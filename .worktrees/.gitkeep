@@ -1,0 +1,2 @@
+# Worktrees / jj workspaces are created under this directory (see CLAUDE.md).
+# This file keeps the directory in the repo; the worktrees themselves are gitignored.
