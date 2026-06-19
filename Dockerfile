@@ -4,10 +4,10 @@
 # backend mounts with no macFUSE, no kernel extension, and no approvals.
 FROM rust:slim
 
-# rustc needs a C linker; curl/ca-certificates fetch zellij; mount/umount ship
-# with debian-slim (util-linux).
+# rustc needs a C linker; curl/ca-certificates fetch zellij; zsh is the
+# interactive shell; mount/umount ship with debian-slim (util-linux).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates \
+ && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates zsh \
  && rm -rf /var/lib/apt/lists/*
 
 # Zellij — a Rust terminal multiplexer. Grab the prebuilt musl binary matching
@@ -25,6 +25,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p epoch-fuse --features fuser-mount \
  && cp target/release/epoch-fuse /usr/local/bin/epoch
+
+# zsh as the interactive shell; a tiny rc keeps zsh from running its first-run
+# new-user wizard inside the pane.
+ENV SHELL=/usr/bin/zsh
+COPY <<'ZSHRC' /root/.zshrc
+autoload -Uz compinit && compinit -u
+PROMPT='%F{cyan}epoch%f:%~ %# '
+ZSHRC
 
 # Split-screen layout: interactive shell on the left, the live epoch mount on
 # the right.

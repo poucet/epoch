@@ -1,0 +1,23 @@
+[package]
+name = "epoch-fuse"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+fuser-adapter = ["fuser-support", "fuser/macos-no-mount"]
+fuser-mount = ["fuser-support"]
+fuser-support = ["dep:fuser", "dep:futures-executor"]
+
+[dependencies]
+epoch-vfs-api = { path = "../epoch-vfs-api" }
+fuser = { version = "0.17", optional = true }
+futures-executor = { version = "0.3", optional = true }
+
+[dev-dependencies]
+futures-executor = "0.3"
+
+[[bin]]
+name = "epoch-fuse"
+path = "src/main.rs"
+required-features = ["fuser-support"]

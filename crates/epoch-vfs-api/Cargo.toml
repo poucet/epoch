@@ -1,0 +1,6 @@
+[package]
+name = "epoch-vfs-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
