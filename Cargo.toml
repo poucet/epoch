@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/epoch-cas",
     "crates/epoch-fuse",
     "crates/epoch-vfs-api",
 ]
