@@ -1,9 +1,11 @@
 //! The generic CAS engine (D14): `encode → hash → zstd → backend.put`, reversed
 //! and integrity-verified on read.
 //!
-//! `SyncGenericCAS<B, C>` / `AsyncGenericCAS<B, C>` implement
+//! `SyncGenericCAS<B, C, H>` / `AsyncGenericCAS<B, C, H>` implement
 //! [`SyncCAS<V>`](crate::SyncCAS) / [`AsyncCAS<V>`](crate::AsyncCAS) over a byte
-//! backend `B` and a [`Codec<V>`](crate::Codec) `C`, with `Id = CASHash`.
+//! backend `B`, a [`Codec<V>`](crate::Codec) `C`, and a
+//! [`ContentHasher`](crate::ContentHasher) `H` (default
+//! [`Blake3Hasher`](crate::Blake3Hasher)), with `Id = CASHash`.
 
 use std::marker::PhantomData;
 
@@ -15,26 +17,32 @@ use crate::codec::Codec;
 use crate::compress::{compress, decompress};
 use crate::error::CASError;
 use crate::hash::CASHash;
+use crate::hasher::{Blake3Hasher, ContentHasher};
 
 /// Encode a value and derive its content-address + the compressed bytes ready
 /// for the backend.
 ///
-/// The id is `BLAKE3(canonical uncompressed encoding)`, so it is stable
+/// The id is `H::hash(canonical uncompressed encoding)`, so it is stable
 /// regardless of compression level.
-fn encode_for_store<V, C: Codec<V>>(value: &V) -> Result<(CASHash, bytes::Bytes), CASError> {
+fn encode_for_store<V, C, H>(value: &V) -> Result<(CASHash, bytes::Bytes), CASError>
+where
+    C: Codec<V>,
+    H: ContentHasher,
+{
     let canonical = C::encode(value);
-    let id = CASHash::of(&canonical);
+    let id = H::hash(&canonical);
     let compressed = compress(&canonical)?;
     Ok((id, compressed))
 }
 
 /// Decompress, verify the recomputed hash matches `id`, then decode.
-fn decode_from_store<V, C: Codec<V>>(
-    id: &CASHash,
-    compressed: &[u8],
-) -> Result<V, CASError> {
+fn decode_from_store<V, C, H>(id: &CASHash, compressed: &[u8]) -> Result<V, CASError>
+where
+    C: Codec<V>,
+    H: ContentHasher,
+{
     let canonical = decompress(compressed)?;
-    let actual = CASHash::of(&canonical);
+    let actual = H::hash(&canonical);
     if actual != *id {
         return Err(CASError::IntegrityMismatch {
             expected: *id,
@@ -44,18 +52,19 @@ fn decode_from_store<V, C: Codec<V>>(
     C::decode(&canonical)
 }
 
-/// Synchronous generic CAS over a [`SyncByteBackend`] `B` and [`Codec<V>`] `C`.
-pub struct SyncGenericCAS<B, C> {
+/// Synchronous generic CAS over a [`SyncByteBackend`] `B`, a [`Codec<V>`] `C`,
+/// and a [`ContentHasher`] `H` (default [`Blake3Hasher`]).
+pub struct SyncGenericCAS<B, C, H = Blake3Hasher> {
     backend: B,
-    _codec: PhantomData<fn() -> C>,
+    _marker: PhantomData<fn() -> (C, H)>,
 }
 
-impl<B, C> SyncGenericCAS<B, C> {
+impl<B, C, H> SyncGenericCAS<B, C, H> {
     /// Build a CAS over `backend`.
     pub fn new(backend: B) -> Self {
         Self {
             backend,
-            _codec: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -65,16 +74,17 @@ impl<B, C> SyncGenericCAS<B, C> {
     }
 }
 
-impl<V, B, C> SyncCAS<V> for SyncGenericCAS<B, C>
+impl<V, B, C, H> SyncCAS<V> for SyncGenericCAS<B, C, H>
 where
     V: Send + Sync + 'static,
     B: SyncByteBackend,
     C: Codec<V>,
+    H: ContentHasher,
 {
     type Id = CASHash;
 
     fn put(&self, value: V) -> Result<CASHash, CASError> {
-        let (id, compressed) = encode_for_store::<V, C>(&value)?;
+        let (id, compressed) = encode_for_store::<V, C, H>(&value)?;
         // Content addressing: re-putting identical content is a harmless
         // overwrite of identical bytes, so no existence check is required.
         self.backend.put(&id, compressed)?;
@@ -84,7 +94,7 @@ where
     fn get(&self, id: &CASHash) -> Result<Option<V>, CASError> {
         match self.backend.get(id)? {
             None => Ok(None),
-            Some(compressed) => Ok(Some(decode_from_store::<V, C>(id, &compressed)?)),
+            Some(compressed) => Ok(Some(decode_from_store::<V, C, H>(id, &compressed)?)),
         }
     }
 
@@ -97,18 +107,19 @@ where
     }
 }
 
-/// Asynchronous generic CAS over an [`AsyncByteBackend`] `B` and [`Codec<V>`] `C`.
-pub struct AsyncGenericCAS<B, C> {
+/// Asynchronous generic CAS over an [`AsyncByteBackend`] `B`, a [`Codec<V>`]
+/// `C`, and a [`ContentHasher`] `H` (default [`Blake3Hasher`]).
+pub struct AsyncGenericCAS<B, C, H = Blake3Hasher> {
     backend: B,
-    _codec: PhantomData<fn() -> C>,
+    _marker: PhantomData<fn() -> (C, H)>,
 }
 
-impl<B, C> AsyncGenericCAS<B, C> {
+impl<B, C, H> AsyncGenericCAS<B, C, H> {
     /// Build a CAS over `backend`.
     pub fn new(backend: B) -> Self {
         Self {
             backend,
-            _codec: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -119,16 +130,17 @@ impl<B, C> AsyncGenericCAS<B, C> {
 }
 
 #[async_trait]
-impl<V, B, C> AsyncCAS<V> for AsyncGenericCAS<B, C>
+impl<V, B, C, H> AsyncCAS<V> for AsyncGenericCAS<B, C, H>
 where
     V: Send + Sync + 'static,
     B: AsyncByteBackend,
     C: Codec<V>,
+    H: ContentHasher,
 {
     type Id = CASHash;
 
     async fn put(&self, value: V) -> Result<CASHash, CASError> {
-        let (id, compressed) = encode_for_store::<V, C>(&value)?;
+        let (id, compressed) = encode_for_store::<V, C, H>(&value)?;
         self.backend.put(&id, compressed).await?;
         Ok(id)
     }
@@ -136,7 +148,7 @@ where
     async fn get(&self, id: &CASHash) -> Result<Option<V>, CASError> {
         match self.backend.get(id).await? {
             None => Ok(None),
-            Some(compressed) => Ok(Some(decode_from_store::<V, C>(id, &compressed)?)),
+            Some(compressed) => Ok(Some(decode_from_store::<V, C, H>(id, &compressed)?)),
         }
     }
 

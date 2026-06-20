@@ -10,6 +10,8 @@
 //! - [`CASHash`] + [`CASError`] — the kernel's content-address and error model.
 //! - [`Codec`] (+ [`IdentityCodec`]) — the canonical `value <-> bytes` mapping
 //!   that determines convergence (D4).
+//! - [`ContentHasher`] (+ [`Blake3Hasher`]) — the pluggable `bytes -> CASHash`
+//!   digest the engine content-addresses with.
 //! - [`SyncByteBackend`] / [`AsyncByteBackend`] — an opaque content-keyed KV
 //!   with zero CAS semantics, plus the in-memory [`MemoryByteBackend`].
 //! - [`SyncCAS`] / [`AsyncCAS`] — the generic CAS traits.
@@ -33,6 +35,7 @@ mod compress;
 mod error;
 mod generic;
 mod hash;
+mod hasher;
 
 pub use backend::{
     AsyncByteBackend, AsyncMemoryByteBackend, MemoryByteBackend, SyncByteBackend,
@@ -45,6 +48,7 @@ pub use compress::{compress, decompress};
 pub use error::CASError;
 pub use generic::{AsyncGenericCAS, SyncGenericCAS};
 pub use hash::{CASHash, ParseHashError};
+pub use hasher::{Blake3Hasher, ContentHasher};
 
 // Re-export `bytes::Bytes` so downstream crates use the exact same type the
 // kernel signatures speak (D5).

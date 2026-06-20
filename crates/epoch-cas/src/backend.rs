@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn put_get_delete() {
         let b = MemoryByteBackend::new();
-        let k = CASHash::of(b"k");
+        let k = CASHash::from_bytes([1u8; 32]);
         assert!(!b.has(&k).unwrap());
         b.put(&k, Bytes::from_static(b"v")).unwrap();
         assert!(b.has(&k).unwrap());

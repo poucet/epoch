@@ -1,6 +1,6 @@
 //! `BatchingCAS<S>` (D8): a write-coalescing [`AsyncCAS`] decorator.
 //!
-//! Because puts are content-addressed, a `put` can compute `Id = CASHash::of(...)`
+//! Because puts are content-addressed, a `put` can compute `Id = H::hash(...)`
 //! **immediately** and hand the actual byte persistence to a bounded queue
 //! drained by a background flush task. Reads, `has`, and `delete` pass
 //! straight through to the inner store.
@@ -19,6 +19,7 @@ use crate::cas::AsyncCAS;
 use crate::codec::Codec;
 use crate::error::CASError;
 use crate::hash::CASHash;
+use crate::hasher::{Blake3Hasher, ContentHasher};
 
 /// A unit of work on the flush queue.
 ///
@@ -35,21 +36,24 @@ struct WriteJob<V> {
 
 /// Write-coalescing decorator over an [`AsyncCAS<V>`] whose `Id = CASHash`.
 ///
-/// Generic over the same [`Codec`] the inner store uses, so it can derive the
-/// content-address without delegating the (slow) persistence.
-pub struct BatchingCAS<S, V, C> {
+/// Generic over the same [`Codec`] `C` and [`ContentHasher`] `H` (default
+/// [`Blake3Hasher`]) the inner store uses, so it can derive the content-address
+/// without delegating the (slow) persistence. `H` must match the inner store's
+/// hasher, or the id returned here won't address what eventually persists.
+pub struct BatchingCAS<S, V, C, H = Blake3Hasher> {
     inner: Arc<S>,
     tx: mpsc::Sender<WriteJob<V>>,
     /// Joined on [`BatchingCAS::shutdown`] to drain in-flight writes.
     flusher: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    _codec: PhantomData<fn() -> C>,
+    _marker: PhantomData<fn() -> (C, H)>,
 }
 
-impl<S, V, C> BatchingCAS<S, V, C>
+impl<S, V, C, H> BatchingCAS<S, V, C, H>
 where
     S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
+    H: ContentHasher,
 {
     /// Wrap `inner` with a bounded queue of `capacity` pending writes and spawn
     /// the background flush task on the current tokio runtime.
@@ -72,7 +76,7 @@ where
             inner,
             tx,
             flusher: Mutex::new(Some(flusher)),
-            _codec: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -102,18 +106,19 @@ where
 }
 
 #[async_trait]
-impl<S, V, C> AsyncCAS<V> for BatchingCAS<S, V, C>
+impl<S, V, C, H> AsyncCAS<V> for BatchingCAS<S, V, C, H>
 where
     S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
+    H: ContentHasher,
 {
     type Id = CASHash;
 
     async fn put(&self, value: V) -> Result<CASHash, CASError> {
         // Compute the content-address now — this is the whole point: the caller
         // gets the id immediately, persistence rides the queue.
-        let id = CASHash::of(&C::encode(&value));
+        let id = H::hash(&C::encode(&value));
         let (done, _ack) = oneshot::channel();
         let job = WriteJob {
             value: Some(value),
@@ -141,11 +146,12 @@ where
     }
 }
 
-impl<S, V, C> BatchingCAS<S, V, C>
+impl<S, V, C, H> BatchingCAS<S, V, C, H>
 where
     S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
+    H: ContentHasher,
 {
     /// Block until every write enqueued *before this call* has been persisted
     /// by the flush task.

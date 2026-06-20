@@ -1,9 +1,13 @@
-//! The kernel's content-address: a 32-byte BLAKE3 digest.
+//! The kernel's content-address: a 32-byte content digest.
 
 use std::fmt;
 use std::str::FromStr;
 
-/// A content-address: the BLAKE3 digest of a canonical byte encoding.
+/// A content-address: a 32-byte digest of a canonical byte encoding.
+///
+/// The producing algorithm is *not* baked in here — it lives behind the
+/// pluggable [`ContentHasher`](crate::ContentHasher) (default
+/// [`Blake3Hasher`](crate::Blake3Hasher)), so `CASHash` is just the address.
 ///
 /// This is the kernel's own id type. It is deliberately id-agnostic — it knows
 /// nothing of `BlobId`/`TreeId` or any domain newtype, which are layered on top
@@ -13,11 +17,6 @@ use std::str::FromStr;
 pub struct CASHash([u8; 32]);
 
 impl CASHash {
-    /// The BLAKE3 digest of `bytes`.
-    pub fn of(bytes: &[u8]) -> CASHash {
-        CASHash(*blake3::hash(bytes).as_bytes())
-    }
-
     /// Construct from raw digest bytes (no hashing performed).
     pub const fn from_bytes(bytes: [u8; 32]) -> CASHash {
         CASHash(bytes)
@@ -40,18 +39,16 @@ impl CASHash {
     }
 }
 
-/// Hand-written rather than derived: a `CASHash` is *already* a uniformly
-/// distributed BLAKE3 digest, so its leading eight bytes are themselves a
-/// perfectly good hash. Feeding just those to the [`Hasher`] avoids re-mixing
-/// all 32 bytes on every map lookup. Equal digests share their leading bytes,
-/// so the `k == k' ⟹ hash(k) == hash(k')` invariant holds.
+/// Hand-written rather than derived: the derived array impl writes a length
+/// prefix before the bytes, but a `CASHash` is always 32 bytes, so that prefix
+/// is pure overhead — we write the raw digest straight to the [`Hasher`]. A
+/// content digest is already uniformly distributed, so its bytes need no extra
+/// mixing for a good hash-table spread.
 ///
 /// [`Hasher`]: std::hash::Hasher
 impl std::hash::Hash for CASHash {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(u64::from_ne_bytes(
-            self.0[..8].try_into().expect("a CASHash is 32 bytes"),
-        ));
+        state.write(&self.0);
     }
 }
 
@@ -130,14 +127,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn of_is_deterministic() {
-        assert_eq!(CASHash::of(b"hello"), CASHash::of(b"hello"));
-        assert_ne!(CASHash::of(b"hello"), CASHash::of(b"world"));
-    }
-
-    #[test]
     fn hex_roundtrip() {
-        let h = CASHash::of(b"some content");
+        // A varied byte pattern so the hex mapping is exercised across nibbles.
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let h = CASHash::from_bytes(bytes);
         let s = h.to_string();
         assert_eq!(s.len(), 64);
         let parsed: CASHash = s.parse().unwrap();
@@ -159,15 +155,5 @@ mod tests {
             bad.parse::<CASHash>(),
             Err(ParseHashError::BadChar { .. })
         ));
-    }
-
-    #[test]
-    fn matches_known_blake3_vector() {
-        // BLAKE3 of the empty input.
-        let h = CASHash::of(b"");
-        assert_eq!(
-            h.to_string(),
-            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
-        );
     }
 }

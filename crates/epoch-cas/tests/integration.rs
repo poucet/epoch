@@ -4,16 +4,16 @@
 //!  2. content-addressing + dedup
 //!  3. integrity verification on corrupt entries
 //!  4. has / delete
-//!  5. a non-identity codec
+//!  5. a non-identity codec, and a pluggable non-default ContentHasher
 //!  6. Blocking / Asyncify sync↔async bridges
 //!  7. BatchingCAS write→flush→read-back
 
 use std::sync::Arc;
 
 use epoch_cas::{
-    AsyncCAS, AsyncGenericCAS, AsyncMemoryByteBackend, Asyncify, BatchingCAS, Blocking, Bytes,
-    CASError, Codec, CASHash, IdentityCodec, MemoryByteBackend, SyncByteBackend, SyncCAS,
-    SyncGenericCAS,
+    AsyncCAS, AsyncGenericCAS, AsyncMemoryByteBackend, Asyncify, BatchingCAS, Blake3Hasher,
+    Blocking, Bytes, CASError, CASHash, Codec, ContentHasher, IdentityCodec, MemoryByteBackend,
+    SyncByteBackend, SyncCAS, SyncGenericCAS,
 };
 
 type IdentitySyncCas = SyncGenericCAS<MemoryByteBackend, IdentityCodec>;
@@ -37,7 +37,7 @@ fn put_get_roundtrip() {
 #[test]
 fn get_missing_returns_none() {
     let (_backend, cas) = new_identity_cas();
-    let absent = CASHash::of(b"never stored");
+    let absent = Blake3Hasher::hash(b"never stored");
     assert_eq!(cas.get(&absent).unwrap(), None);
 }
 
@@ -47,7 +47,7 @@ fn id_is_hash_of_uncompressed_encoding() {
     let payload = Bytes::from_static(b"determinism");
     let id = cas.put(payload.clone()).unwrap();
     // IdentityCodec means the canonical encoding is the payload itself.
-    assert_eq!(id, CASHash::of(&payload));
+    assert_eq!(id, Blake3Hasher::hash(&payload));
 }
 
 // 2. content-addressing + dedup: identical content → identical id, single entry.
@@ -87,7 +87,7 @@ fn corrupt_entry_yields_integrity_mismatch() {
         CASError::IntegrityMismatch { expected, actual } => {
             assert_eq!(expected, id);
             assert_ne!(actual, id);
-            assert_eq!(actual, CASHash::of(b"tampered payload"));
+            assert_eq!(actual, Blake3Hasher::hash(b"tampered payload"));
         }
         other => panic!("expected IntegrityMismatch, got {other:?}"),
     }
@@ -102,7 +102,7 @@ fn has_and_delete() {
 
     assert!(cas.has(&id_a).unwrap());
     assert!(cas.has(&id_b).unwrap());
-    assert!(!cas.has(&CASHash::of(b"absent")).unwrap());
+    assert!(!cas.has(&Blake3Hasher::hash(b"absent")).unwrap());
 
     cas.delete(&id_a).unwrap();
     assert!(!cas.has(&id_a).unwrap());
@@ -169,13 +169,43 @@ fn non_identity_codec_decode_error_surfaces() {
     let cas = SyncGenericCAS::<_, PointCodec>::new(backend.clone());
 
     let bad = Bytes::from_static(b"xyz"); // 3 bytes, not 8
-    let id = CASHash::of(&bad);
+    let id = Blake3Hasher::hash(&bad);
     backend.put(&id, epoch_cas::compress(&bad).unwrap()).unwrap();
 
     match cas.get(&id).unwrap_err() {
         CASError::Codec(_) => {}
         other => panic!("expected Codec error, got {other:?}"),
     }
+}
+
+// 5b. a pluggable, non-default ContentHasher threaded through the engine.
+//
+// `DoubleBlake3` hashes the hash: deterministic, still 32 bytes, but distinct
+// from a single BLAKE3 pass — so we can prove the CAS actually addresses with
+// the `H` it was given (both on write and on the read-side integrity check).
+struct DoubleBlake3;
+
+impl ContentHasher for DoubleBlake3 {
+    fn hash(bytes: &[u8]) -> CASHash {
+        let once = Blake3Hasher::hash(bytes);
+        Blake3Hasher::hash(once.as_bytes())
+    }
+}
+
+#[test]
+fn custom_hasher_addresses_with_its_own_digest() {
+    let backend = MemoryByteBackend::new();
+    let cas = SyncGenericCAS::<_, IdentityCodec, DoubleBlake3>::new(backend.clone());
+
+    let payload = Bytes::from_static(b"hashed by the plugged-in hasher");
+    let id = cas.put(payload.clone()).unwrap();
+
+    // The id is the custom digest, not the default BLAKE3 one.
+    assert_eq!(id, DoubleBlake3::hash(&payload));
+    assert_ne!(id, Blake3Hasher::hash(&payload));
+
+    // Round-trip works: the read-side integrity check re-hashes with the same H.
+    assert_eq!(cas.get(&id).unwrap(), Some(payload));
 }
 
 // 6. Blocking and Asyncify bridge round-trips.
@@ -223,7 +253,7 @@ async fn batching_write_flush_readback() {
     let payload = Bytes::from_static(b"coalesced write");
     // put returns the content-address immediately, before persistence.
     let id = batching.put(payload.clone()).await.unwrap();
-    assert_eq!(id, CASHash::of(&payload));
+    assert_eq!(id, Blake3Hasher::hash(&payload));
 
     // Drain the queue, then the value is durable and readable back.
     batching.flush().await.unwrap();
