@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use epoch_cas::{
     AsyncCAS, AsyncGenericCAS, AsyncMemoryByteBackend, Asyncify, BatchingCAS, Blocking, Bytes,
-    CASError, Codec, Hash, IdentityCodec, MemoryByteBackend, SyncByteBackend, SyncCAS,
+    CASError, Codec, CASHash, IdentityCodec, MemoryByteBackend, SyncByteBackend, SyncCAS,
     SyncGenericCAS,
 };
 
@@ -37,7 +37,7 @@ fn put_get_roundtrip() {
 #[test]
 fn get_missing_returns_none() {
     let (_backend, cas) = new_identity_cas();
-    let absent = Hash::of(b"never stored");
+    let absent = CASHash::of(b"never stored");
     assert_eq!(cas.get(&absent).unwrap(), None);
 }
 
@@ -47,7 +47,7 @@ fn id_is_hash_of_uncompressed_encoding() {
     let payload = Bytes::from_static(b"determinism");
     let id = cas.put(payload.clone()).unwrap();
     // IdentityCodec means the canonical encoding is the payload itself.
-    assert_eq!(id, Hash::of(&payload));
+    assert_eq!(id, CASHash::of(&payload));
 }
 
 // 2. content-addressing + dedup: identical content → identical id, single entry.
@@ -87,7 +87,7 @@ fn corrupt_entry_yields_integrity_mismatch() {
         CASError::IntegrityMismatch { expected, actual } => {
             assert_eq!(expected, id);
             assert_ne!(actual, id);
-            assert_eq!(actual, Hash::of(b"tampered payload"));
+            assert_eq!(actual, CASHash::of(b"tampered payload"));
         }
         other => panic!("expected IntegrityMismatch, got {other:?}"),
     }
@@ -102,7 +102,7 @@ fn has_and_delete() {
 
     assert!(cas.has(&id_a).unwrap());
     assert!(cas.has(&id_b).unwrap());
-    assert!(!cas.has(&Hash::of(b"absent")).unwrap());
+    assert!(!cas.has(&CASHash::of(b"absent")).unwrap());
 
     cas.delete(&id_a).unwrap();
     assert!(!cas.has(&id_a).unwrap());
@@ -169,7 +169,7 @@ fn non_identity_codec_decode_error_surfaces() {
     let cas = SyncGenericCAS::<_, PointCodec>::new(backend.clone());
 
     let bad = Bytes::from_static(b"xyz"); // 3 bytes, not 8
-    let id = Hash::of(&bad);
+    let id = CASHash::of(&bad);
     backend.put(&id, epoch_cas::compress(&bad).unwrap()).unwrap();
 
     match cas.get(&id).unwrap_err() {
@@ -223,7 +223,7 @@ async fn batching_write_flush_readback() {
     let payload = Bytes::from_static(b"coalesced write");
     // put returns the content-address immediately, before persistence.
     let id = batching.put(payload.clone()).await.unwrap();
-    assert_eq!(id, Hash::of(&payload));
+    assert_eq!(id, CASHash::of(&payload));
 
     // Drain the queue, then the value is durable and readable back.
     batching.flush().await.unwrap();

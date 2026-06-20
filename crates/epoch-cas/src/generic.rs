@@ -3,7 +3,7 @@
 //!
 //! `SyncGenericCAS<B, C>` / `AsyncGenericCAS<B, C>` implement
 //! [`SyncCAS<V>`](crate::SyncCAS) / [`AsyncCAS<V>`](crate::AsyncCAS) over a byte
-//! backend `B` and a [`Codec<V>`](crate::Codec) `C`, with `Id = Hash`.
+//! backend `B` and a [`Codec<V>`](crate::Codec) `C`, with `Id = CASHash`.
 
 use std::marker::PhantomData;
 
@@ -14,27 +14,27 @@ use crate::cas::{AsyncCAS, SyncCAS};
 use crate::codec::Codec;
 use crate::compress::{compress, decompress};
 use crate::error::CASError;
-use crate::hash::Hash;
+use crate::hash::CASHash;
 
 /// Encode a value and derive its content-address + the compressed bytes ready
 /// for the backend.
 ///
 /// The id is `BLAKE3(canonical uncompressed encoding)`, so it is stable
 /// regardless of compression level.
-fn encode_for_store<V, C: Codec<V>>(value: &V) -> Result<(Hash, bytes::Bytes), CASError> {
+fn encode_for_store<V, C: Codec<V>>(value: &V) -> Result<(CASHash, bytes::Bytes), CASError> {
     let canonical = C::encode(value);
-    let id = Hash::of(&canonical);
+    let id = CASHash::of(&canonical);
     let compressed = compress(&canonical)?;
     Ok((id, compressed))
 }
 
 /// Decompress, verify the recomputed hash matches `id`, then decode.
 fn decode_from_store<V, C: Codec<V>>(
-    id: &Hash,
+    id: &CASHash,
     compressed: &[u8],
 ) -> Result<V, CASError> {
     let canonical = decompress(compressed)?;
-    let actual = Hash::of(&canonical);
+    let actual = CASHash::of(&canonical);
     if actual != *id {
         return Err(CASError::IntegrityMismatch {
             expected: *id,
@@ -71,9 +71,9 @@ where
     B: SyncByteBackend,
     C: Codec<V>,
 {
-    type Id = Hash;
+    type Id = CASHash;
 
-    fn put(&self, value: V) -> Result<Hash, CASError> {
+    fn put(&self, value: V) -> Result<CASHash, CASError> {
         let (id, compressed) = encode_for_store::<V, C>(&value)?;
         // Content addressing: re-putting identical content is a harmless
         // overwrite of identical bytes, so no existence check is required.
@@ -81,18 +81,18 @@ where
         Ok(id)
     }
 
-    fn get(&self, id: &Hash) -> Result<Option<V>, CASError> {
+    fn get(&self, id: &CASHash) -> Result<Option<V>, CASError> {
         match self.backend.get(id)? {
             None => Ok(None),
             Some(compressed) => Ok(Some(decode_from_store::<V, C>(id, &compressed)?)),
         }
     }
 
-    fn has(&self, id: &Hash) -> Result<bool, CASError> {
+    fn has(&self, id: &CASHash) -> Result<bool, CASError> {
         self.backend.has(id)
     }
 
-    fn delete(&self, id: &Hash) -> Result<(), CASError> {
+    fn delete(&self, id: &CASHash) -> Result<(), CASError> {
         self.backend.delete(id)
     }
 }
@@ -125,26 +125,26 @@ where
     B: AsyncByteBackend,
     C: Codec<V>,
 {
-    type Id = Hash;
+    type Id = CASHash;
 
-    async fn put(&self, value: V) -> Result<Hash, CASError> {
+    async fn put(&self, value: V) -> Result<CASHash, CASError> {
         let (id, compressed) = encode_for_store::<V, C>(&value)?;
         self.backend.put(&id, compressed).await?;
         Ok(id)
     }
 
-    async fn get(&self, id: &Hash) -> Result<Option<V>, CASError> {
+    async fn get(&self, id: &CASHash) -> Result<Option<V>, CASError> {
         match self.backend.get(id).await? {
             None => Ok(None),
             Some(compressed) => Ok(Some(decode_from_store::<V, C>(id, &compressed)?)),
         }
     }
 
-    async fn has(&self, id: &Hash) -> Result<bool, CASError> {
+    async fn has(&self, id: &CASHash) -> Result<bool, CASError> {
         self.backend.has(id).await
     }
 
-    async fn delete(&self, id: &Hash) -> Result<(), CASError> {
+    async fn delete(&self, id: &CASHash) -> Result<(), CASError> {
         self.backend.delete(id).await
     }
 }

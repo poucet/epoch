@@ -2,7 +2,7 @@
 //! opaque `Backend` escape hatch so the kernel never depends on a concrete
 //! storage crate.
 
-use crate::hash::Hash;
+use crate::hash::CASHash;
 
 /// Errors produced anywhere in the CAS kernel.
 ///
@@ -19,9 +19,9 @@ pub enum CASError {
     #[error("integrity mismatch: expected {expected}, got {actual}")]
     IntegrityMismatch {
         /// The id that was requested (and re-hashed against).
-        expected: Hash,
+        expected: CASHash,
         /// The id the fetched bytes actually hashed to.
-        actual: Hash,
+        actual: CASHash,
     },
 
     /// A background worker / channel was dropped — the component is shutting

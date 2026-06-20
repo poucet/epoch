@@ -1,13 +1,13 @@
 //! # epoch-cas — the generic, id-agnostic Content-Addressed Storage kernel
 //!
-//! This crate is the foundation of the `epoch` storage stack (Wave 0, D14/D15).
-//! It is **id-agnostic**: it is keyed by its own content-address [`Hash`] and
+//! This crate is the foundation of the `epoch` storage stack.
+//! It is **id-agnostic**: it is keyed by its own content-address [`CASHash`] and
 //! depends on nothing internal. Domain id newtypes (`BlobId`/`TreeId`) are
 //! layered on top in later crates.
 //!
 //! ## What's here
 //!
-//! - [`Hash`] + [`CASError`] — the kernel's content-address and error model.
+//! - [`CASHash`] + [`CASError`] — the kernel's content-address and error model.
 //! - [`Codec`] (+ [`IdentityCodec`]) — the canonical `value <-> bytes` mapping
 //!   that determines convergence (D4).
 //! - [`SyncByteBackend`] / [`AsyncByteBackend`] — an opaque content-keyed KV
@@ -44,7 +44,7 @@ pub use codec::{Codec, IdentityCodec};
 pub use compress::{compress, decompress};
 pub use error::CASError;
 pub use generic::{AsyncGenericCAS, SyncGenericCAS};
-pub use hash::{Hash, ParseHashError};
+pub use hash::{CASHash, ParseHashError};
 
 // Re-export `bytes::Bytes` so downstream crates use the exact same type the
 // kernel signatures speak (D5).

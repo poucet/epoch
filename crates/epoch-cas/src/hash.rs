@@ -7,19 +7,20 @@ use std::str::FromStr;
 ///
 /// This is the kernel's own id type. It is deliberately id-agnostic — it knows
 /// nothing of `BlobId`/`TreeId` or any domain newtype, which are layered on top
-/// elsewhere.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Hash([u8; 32]);
+/// elsewhere. Named `CASHash` rather than `Hash` so it never reads ambiguously
+/// against [`std::hash::Hash`] (which it also implements, by hand — see below).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CASHash([u8; 32]);
 
-impl Hash {
+impl CASHash {
     /// The BLAKE3 digest of `bytes`.
-    pub fn of(bytes: &[u8]) -> Hash {
-        Hash(*blake3::hash(bytes).as_bytes())
+    pub fn of(bytes: &[u8]) -> CASHash {
+        CASHash(*blake3::hash(bytes).as_bytes())
     }
 
     /// Construct from raw digest bytes (no hashing performed).
-    pub const fn from_bytes(bytes: [u8; 32]) -> Hash {
-        Hash(bytes)
+    pub const fn from_bytes(bytes: [u8; 32]) -> CASHash {
+        CASHash(bytes)
     }
 
     /// The raw 32-byte digest.
@@ -39,20 +40,35 @@ impl Hash {
     }
 }
 
+/// Hand-written rather than derived: a `CASHash` is *already* a uniformly
+/// distributed BLAKE3 digest, so its leading eight bytes are themselves a
+/// perfectly good hash. Feeding just those to the [`Hasher`] avoids re-mixing
+/// all 32 bytes on every map lookup. Equal digests share their leading bytes,
+/// so the `k == k' ⟹ hash(k) == hash(k')` invariant holds.
+///
+/// [`Hasher`]: std::hash::Hasher
+impl std::hash::Hash for CASHash {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from_ne_bytes(
+            self.0[..8].try_into().expect("a CASHash is 32 bytes"),
+        ));
+    }
+}
+
 /// Hex on both `Display` and `Debug` so logs and errors are readable.
-impl fmt::Display for Hash {
+impl fmt::Display for CASHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_hex())
     }
 }
 
-impl fmt::Debug for Hash {
+impl fmt::Debug for CASHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Hash({})", self.to_hex())
+        write!(f, "CASHash({})", self.to_hex())
     }
 }
 
-/// The error returned when a hex string cannot be parsed into a [`Hash`].
+/// The error returned when a hex string cannot be parsed into a [`CASHash`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseHashError {
     /// The input was not exactly 64 hex characters long.
@@ -82,7 +98,7 @@ impl fmt::Display for ParseHashError {
 
 impl std::error::Error for ParseHashError {}
 
-impl FromStr for Hash {
+impl FromStr for CASHash {
     type Err = ParseHashError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -96,7 +112,7 @@ impl FromStr for Hash {
             let lo = hex_val(bytes[i * 2 + 1])?;
             out[i] = (hi << 4) | lo;
         }
-        Ok(Hash(out))
+        Ok(CASHash(out))
     }
 }
 
@@ -115,23 +131,23 @@ mod tests {
 
     #[test]
     fn of_is_deterministic() {
-        assert_eq!(Hash::of(b"hello"), Hash::of(b"hello"));
-        assert_ne!(Hash::of(b"hello"), Hash::of(b"world"));
+        assert_eq!(CASHash::of(b"hello"), CASHash::of(b"hello"));
+        assert_ne!(CASHash::of(b"hello"), CASHash::of(b"world"));
     }
 
     #[test]
     fn hex_roundtrip() {
-        let h = Hash::of(b"some content");
+        let h = CASHash::of(b"some content");
         let s = h.to_string();
         assert_eq!(s.len(), 64);
-        let parsed: Hash = s.parse().unwrap();
+        let parsed: CASHash = s.parse().unwrap();
         assert_eq!(h, parsed);
     }
 
     #[test]
     fn parse_rejects_bad_length() {
         assert_eq!(
-            "abc".parse::<Hash>(),
+            "abc".parse::<CASHash>(),
             Err(ParseHashError::BadLength { got: 3 })
         );
     }
@@ -140,7 +156,7 @@ mod tests {
     fn parse_rejects_bad_char() {
         let bad = "z".repeat(64);
         assert!(matches!(
-            bad.parse::<Hash>(),
+            bad.parse::<CASHash>(),
             Err(ParseHashError::BadChar { .. })
         ));
     }
@@ -148,7 +164,7 @@ mod tests {
     #[test]
     fn matches_known_blake3_vector() {
         // BLAKE3 of the empty input.
-        let h = Hash::of(b"");
+        let h = CASHash::of(b"");
         assert_eq!(
             h.to_string(),
             "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"

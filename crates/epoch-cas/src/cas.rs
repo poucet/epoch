@@ -14,7 +14,7 @@ use crate::error::CASError;
 /// `put` returns the content-address of the stored value; identical values
 /// always yield the same `Id` (that is the whole point of CAS).
 pub trait SyncCAS<V>: Send + Sync + 'static {
-    /// The content-address type. The kernel engine uses [`crate::Hash`].
+    /// The content-address type. The kernel engine uses [`crate::CASHash`].
     type Id;
 
     /// Store `value`, returning its content-address.
@@ -30,7 +30,7 @@ pub trait SyncCAS<V>: Send + Sync + 'static {
 /// The async twin of [`SyncCAS`] for remote/cloud backends.
 #[async_trait]
 pub trait AsyncCAS<V>: Send + Sync + 'static {
-    /// The content-address type. The kernel engine uses [`crate::Hash`].
+    /// The content-address type. The kernel engine uses [`crate::CASHash`].
     type Id;
 
     /// Store `value`, returning its content-address.

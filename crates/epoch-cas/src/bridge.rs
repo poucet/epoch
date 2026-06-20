@@ -88,7 +88,7 @@ where
     V: Send + Sync + 'static,
     S: SyncCAS<V>,
     // `Clone` is needed to move the id into the blocking closure; the kernel's
-    // `Id = Hash` is `Copy`, so this is free in practice.
+    // `Id = CASHash` is `Copy`, so this is free in practice.
     S::Id: Send + Sync + Clone + 'static,
 {
     type Id = S::Id;

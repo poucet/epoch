@@ -1,6 +1,6 @@
 //! `BatchingCAS<S>` (D8): a write-coalescing [`AsyncCAS`] decorator.
 //!
-//! Because puts are content-addressed, a `put` can compute `Id = Hash::of(...)`
+//! Because puts are content-addressed, a `put` can compute `Id = CASHash::of(...)`
 //! **immediately** and hand the actual byte persistence to a bounded queue
 //! drained by a background flush task. Reads, `has`, and `delete` pass
 //! straight through to the inner store.
@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::cas::AsyncCAS;
 use crate::codec::Codec;
 use crate::error::CASError;
-use crate::hash::Hash;
+use crate::hash::CASHash;
 
 /// A unit of work on the flush queue.
 ///
@@ -33,7 +33,7 @@ struct WriteJob<V> {
     done: oneshot::Sender<Result<(), CASError>>,
 }
 
-/// Write-coalescing decorator over an [`AsyncCAS<V>`] whose `Id = Hash`.
+/// Write-coalescing decorator over an [`AsyncCAS<V>`] whose `Id = CASHash`.
 ///
 /// Generic over the same [`Codec`] the inner store uses, so it can derive the
 /// content-address without delegating the (slow) persistence.
@@ -47,7 +47,7 @@ pub struct BatchingCAS<S, V, C> {
 
 impl<S, V, C> BatchingCAS<S, V, C>
 where
-    S: AsyncCAS<V, Id = Hash>,
+    S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
 {
@@ -104,16 +104,16 @@ where
 #[async_trait]
 impl<S, V, C> AsyncCAS<V> for BatchingCAS<S, V, C>
 where
-    S: AsyncCAS<V, Id = Hash>,
+    S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
 {
-    type Id = Hash;
+    type Id = CASHash;
 
-    async fn put(&self, value: V) -> Result<Hash, CASError> {
+    async fn put(&self, value: V) -> Result<CASHash, CASError> {
         // Compute the content-address now — this is the whole point: the caller
         // gets the id immediately, persistence rides the queue.
-        let id = Hash::of(&C::encode(&value));
+        let id = CASHash::of(&C::encode(&value));
         let (done, _ack) = oneshot::channel();
         let job = WriteJob {
             value: Some(value),
@@ -128,22 +128,22 @@ where
         Ok(id)
     }
 
-    async fn get(&self, id: &Hash) -> Result<Option<V>, CASError> {
+    async fn get(&self, id: &CASHash) -> Result<Option<V>, CASError> {
         self.inner.get(id).await
     }
 
-    async fn has(&self, id: &Hash) -> Result<bool, CASError> {
+    async fn has(&self, id: &CASHash) -> Result<bool, CASError> {
         self.inner.has(id).await
     }
 
-    async fn delete(&self, id: &Hash) -> Result<(), CASError> {
+    async fn delete(&self, id: &CASHash) -> Result<(), CASError> {
         self.inner.delete(id).await
     }
 }
 
 impl<S, V, C> BatchingCAS<S, V, C>
 where
-    S: AsyncCAS<V, Id = Hash>,
+    S: AsyncCAS<V, Id = CASHash>,
     V: Send + Sync + 'static,
     C: Codec<V>,
 {
