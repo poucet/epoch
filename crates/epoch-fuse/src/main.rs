@@ -1,6 +1,7 @@
 use std::{env, fs, sync::Arc};
 
-use epoch_fuse::{OverlayProbeVfs, fuser_adapter::mount_spike};
+use epoch_fuse::fuser_adapter::mount_spike;
+use epoch_vfs::OverlayProbeVfs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);

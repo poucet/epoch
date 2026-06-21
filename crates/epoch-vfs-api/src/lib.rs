@@ -1,16 +1,13 @@
-//! Async VFS contracts that stay independent from FUSE, CAS, timeline stores,
-//! daemon process state, and concrete runtimes.
+//! Synchronous VFS contracts that stay independent from FUSE, CAS, timeline
+//! stores, daemon process state, and concrete runtimes.
 
 use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt,
-    future::Future,
-    pin::Pin,
     time::{Duration, SystemTime},
 };
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type VfsResult<T> = Result<T, VfsError>;
 
 pub const ROOT_NODE_ID: NodeId = NodeId(1);
@@ -153,12 +150,12 @@ pub struct ReadRequest {
     pub size: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriteRequest {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteRequest<'a> {
     pub node_id: NodeId,
     pub handle: FileHandle,
     pub offset: u64,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,29 +228,29 @@ impl fmt::Display for VfsError {
 impl Error for VfsError {}
 
 pub trait VfsService: Send + Sync {
-    fn lookup<'a>(&'a self, parent: NodeId, name: &'a OsStr) -> BoxFuture<'a, VfsResult<Entry>>;
+    fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry>;
 
-    fn getattr<'a>(&'a self, node_id: NodeId) -> BoxFuture<'a, VfsResult<NodeAttr>>;
+    fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr>;
 
-    fn readdir<'a>(&'a self, node_id: NodeId) -> BoxFuture<'a, VfsResult<Vec<DirEntry>>>;
+    fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>>;
 
-    fn open<'a>(&'a self, request: OpenRequest) -> BoxFuture<'a, VfsResult<OpenedFile>>;
+    fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
 
-    fn read<'a>(&'a self, request: ReadRequest) -> BoxFuture<'a, VfsResult<Vec<u8>>>;
+    fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>>;
 
-    fn write<'a>(&'a self, request: WriteRequest) -> BoxFuture<'a, VfsResult<u32>>;
+    fn write(&self, request: WriteRequest<'_>) -> VfsResult<u32>;
 
-    fn create<'a>(&'a self, request: CreateRequest) -> BoxFuture<'a, VfsResult<CreatedNode>>;
+    fn create(&self, request: CreateRequest) -> VfsResult<CreatedNode>;
 
-    fn mkdir<'a>(&'a self, request: CreateRequest) -> BoxFuture<'a, VfsResult<Entry>>;
+    fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry>;
 
-    fn unlink<'a>(&'a self, parent: NodeId, name: &'a OsStr) -> BoxFuture<'a, VfsResult<()>>;
+    fn unlink(&self, parent: NodeId, name: &OsStr) -> VfsResult<()>;
 
-    fn rmdir<'a>(&'a self, parent: NodeId, name: &'a OsStr) -> BoxFuture<'a, VfsResult<()>>;
+    fn rmdir(&self, parent: NodeId, name: &OsStr) -> VfsResult<()>;
 
-    fn flush<'a>(&'a self, handle: FileHandle) -> BoxFuture<'a, VfsResult<()>>;
+    fn flush(&self, handle: FileHandle) -> VfsResult<()>;
 
-    fn release<'a>(&'a self, handle: FileHandle) -> BoxFuture<'a, VfsResult<()>>;
+    fn release(&self, handle: FileHandle) -> VfsResult<()>;
 }
 
 #[cfg(test)]

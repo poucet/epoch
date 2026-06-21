@@ -9,7 +9,6 @@ use fuser::{
     KernelConfig, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use futures_executor::block_on;
 
 pub struct FuseSpikeFs {
     vfs: Arc<dyn VfsService>,
@@ -52,7 +51,7 @@ impl Filesystem for FuseSpikeFs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         fuse_log!("lookup parent={} name={:?}", parent.0, name);
-        match block_on(self.vfs.lookup(from_ino(parent), name)) {
+        match self.vfs.lookup(from_ino(parent), name) {
             Ok(entry) => {
                 fuse_log!(
                     "lookup ok node={} kind={:?} size={}",
@@ -68,7 +67,7 @@ impl Filesystem for FuseSpikeFs {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         fuse_log!("getattr ino={}", ino.0);
-        match block_on(self.vfs.getattr(from_ino(ino))) {
+        match self.vfs.getattr(from_ino(ino)) {
             Ok(attr) => {
                 fuse_log!(
                     "getattr ok ino={} kind={:?} size={}",
@@ -93,7 +92,7 @@ impl Filesystem for FuseSpikeFs {
             append: false,
         };
 
-        match block_on(self.vfs.open(request)) {
+        match self.vfs.open(request) {
             Ok(opened) => {
                 fuse_log!("open ok fh={}", opened.handle.0);
                 reply.opened(to_fh(opened.handle), FopenFlags::empty());
@@ -127,7 +126,7 @@ impl Filesystem for FuseSpikeFs {
             size,
         };
 
-        match block_on(self.vfs.read(request)) {
+        match self.vfs.read(request) {
             Ok(data) => {
                 fuse_log!("read ok bytes={}", data.len());
                 reply.data(&data);
@@ -159,10 +158,10 @@ impl Filesystem for FuseSpikeFs {
             node_id: from_ino(ino),
             handle: from_fh(fh),
             offset,
-            data: data.to_vec(),
+            data,
         };
 
-        match block_on(self.vfs.write(request)) {
+        match self.vfs.write(request) {
             Ok(bytes_written) => {
                 fuse_log!("write ok bytes={bytes_written}");
                 reply.written(bytes_written);
@@ -180,7 +179,7 @@ impl Filesystem for FuseSpikeFs {
         reply: ReplyEmpty,
     ) {
         fuse_log!("flush fh={}", fh.0);
-        match block_on(self.vfs.flush(from_fh(fh))) {
+        match self.vfs.flush(from_fh(fh)) {
             Ok(()) => {
                 fuse_log!("flush ok");
                 reply.ok();
@@ -200,7 +199,7 @@ impl Filesystem for FuseSpikeFs {
         reply: ReplyEmpty,
     ) {
         fuse_log!("release fh={}", fh.0);
-        match block_on(self.vfs.release(from_fh(fh))) {
+        match self.vfs.release(from_fh(fh)) {
             Ok(()) => {
                 fuse_log!("release ok");
                 reply.ok();
@@ -223,7 +222,7 @@ impl Filesystem for FuseSpikeFs {
         mut reply: ReplyDirectory,
     ) {
         fuse_log!("readdir ino={} offset={offset}", ino.0);
-        match block_on(self.vfs.readdir(from_ino(ino))) {
+        match self.vfs.readdir(from_ino(ino)) {
             Ok(entries) => {
                 let total = entries.len();
                 for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
@@ -276,7 +275,7 @@ impl Filesystem for FuseSpikeFs {
         fuse_log!("create parent={} name={:?} mode={mode:o}", parent.0, name);
         let request = CreateRequest::file(from_ino(parent), name.to_owned(), mode);
 
-        match block_on(self.vfs.create(request)) {
+        match self.vfs.create(request) {
             Ok(created) => {
                 let Some(opened) = created.opened else {
                     fuse_log!("create error missing opened handle");
@@ -314,7 +313,7 @@ impl Filesystem for FuseSpikeFs {
         fuse_log!("mkdir parent={} name={:?} mode={mode:o}", parent.0, name);
         let request = CreateRequest::directory(from_ino(parent), name.to_owned(), mode);
 
-        match block_on(self.vfs.mkdir(request)) {
+        match self.vfs.mkdir(request) {
             Ok(entry) => {
                 fuse_log!("mkdir ok node={}", entry.attr.node_id.0);
                 reply_entry(reply, entry);
@@ -325,7 +324,7 @@ impl Filesystem for FuseSpikeFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         fuse_log!("unlink parent={} name={:?}", parent.0, name);
-        match block_on(self.vfs.unlink(from_ino(parent), name)) {
+        match self.vfs.unlink(from_ino(parent), name) {
             Ok(()) => {
                 fuse_log!("unlink ok");
                 reply.ok();
@@ -336,7 +335,7 @@ impl Filesystem for FuseSpikeFs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         fuse_log!("rmdir parent={} name={:?}", parent.0, name);
-        match block_on(self.vfs.rmdir(from_ino(parent), name)) {
+        match self.vfs.rmdir(from_ino(parent), name) {
             Ok(()) => {
                 fuse_log!("rmdir ok");
                 reply.ok();

@@ -1,0 +1,7 @@
+[package]
+name = "epoch-vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-vfs-api = { path = "../epoch-vfs-api" }

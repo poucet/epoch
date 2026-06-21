@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/epoch-cas",
     "crates/epoch-fuse",
+    "crates/epoch-vfs",
     "crates/epoch-vfs-api",
 ]
 resolver = "3"
