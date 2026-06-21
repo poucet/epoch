@@ -1,0 +1,9 @@
+[package]
+name = "epoch-file-cas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+bytes = "1"
+thiserror = "2"

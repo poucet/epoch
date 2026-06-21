@@ -115,6 +115,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "epoch-file-cas"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "epoch-cas",
+ "thiserror",
+]
+
+[[package]]
 name = "epoch-fuse"
 version = "0.1.0"
 dependencies = [

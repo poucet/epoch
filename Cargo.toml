@@ -2,8 +2,9 @@
 members = [
     ".",
     "crates/epoch-cas",
-    "crates/epoch-tree",
+    "crates/epoch-file-cas",
     "crates/epoch-fuse",
+    "crates/epoch-tree",
     "crates/epoch-tree-cas",
     "crates/epoch-vfs",
     "crates/epoch-vfs-api",
