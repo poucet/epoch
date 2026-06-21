@@ -94,6 +94,28 @@ impl OverlayProbeVfs {
             keep_cache: false,
         })
     }
+
+    /// Synthesize attributes for a node inside the `.vfs` control plane.
+    fn control_attr(&self, path: &Path, control: ControlPlane) -> VfsResult<NodeAttr> {
+        let node_id = self.id_for_path(path)?;
+        Ok(match control {
+            ControlPlane::Root | ControlPlane::CasDir => control_dir_attr(node_id),
+            ControlPlane::CasEntry => cas_entry_attr(node_id, cas_content(path).len() as u64),
+            ControlPlane::Passthrough => return Err(VfsError::NotFound),
+        })
+    }
+
+    /// Build the leading `.`/`..` entries shared by every directory listing.
+    fn dot_entries(&self, node_id: NodeId, path: &Path) -> VfsResult<Vec<DirEntry>> {
+        let parent_id = parent_path(path)
+            .map(|parent| self.id_for_path(&parent))
+            .transpose()?
+            .unwrap_or(node_id);
+        Ok(vec![
+            DirEntry::new(node_id, OsString::from("."), NodeKind::Directory),
+            DirEntry::new(parent_id, OsString::from(".."), NodeKind::Directory),
+        ])
+    }
 }
 
 impl VfsService for OverlayProbeVfs {
@@ -105,9 +127,15 @@ impl VfsService for OverlayProbeVfs {
             );
             let parent_path = self.path_for_node(parent)?;
             let child = child_path(&parent_path, name)?;
-            let metadata = fs::symlink_metadata(self.lower_path(&child)).map_err(map_io_error)?;
-            let node_id = self.id_for_path(&child)?;
-            let entry = Entry::new(attr_from_metadata(node_id, &metadata));
+            let attr = match classify(&child) {
+                ControlPlane::Passthrough => {
+                    let metadata =
+                        fs::symlink_metadata(self.lower_path(&child)).map_err(map_io_error)?;
+                    attr_from_metadata(self.id_for_path(&child)?, &metadata)
+                }
+                control => self.control_attr(&child, control)?,
+            };
+            let entry = Entry::new(attr);
             eprintln!(
                 "[epoch-fuse:vfs] lookup -> node={} kind={:?} size={}",
                 entry.attr.node_id.0, entry.attr.kind, entry.attr.size
@@ -120,8 +148,14 @@ impl VfsService for OverlayProbeVfs {
         Box::pin(async move {
             eprintln!("[epoch-fuse:vfs] getattr node={}", node_id.0);
             let path = self.path_for_node(node_id)?;
-            let metadata = fs::symlink_metadata(self.lower_path(&path)).map_err(map_io_error)?;
-            let attr = attr_from_metadata(node_id, &metadata);
+            let attr = match classify(&path) {
+                ControlPlane::Passthrough => {
+                    let metadata =
+                        fs::symlink_metadata(self.lower_path(&path)).map_err(map_io_error)?;
+                    attr_from_metadata(node_id, &metadata)
+                }
+                control => self.control_attr(&path, control)?,
+            };
             eprintln!(
                 "[epoch-fuse:vfs] getattr -> kind={:?} size={}",
                 attr.kind, attr.size
@@ -134,39 +168,56 @@ impl VfsService for OverlayProbeVfs {
         Box::pin(async move {
             eprintln!("[epoch-fuse:vfs] readdir node={}", node_id.0);
             let path = self.path_for_node(node_id)?;
-            let lower_path = self.lower_path(&path);
-            let metadata = fs::symlink_metadata(&lower_path).map_err(map_io_error)?;
-            if !metadata.is_dir() {
-                return Err(VfsError::NotDirectory);
+            let mut entries = self.dot_entries(node_id, &path)?;
+            match classify(&path) {
+                ControlPlane::Root => {
+                    // `.vfs` exposes only the feature directories it implements.
+                    let cas = self.id_for_path(&path.join(CAS_DIR))?;
+                    entries.push(DirEntry::new(cas, OsString::from(CAS_DIR), NodeKind::Directory));
+                }
+                ControlPlane::CasDir => {
+                    // Intentionally not listable: cas entries are addressable by id only.
+                    eprintln!("[epoch-fuse:vfs] readdir cas -> entries not listable");
+                }
+                ControlPlane::CasEntry => return Err(VfsError::NotDirectory),
+                ControlPlane::Passthrough => {
+                    let lower_path = self.lower_path(&path);
+                    let metadata = fs::symlink_metadata(&lower_path).map_err(map_io_error)?;
+                    if !metadata.is_dir() {
+                        return Err(VfsError::NotDirectory);
+                    }
+
+                    for entry in fs::read_dir(lower_path).map_err(map_io_error)? {
+                        let entry = entry.map_err(map_io_error)?;
+                        let name = entry.file_name();
+                        // The synthetic control plane shadows any lower entry of the same name.
+                        if path.as_os_str().is_empty() && name == OsStr::new(CONTROL_DIR) {
+                            continue;
+                        }
+                        let child = child_path(&path, &name)?;
+                        let metadata = entry.metadata().map_err(map_io_error)?;
+                        let child_id = self.id_for_path(&child)?;
+                        let kind = kind_from_metadata(&metadata);
+                        eprintln!(
+                            "[epoch-fuse:vfs] readdir child node={} name={:?} kind={kind:?}",
+                            child_id.0, name
+                        );
+                        entries.push(DirEntry::new(child_id, name, kind));
+                    }
+
+                    // Surface the control plane at the root so it is discoverable.
+                    if path.as_os_str().is_empty() {
+                        let vfs = self.id_for_path(Path::new(CONTROL_DIR))?;
+                        entries.push(DirEntry::new(
+                            vfs,
+                            OsString::from(CONTROL_DIR),
+                            NodeKind::Directory,
+                        ));
+                    }
+                }
             }
 
-            let parent_id = parent_path(&path)
-                .map(|parent| self.id_for_path(&parent))
-                .transpose()?
-                .unwrap_or(node_id);
-            let mut entries = vec![
-                DirEntry::new(node_id, OsString::from("."), NodeKind::Directory),
-                DirEntry::new(parent_id, OsString::from(".."), NodeKind::Directory),
-            ];
-
-            for entry in fs::read_dir(lower_path).map_err(map_io_error)? {
-                let entry = entry.map_err(map_io_error)?;
-                let name = entry.file_name();
-                let child = child_path(&path, &name)?;
-                let metadata = entry.metadata().map_err(map_io_error)?;
-                let child_id = self.id_for_path(&child)?;
-                let kind = kind_from_metadata(&metadata);
-                eprintln!(
-                    "[epoch-fuse:vfs] readdir child node={} name={:?} kind={kind:?}",
-                    child_id.0, name
-                );
-                entries.push(DirEntry::new(child_id, name, kind));
-            }
-
-            eprintln!(
-                "[epoch-fuse:vfs] readdir -> {} entries",
-                entries.len()
-            );
+            eprintln!("[epoch-fuse:vfs] readdir -> {} entries", entries.len());
             Ok(entries)
         })
     }
@@ -183,9 +234,17 @@ impl VfsService for OverlayProbeVfs {
             }
 
             let path = self.path_for_node(request.node_id)?;
-            let metadata = fs::symlink_metadata(self.lower_path(&path)).map_err(map_io_error)?;
-            if metadata.is_dir() {
-                return Err(VfsError::IsDirectory);
+            match classify(&path) {
+                // Synthetic read-only file; fall through to register a handle.
+                ControlPlane::CasEntry => {}
+                ControlPlane::Root | ControlPlane::CasDir => return Err(VfsError::IsDirectory),
+                ControlPlane::Passthrough => {
+                    let metadata =
+                        fs::symlink_metadata(self.lower_path(&path)).map_err(map_io_error)?;
+                    if metadata.is_dir() {
+                        return Err(VfsError::IsDirectory);
+                    }
+                }
             }
 
             let opened = self.open_handle(path)?;
@@ -209,16 +268,15 @@ impl VfsService for OverlayProbeVfs {
                     .or_else(|| state.path_by_id.get(&request.node_id).cloned())
                     .ok_or(VfsError::NotFound)?
             };
-            let data = fs::read(self.lower_path(&path)).map_err(map_io_error)?;
-            let start = usize::try_from(request.offset)
-                .map_err(|_| VfsError::InvalidInput("read offset exceeds usize".to_owned()))?;
-            let size = usize::try_from(request.size)
-                .map_err(|_| VfsError::InvalidInput("read size exceeds usize".to_owned()))?;
-            let end = start.saturating_add(size).min(data.len());
-            let slice = if start >= data.len() {
-                Vec::new()
-            } else {
-                data[start..end].to_vec()
+            let slice = match classify(&path) {
+                ControlPlane::CasEntry => {
+                    slice_bytes(&cas_content(&path), request.offset, request.size)?
+                }
+                ControlPlane::Passthrough => {
+                    let data = fs::read(self.lower_path(&path)).map_err(map_io_error)?;
+                    slice_bytes(&data, request.offset, request.size)?
+                }
+                ControlPlane::Root | ControlPlane::CasDir => return Err(VfsError::IsDirectory),
             };
             eprintln!("[epoch-fuse:vfs] read -> {} bytes", slice.len());
             Ok(slice)
@@ -293,6 +351,90 @@ impl VfsService for OverlayProbeVfs {
             Ok(())
         })
     }
+}
+
+/// Name of the synthetic control-plane directory at the mount root.
+const CONTROL_DIR: &str = ".vfs";
+/// Name of the content-addressed-store directory inside the control plane.
+const CAS_DIR: &str = "cas";
+
+/// Classification of a relative path against the `.vfs` control plane.
+#[derive(Clone, Copy, Debug)]
+enum ControlPlane {
+    /// Outside the control plane; served from the lower directory.
+    Passthrough,
+    /// The `.vfs` directory itself.
+    Root,
+    /// The `.vfs/cas` directory (entries are addressable but not listable).
+    CasDir,
+    /// A `.vfs/cas/<cas-id>` synthetic file whose contents are the id.
+    CasEntry,
+}
+
+fn classify(path: &Path) -> ControlPlane {
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first == OsStr::new(CONTROL_DIR) => {
+            match components.next() {
+                None => ControlPlane::Root,
+                Some(Component::Normal(second)) if second == OsStr::new(CAS_DIR) => {
+                    match (components.next(), components.next()) {
+                        (None, _) => ControlPlane::CasDir,
+                        (Some(Component::Normal(_)), None) => ControlPlane::CasEntry,
+                        // cas ids have no children: deeper paths fall through to the
+                        // lower directory, which reports them as missing.
+                        _ => ControlPlane::Passthrough,
+                    }
+                }
+                // `.vfs/<other>` is not a defined control entry yet.
+                _ => ControlPlane::Passthrough,
+            }
+        }
+        _ => ControlPlane::Passthrough,
+    }
+}
+
+fn control_dir_attr(node_id: NodeId) -> NodeAttr {
+    let mut attr = NodeAttr::directory(node_id, SystemTime::now());
+    attr.perm = 0o555;
+    attr
+}
+
+fn cas_entry_attr(node_id: NodeId, size: u64) -> NodeAttr {
+    let mut attr = NodeAttr::regular_file(node_id, size, SystemTime::now());
+    attr.perm = 0o444;
+    attr
+}
+
+/// Contents of a `.vfs/cas/<cas-id>` file: the id itself, newline-terminated.
+fn cas_content(path: &Path) -> Vec<u8> {
+    let mut bytes = path.file_name().map(os_str_bytes).unwrap_or_default();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[cfg(unix)]
+fn os_str_bytes(name: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn os_str_bytes(name: &OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Clamp a read to the bytes available for `[offset, offset + size)`.
+fn slice_bytes(data: &[u8], offset: u64, size: u32) -> VfsResult<Vec<u8>> {
+    let start = usize::try_from(offset)
+        .map_err(|_| VfsError::InvalidInput("read offset exceeds usize".to_owned()))?;
+    let size = usize::try_from(size)
+        .map_err(|_| VfsError::InvalidInput("read size exceeds usize".to_owned()))?;
+    if start >= data.len() {
+        return Ok(Vec::new());
+    }
+    let end = start.saturating_add(size).min(data.len());
+    Ok(data[start..end].to_vec())
 }
 
 fn id_for_path(state: &mut ProbeState, next_node_id: &AtomicU64, path: PathBuf) -> NodeId {
