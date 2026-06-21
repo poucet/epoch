@@ -131,6 +131,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "epoch-tree"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "epoch-cas",
+ "thiserror",
+]
+
+[[package]]
 name = "epoch-vfs-api"
 version = "0.1.0"
 
