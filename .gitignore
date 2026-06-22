@@ -4,3 +4,4 @@
 # jj/git worktrees live here (see CLAUDE.md): ignore the worktrees, keep the directory
 /.worktrees/*
 !/.worktrees/.gitkeep
+.DS_Store
