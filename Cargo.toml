@@ -4,6 +4,7 @@ members = [
     "crates/epoch-cas",
     "crates/epoch-tree",
     "crates/epoch-fuse",
+    "crates/epoch-tree-cas",
     "crates/epoch-vfs",
     "crates/epoch-vfs-api",
 ]
