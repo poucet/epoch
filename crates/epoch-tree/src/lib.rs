@@ -34,7 +34,8 @@
 //! - [`TreeEntry`] — one `(name, id, mode, size)` child record. Names are raw
 //!   bytes (unix filenames are not guaranteed UTF-8).
 //! - [`EntryId`] — the tagged child reference: `Blob(B)` for a foreign file
-//!   blob, `Tree(`[`TreeId`]`)` for a subtree.
+//!   blob, `Tree(`[`TreeId`]`)` for a subtree, or `Tombstone` for an overlay
+//!   whiteout (see below).
 //! - [`TreeId`] — a tree object's own content-address; a concrete newtype over
 //!   the kernel's [`CASHash`](epoch_cas::CASHash).
 //! - [`BlobRef`] — the bound a foreign blob-id type must meet to be referenced
@@ -43,6 +44,18 @@
 //! **Symlinks** need no special entry kind: a symlink is a [blob](EntryId::Blob)
 //! entry whose mode is [`SYMLINK_MODE`] and whose blob bytes are the link
 //! target (git-style). See [`entry`] for the rationale.
+//!
+//! ## Trees as sparse overlay layers
+//!
+//! Besides being a complete directory listing, a [`Tree`] can serve as a
+//! **sparse overlay layer** over a lower/base tree. The
+//! [`Tombstone`](EntryId::Tombstone) entry kind is the whiteout marker for that
+//! mode. Read against a base: an *absent* name falls through to the lower layer,
+//! a tombstone *hides* the lower entry (deletion), and a blob/tree entry
+//! *overrides* it. A tree with no tombstones, read with no base, is a plain
+//! complete tree — the overlay model is fully backward compatible. See
+//! [`entry`] for the detailed semantics and [`codec`] for the compact tombstone
+//! wire encoding.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -52,11 +52,16 @@ fn id_hex_roundtrip_and_formatting() {
     // CASHash), the tree arm holds a TreeId.
     let blob_entry: EntryId<CASHash> = EntryId::Blob(h);
     assert!(blob_entry.is_blob());
-    assert_eq!(blob_entry.as_cas_hash(), h);
+    assert_eq!(blob_entry.cas_hash(), Some(h));
 
     let tree_entry: EntryId<CASHash> = EntryId::Tree(tree_id);
     assert!(tree_entry.is_tree());
-    assert_eq!(tree_entry.as_cas_hash(), h);
+    assert_eq!(tree_entry.cas_hash(), Some(h));
+
+    // A tombstone addresses no object.
+    let tomb: EntryId<CASHash> = EntryId::Tombstone;
+    assert!(tomb.is_tombstone());
+    assert_eq!(tomb.cas_hash(), None);
 }
 
 #[test]

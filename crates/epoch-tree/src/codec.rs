@@ -11,20 +11,30 @@
 //! ```text
 //! [u8]        format version  (== TREE_FORMAT_VERSION, currently 1)
 //! [u32 LE]    entry count
-//! repeated, in canonical name-ascending order:
-//!     [u8]      kind tag       (0 = Blob, 1 = Tree; 2 reserved, never emitted)
+//! repeated, in canonical name-ascending order, one of:
+//!   Blob (tag 0) / Tree (tag 1):
+//!     [u8]      kind tag       (0 = Blob, 1 = Tree)
 //!     [32 bytes] child CASHash raw bytes
 //!     [u32 LE]  mode
 //!     [u64 LE]  size
 //!     [u32 LE]  name length (n)
 //!     [n bytes] raw name bytes
+//!   Tombstone (tag 2) — a whiteout addressing no object:
+//!     [u8]      kind tag       (2 = Tombstone)
+//!     [u32 LE]  name length (n)
+//!     [n bytes] raw name bytes
 //! ```
+//!
+//! A tombstone carries *only* its name — no child hash, no mode, no size — so it
+//! is encoded compactly: tag `2`, the name length, then the raw name. The
+//! decoder branches on the tag, so the per-record width is unambiguous despite
+//! the two shapes.
 //!
 //! Fixed-width little-endian was chosen over a varint scheme for being trivially
 //! unambiguous: there is exactly one byte sequence for any given tree, with no
 //! encoder discretion. Because [`Tree`] always stores entries in canonical order
-//! and the encoder emits them in stored order, the same logical tree always
-//! yields the same bytes regardless of how it was built.
+//! (tombstones included) and the encoder emits them in stored order, the same
+//! logical tree always yields the same bytes regardless of how it was built.
 //!
 //! The blob arm stores `B`'s underlying [`CASHash`] bytes, so the layout is
 //! identical no matter which foreign blob-id type `B` is in play; the codec is
@@ -33,10 +43,10 @@
 //! ## Decode is validating
 //!
 //! [`decode`](TreeCodec::decode) rejects anything that is not canonical:
-//! unknown/wrong version, unknown kind tag, truncated/over-long input, and
-//! names that are not *strictly* ascending (which also catches duplicates). The
-//! strict-ascending check guarantees a decode → encode round-trip reproduces the
-//! input byte-for-byte.
+//! unknown/wrong version, an unknown kind tag (now any tag `> 2`),
+//! truncated/over-long input, and names that are not *strictly* ascending
+//! (which also catches duplicates). The strict-ascending check guarantees a
+//! decode → encode round-trip reproduces the input byte-for-byte.
 
 use core::marker::PhantomData;
 
@@ -54,6 +64,9 @@ pub const TREE_FORMAT_VERSION: u8 = 1;
 const KIND_BLOB: u8 = 0;
 /// Kind tag for a [tree](EntryId::Tree) child.
 const KIND_TREE: u8 = 1;
+/// Kind tag for a [tombstone](EntryId::Tombstone) (overlay whiteout) — no child
+/// hash, mode or size, only the name follows.
+const KIND_TOMBSTONE: u8 = 2;
 
 /// Width of the raw [`CASHash`] field, in bytes.
 const HASH_LEN: usize = 32;
@@ -71,28 +84,47 @@ impl<B: BlobRef + 'static> Codec<Tree<B>> for TreeCodec<B> {
     fn encode(value: &Tree<B>) -> Bytes {
         let entries = value.entries();
 
-        // Pre-size the buffer so encoding is a single allocation: header
-        // (1 + 4) plus, per entry, the fixed fields (1 + 32 + 4 + 8 + 4) and
-        // the variable-length name.
-        let fixed_per_entry = 1 + HASH_LEN + 4 + 8 + 4;
+        // Pre-size the buffer so encoding is a single allocation. Every record
+        // has at least `tag + name_len` (1 + 4) plus its name; Blob/Tree records
+        // additionally carry the fixed child fields (32 + 4 + 8). Over-counting
+        // the fixed part for tombstones would still be a valid upper bound, but
+        // counting it only where it applies keeps the capacity exact.
+        let min_per_entry = 1 + 4;
+        let blob_tree_extra = HASH_LEN + 4 + 8;
         let names_len: usize = entries.iter().map(|e| e.name.len()).sum();
-        let capacity = 1 + 4 + entries.len() * fixed_per_entry + names_len;
+        let fixed_extra: usize = entries
+            .iter()
+            .filter(|e| !e.id.is_tombstone())
+            .count()
+            * blob_tree_extra;
+        let capacity = 1 + 4 + entries.len() * min_per_entry + fixed_extra + names_len;
 
         let mut buf = Vec::with_capacity(capacity);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
         for entry in entries {
-            let (tag, hash): (u8, CASHash) = match &entry.id {
-                EntryId::Blob(b) => (KIND_BLOB, Into::<CASHash>::into(*b)),
-                EntryId::Tree(id) => (KIND_TREE, id.into_cas_hash()),
-            };
-            buf.push(tag);
-            buf.extend_from_slice(hash.as_bytes());
-            buf.extend_from_slice(&entry.mode.to_le_bytes());
-            buf.extend_from_slice(&entry.size.to_le_bytes());
-            buf.extend_from_slice(&(entry.name.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&entry.name);
+            match &entry.id {
+                EntryId::Tombstone => {
+                    // Compact whiteout: tag + name only (no hash/mode/size).
+                    buf.push(KIND_TOMBSTONE);
+                    buf.extend_from_slice(&(entry.name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&entry.name);
+                }
+                blob_or_tree => {
+                    let (tag, hash): (u8, CASHash) = match blob_or_tree {
+                        EntryId::Blob(b) => (KIND_BLOB, Into::<CASHash>::into(*b)),
+                        EntryId::Tree(id) => (KIND_TREE, id.into_cas_hash()),
+                        EntryId::Tombstone => unreachable!("matched non-tombstone arm"),
+                    };
+                    buf.push(tag);
+                    buf.extend_from_slice(hash.as_bytes());
+                    buf.extend_from_slice(&entry.mode.to_le_bytes());
+                    buf.extend_from_slice(&entry.size.to_le_bytes());
+                    buf.extend_from_slice(&(entry.name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&entry.name);
+                }
+            }
         }
 
         Bytes::from(buf)
@@ -116,15 +148,28 @@ impl<B: BlobRef + 'static> Codec<Tree<B>> for TreeCodec<B> {
 
         for _ in 0..count {
             let tag = r.u8()?;
-            let hash = CASHash::from_bytes(r.hash()?);
-            let mode = r.u32()?;
-            let size = r.u64()?;
-            let name_len = r.u32()? as usize;
-            let name = r.bytes(name_len)?;
 
-            let id = match tag {
-                KIND_BLOB => EntryId::Blob(B::from(hash)),
-                KIND_TREE => EntryId::Tree(TreeId::from_cas_hash(hash)),
+            // Branch on the tag *before* reading the body: Blob/Tree carry the
+            // fixed child fields, a tombstone carries only its name.
+            let (id, mode, size, name) = match tag {
+                KIND_BLOB | KIND_TREE => {
+                    let hash = CASHash::from_bytes(r.hash()?);
+                    let mode = r.u32()?;
+                    let size = r.u64()?;
+                    let name_len = r.u32()? as usize;
+                    let name = r.bytes(name_len)?;
+                    let id = if tag == KIND_BLOB {
+                        EntryId::Blob(B::from(hash))
+                    } else {
+                        EntryId::Tree(TreeId::from_cas_hash(hash))
+                    };
+                    (id, mode, size, name)
+                }
+                KIND_TOMBSTONE => {
+                    let name_len = r.u32()? as usize;
+                    let name = r.bytes(name_len)?;
+                    (EntryId::Tombstone, 0u32, 0u64, name)
+                }
                 other => return Err(codec_err(format!("unknown entry kind tag: {other}"))),
             };
 
@@ -282,6 +327,41 @@ mod tests {
     }
 
     #[test]
+    fn overlay_tree_with_tombstones_roundtrips_byte_stable() {
+        // A sparse overlay layer mixing all three kinds, with non-UTF8 names,
+        // built in arbitrary order (Tree::from_entries canonicalizes).
+        let t = Tree::from_entries([
+            blob_entry(b"alpha", 1, 0o100644, 10),
+            tombstone_entry(b"\xff\x00gone"),
+            tree_entry(b"sub", 2, 0o040000),
+            tombstone_entry(b"zap"),
+        ])
+        .unwrap();
+
+        let enc = TreeCodec::<CASHash>::encode(&t);
+        let dec = TreeCodec::<CASHash>::decode(&enc).unwrap();
+        assert_eq!(dec, t);
+        // The decoded tombstones survive as whiteouts with zero mode/size.
+        let gone = dec.get(b"\xff\x00gone").unwrap();
+        assert!(gone.id.is_tombstone());
+        assert_eq!(gone.id.cas_hash(), None);
+        assert_eq!((gone.mode, gone.size), (0, 0));
+        // Determinism: re-encoding the decoded value is byte-identical.
+        assert_eq!(TreeCodec::<CASHash>::encode(&dec), enc);
+    }
+
+    #[test]
+    fn tombstone_only_tree_roundtrips() {
+        let t = Tree::from_entries([tombstone_entry(b"a"), tombstone_entry(b"b")]).unwrap();
+        let enc = TreeCodec::<CASHash>::encode(&t);
+        // Each tombstone is the compact shape: tag(1) + name_len(4) + name(1).
+        assert_eq!(enc.len(), 1 + 4 + 2 * (1 + 4 + 1));
+        let dec = TreeCodec::<CASHash>::decode(&enc).unwrap();
+        assert_eq!(dec, t);
+        assert!(dec.iter().all(|e| e.id.is_tombstone()));
+    }
+
+    #[test]
     fn encode_is_deterministic_across_insertion_orders() {
         let a = Tree::from_entries([
             blob_entry(b"a", 1, 0o100644, 1),
@@ -308,12 +388,17 @@ mod tests {
         ));
     }
 
+    fn tombstone_entry(name: &[u8]) -> TreeEntry<CASHash> {
+        TreeEntry::tombstone(Bytes::copy_from_slice(name))
+    }
+
     #[test]
     fn decode_rejects_unknown_kind_tag() {
         let t = Tree::from_entries([blob_entry(b"x", 1, 0o100644, 0)]).unwrap();
         let mut enc = TreeCodec::<CASHash>::encode(&t).to_vec();
         // The kind tag sits right after the 1-byte version + 4-byte count.
-        enc[5] = 2;
+        // Tag 2 is now Tombstone, so an *unknown* tag must be > 2.
+        enc[5] = 3;
         assert!(matches!(
             TreeCodec::<CASHash>::decode(&enc),
             Err(CASError::Codec(_))
@@ -374,6 +459,40 @@ mod tests {
             buf.extend_from_slice(&1u32.to_le_bytes());
             buf.push(b'a');
         }
+        assert!(matches!(
+            TreeCodec::<CASHash>::decode(&buf),
+            Err(CASError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_tombstone_with_non_ascending_name() {
+        // Two compact tombstone records in descending name order ("b" then "a")
+        // must be rejected just like Blob/Tree records — tombstones participate
+        // in the strict-ascending invariant.
+        let mut buf = Vec::new();
+        buf.push(TREE_FORMAT_VERSION);
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for name in [b"b".as_slice(), b"a".as_slice()] {
+            buf.push(KIND_TOMBSTONE);
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name);
+        }
+        assert!(matches!(
+            TreeCodec::<CASHash>::decode(&buf),
+            Err(CASError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_tombstone_name() {
+        // A tombstone record claiming a 4-byte name but providing only 1.
+        let mut buf = Vec::new();
+        buf.push(TREE_FORMAT_VERSION);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.push(KIND_TOMBSTONE);
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.push(b'x');
         assert!(matches!(
             TreeCodec::<CASHash>::decode(&buf),
             Err(CASError::Codec(_))

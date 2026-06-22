@@ -161,6 +161,13 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                     );
                     self.hydrate_into(child, sub)?;
                 }
+                EntryId::Tombstone => {
+                    // A tombstone is an overlay whiteout; a pure (non-overlay)
+                    // hydrate has no lower layer to hide, so it cannot occur
+                    // here. Skip it.
+                    // TODO(overlay): handled in the upcoming overlay WorkingTree.
+                    continue;
+                }
             }
             children.insert(name, child);
         }

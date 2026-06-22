@@ -16,9 +16,24 @@
 //!   provides. The two are wired together at a higher level.
 //!
 //! [`EntryId<B>`](EntryId) is the tagged union actually stored in a
-//! [`TreeEntry`](crate::TreeEntry): it both carries the child address *and*
-//! records whether the child is a blob (`B`) or a tree ([`TreeId`]) — the one
-//! bit a parent needs to interpret its children.
+//! [`TreeEntry`](crate::TreeEntry): it carries the child address *and* records
+//! whether the child is a blob (`B`), a tree ([`TreeId`]), or a *tombstone*
+//! (whiteout) — the kind a parent needs to interpret (or hide) its children.
+//!
+//! ## Overlay semantics
+//!
+//! A [`Tree`](crate::Tree) is normally a *complete* directory listing. It can
+//! also act as a **sparse overlay layer** over a lower/base tree, in which case
+//! its entries are read against that base:
+//!
+//! - an **absent** name falls through to the lower layer;
+//! - a [`Tombstone`](EntryId::Tombstone) entry **hides** the lower entry
+//!   (a whiteout) — the name is treated as deleted in the merged view;
+//! - a [`Blob`](EntryId::Blob)/[`Tree`](EntryId::Tree) entry **overrides** the
+//!   lower entry at that name.
+//!
+//! A tree that contains no tombstones, read with no base, is still a plain
+//! complete tree — the overlay model is backward compatible.
 
 use std::fmt;
 
@@ -85,19 +100,24 @@ impl fmt::Debug for TreeId {
     }
 }
 
-/// A tree-entry child reference: a content-address tagged with the kind of
-/// object it points at.
+/// A tree-entry child reference: the kind of object a name points at (or a
+/// whiteout hiding it in an overlay).
 ///
-/// A parent tree needs exactly one bit beyond the raw address — *is this child a
-/// blob or another tree?* — to know how to interpret it. `EntryId` carries that
-/// bit alongside the strongly-typed id. The blob arm holds a foreign blob-id
-/// type `B` (see [`BlobRef`]); the tree arm holds this crate's own [`TreeId`].
+/// For [`Blob`](EntryId::Blob)/[`Tree`](EntryId::Tree) the variant carries the
+/// strongly-typed child address; the blob arm holds a foreign blob-id type `B`
+/// (see [`BlobRef`]), the tree arm holds this crate's own [`TreeId`]. The third
+/// kind, [`Tombstone`](EntryId::Tombstone), carries no address: it marks the
+/// name as deleted relative to a lower overlay layer. See the
+/// [module docs](self) for the full overlay semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum EntryId<B> {
     /// The child is a file blob, addressed by the foreign blob-id type `B`.
     Blob(B),
     /// The child is a subtree.
     Tree(TreeId),
+    /// A whiteout: in an overlay this name is hidden (deleted) relative to the
+    /// lower/base layer. It addresses no object and so has no content-hash.
+    Tombstone,
 }
 
 impl<B> EntryId<B> {
@@ -110,17 +130,24 @@ impl<B> EntryId<B> {
     pub const fn is_tree(&self) -> bool {
         matches!(self, EntryId::Tree(_))
     }
+
+    /// Whether this entry is a whiteout (overlay deletion marker).
+    pub const fn is_tombstone(&self) -> bool {
+        matches!(self, EntryId::Tombstone)
+    }
 }
 
 impl<B: BlobRef> EntryId<B> {
-    /// The underlying content-address regardless of kind.
+    /// The underlying content-address, or `None` for a tombstone.
     ///
-    /// Returned by value: a blob id converts into its [`CASHash`] (consuming the
-    /// `Copy` value), and a tree id unwraps its own.
-    pub fn as_cas_hash(&self) -> CASHash {
+    /// A [`Blob`](EntryId::Blob) id converts into its [`CASHash`] (consuming the
+    /// `Copy` value) and a [`Tree`](EntryId::Tree) id unwraps its own; a
+    /// [`Tombstone`](EntryId::Tombstone) addresses no object and yields `None`.
+    pub fn cas_hash(&self) -> Option<CASHash> {
         match self {
-            EntryId::Blob(b) => (*b).into(),
-            EntryId::Tree(t) => t.into_cas_hash(),
+            EntryId::Blob(b) => Some((*b).into()),
+            EntryId::Tree(t) => Some(t.into_cas_hash()),
+            EntryId::Tombstone => None,
         }
     }
 }
@@ -163,13 +190,20 @@ mod tests {
         let th = sample_hash(5);
         let blob: EntryId<CASHash> = EntryId::Blob(bh);
         let tree: EntryId<CASHash> = EntryId::Tree(TreeId::from_cas_hash(th));
+        let tomb: EntryId<CASHash> = EntryId::Tombstone;
 
         assert!(blob.is_blob());
         assert!(!blob.is_tree());
+        assert!(!blob.is_tombstone());
         assert!(tree.is_tree());
         assert!(!tree.is_blob());
+        assert!(!tree.is_tombstone());
+        assert!(tomb.is_tombstone());
+        assert!(!tomb.is_blob());
+        assert!(!tomb.is_tree());
 
-        assert_eq!(blob.as_cas_hash(), bh);
-        assert_eq!(tree.as_cas_hash(), th);
+        assert_eq!(blob.cas_hash(), Some(bh));
+        assert_eq!(tree.cas_hash(), Some(th));
+        assert_eq!(tomb.cas_hash(), None);
     }
 }

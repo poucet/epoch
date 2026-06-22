@@ -21,6 +21,25 @@
 //! (tree).
 //!
 //! [blob]: EntryId::Blob
+//!
+//! ## Tombstones (overlay whiteouts)
+//!
+//! A tree is normally a complete directory listing, but it can also act as a
+//! **sparse overlay layer** over a lower/base tree. A [tombstone] entry is the
+//! whiteout marker for that mode. When a tree is read as an overlay over a base:
+//!
+//! - an **absent** name falls through to the lower layer;
+//! - a [tombstone] entry **hides** the lower entry (a deletion in the merged
+//!   view);
+//! - a [blob]/[tree] entry **overrides** the lower entry at that name.
+//!
+//! A tombstone addresses no object: its [`id`](TreeEntry::id) is
+//! [`EntryId::Tombstone`] and its [`mode`](TreeEntry::mode) and
+//! [`size`](TreeEntry::size) are `0`. A tree with no tombstones, read with no
+//! base, is a plain complete tree — the overlay model is backward compatible.
+//!
+//! [tree]: EntryId::Tree
+//! [tombstone]: EntryId::Tombstone
 
 use epoch_cas::Bytes;
 
@@ -79,6 +98,19 @@ impl<B> TreeEntry<B> {
             size: 0,
         }
     }
+
+    /// Construct a tombstone (whiteout) entry hiding `name` in an overlay layer.
+    ///
+    /// A tombstone addresses no object, so both `mode` and `size` are fixed to
+    /// `0`; see the [module docs](self) for the overlay semantics.
+    pub fn tombstone(name: impl Into<Bytes>) -> TreeEntry<B> {
+        TreeEntry {
+            name: name.into(),
+            id: EntryId::Tombstone,
+            mode: 0,
+            size: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +141,17 @@ mod tests {
         assert_eq!(e.id, EntryId::Tree(id));
         assert_eq!(e.size, 0);
         assert!(e.id.is_tree());
+    }
+
+    #[test]
+    fn tombstone_constructor_is_zero_moded_whiteout() {
+        let e = TreeEntry::<CASHash>::tombstone(Bytes::from_static(b"gone"));
+        assert_eq!(e.name, Bytes::from_static(b"gone"));
+        assert_eq!(e.id, EntryId::Tombstone);
+        assert_eq!(e.mode, 0);
+        assert_eq!(e.size, 0);
+        assert!(e.id.is_tombstone());
+        assert_eq!(e.id.cas_hash(), None);
     }
 
     #[test]
