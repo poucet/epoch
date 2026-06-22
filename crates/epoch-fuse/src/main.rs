@@ -1,7 +1,7 @@
-use std::{env, fs, sync::Arc};
+use std::{env, fs};
 
 use epoch_fuse::fuser_adapter::mount_spike;
-use epoch_vfs::OverlayProbeVfs;
+use epoch_vfs::overlay_probe;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[epoch-fuse] mounting lower overlay probe lower={:?} mountpoint={:?}",
         lower, mountpoint
     );
-    let vfs = Arc::new(OverlayProbeVfs::new(lower));
+    let vfs = overlay_probe(lower);
     mount_spike(mountpoint, vfs)?;
     Ok(())
 }
