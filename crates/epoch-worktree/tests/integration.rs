@@ -34,7 +34,7 @@ fn seal_then_hydrate_roundtrip() {
     let sealed = wt.seal().unwrap();
 
     // Hydrate a fresh tree from the sealed root (shared backend storage).
-    let wt2 = Wt::from_root(backend.clone(), sealed).unwrap();
+    let mut wt2 = Wt::from_root(backend.clone(), sealed).unwrap();
     let root2 = wt2.root();
 
     let mut top = names(&wt2.readdir(root2).unwrap());
@@ -66,8 +66,9 @@ fn write_at_offset_leaves_zero_hole() {
     wt.write_at(id, 4, b"AB").unwrap();
     let sealed = wt.seal().unwrap();
 
-    let wt2 = Wt::from_root(backend.clone(), sealed).unwrap();
-    let f = wt2.lookup(wt2.root(), OsStr::new("sparse")).unwrap();
+    let mut wt2 = Wt::from_root(backend.clone(), sealed).unwrap();
+    let root2 = wt2.root();
+    let f = wt2.lookup(root2, OsStr::new("sparse")).unwrap();
     assert_eq!(wt2.read_at(f, 0, 6).unwrap(), vec![0, 0, 0, 0, b'A', b'B']);
     assert_eq!(wt2.getattr(f).unwrap().size, 6);
 }
@@ -82,14 +83,16 @@ fn overwrite_then_reseal_changes_root() {
 
     // Edit through a hydrated tree, reseal.
     let mut wt2 = Wt::from_root(backend.clone(), root1).unwrap();
-    let f = wt2.lookup(wt2.root(), OsStr::new("f")).unwrap();
+    let r2 = wt2.root();
+    let f = wt2.lookup(r2, OsStr::new("f")).unwrap();
     wt2.write_at(f, 0, b"second!").unwrap();
     let root2 = wt2.seal().unwrap();
 
     assert_ne!(root1, root2);
 
-    let wt3 = Wt::from_root(backend.clone(), root2).unwrap();
-    let f3 = wt3.lookup(wt3.root(), OsStr::new("f")).unwrap();
+    let mut wt3 = Wt::from_root(backend.clone(), root2).unwrap();
+    let r3 = wt3.root();
+    let f3 = wt3.lookup(r3, OsStr::new("f")).unwrap();
     assert_eq!(wt3.read_at(f3, 0, 1024).unwrap(), b"second!");
 }
 
@@ -136,6 +139,323 @@ fn error_cases() {
     // unlink a directory / rmdir a file are rejected
     assert_eq!(wt.unlink(root, OsStr::new("d")).unwrap_err(), VfsError::IsDirectory);
     assert_eq!(wt.rmdir(dir, OsStr::new("child")).unwrap_err(), VfsError::NotDirectory);
+}
+
+/// Copy-on-write overlay semantics: a `WorkingTree` built over a lower
+/// [`VfsService`] must read untouched names through to the lower, copy a file up
+/// into the CAS on first write (leaving the lower unmodified), whiteout deletions
+/// with tombstones, and seal a **sparse** delta that holds only the mutated spine.
+mod overlay {
+    use std::collections::{BTreeMap, HashMap};
+    use std::ffi::{OsStr, OsString};
+    use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
+
+    use epoch_cas::MemoryByteBackend;
+    use epoch_vfs_api::{
+        CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, NodeId, NodeKind,
+        OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+        ROOT_NODE_ID,
+    };
+    use epoch_worktree::WorkingTree;
+
+    use super::names;
+
+    /// A tiny read-only, in-memory lower service used purely as an overlay base.
+    /// Mutating operations return [`VfsError::ReadOnlyFilesystem`] so the tests
+    /// also assert the overlay never writes down into the lower.
+    enum Node {
+        Dir(BTreeMap<OsString, NodeId>),
+        File(Vec<u8>),
+    }
+
+    struct Lower {
+        nodes: HashMap<NodeId, Node>,
+    }
+
+    /// Fluent builder for a [`Lower`] tree; every inserted node gets a fresh id.
+    struct Build {
+        nodes: HashMap<NodeId, Node>,
+        next: u64,
+    }
+
+    impl Build {
+        fn new() -> Self {
+            let mut nodes = HashMap::new();
+            nodes.insert(ROOT_NODE_ID, Node::Dir(BTreeMap::new()));
+            Self {
+                nodes,
+                next: ROOT_NODE_ID.0 + 1,
+            }
+        }
+
+        fn insert(&mut self, parent: NodeId, name: &str, node: Node) -> NodeId {
+            let id = NodeId(self.next);
+            self.next += 1;
+            self.nodes.insert(id, node);
+            if let Some(Node::Dir(m)) = self.nodes.get_mut(&parent) {
+                m.insert(OsString::from(name), id);
+            }
+            id
+        }
+
+        fn file(&mut self, parent: NodeId, name: &str, content: &[u8]) -> NodeId {
+            self.insert(parent, name, Node::File(content.to_vec()))
+        }
+
+        fn dir(&mut self, parent: NodeId, name: &str) -> NodeId {
+            self.insert(parent, name, Node::Dir(BTreeMap::new()))
+        }
+
+        fn build(self) -> Arc<Lower> {
+            Arc::new(Lower { nodes: self.nodes })
+        }
+    }
+
+    impl Lower {
+        fn attr(&self, id: NodeId) -> VfsResult<NodeAttr> {
+            match self.nodes.get(&id).ok_or(VfsError::NotFound)? {
+                Node::Dir(_) => Ok(NodeAttr::directory(id, UNIX_EPOCH)),
+                Node::File(b) => Ok(NodeAttr::regular_file(id, b.len() as u64, UNIX_EPOCH)),
+            }
+        }
+    }
+
+    impl VfsService for Lower {
+        fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry> {
+            let dir = match self.nodes.get(&parent).ok_or(VfsError::NotFound)? {
+                Node::Dir(m) => m,
+                _ => return Err(VfsError::NotDirectory),
+            };
+            let id = dir.get(name).copied().ok_or(VfsError::NotFound)?;
+            Ok(Entry::new(self.attr(id)?))
+        }
+
+        fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr> {
+            self.attr(node_id)
+        }
+
+        fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>> {
+            let dir = match self.nodes.get(&node_id).ok_or(VfsError::NotFound)? {
+                Node::Dir(m) => m,
+                _ => return Err(VfsError::NotDirectory),
+            };
+            Ok(dir
+                .iter()
+                .map(|(name, &id)| {
+                    let kind = match self.nodes.get(&id) {
+                        Some(Node::Dir(_)) => NodeKind::Directory,
+                        _ => NodeKind::RegularFile,
+                    };
+                    DirEntry::new(id, name.clone(), kind)
+                })
+                .collect())
+        }
+
+        fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+            Ok(OpenedFile {
+                handle: FileHandle(request.node_id.0),
+                direct_io: false,
+                keep_cache: true,
+            })
+        }
+
+        fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+            match self.nodes.get(&request.node_id).ok_or(VfsError::NotFound)? {
+                Node::File(b) => {
+                    let start = (request.offset as usize).min(b.len());
+                    let end = start.saturating_add(request.size as usize).min(b.len());
+                    Ok(b[start..end].to_vec())
+                }
+                Node::Dir(_) => Err(VfsError::IsDirectory),
+            }
+        }
+
+        fn write(&self, _: WriteRequest<'_>) -> VfsResult<u32> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
+        fn create(&self, _: CreateRequest) -> VfsResult<CreatedNode> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
+        fn mkdir(&self, _: CreateRequest) -> VfsResult<Entry> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
+        fn unlink(&self, _: NodeId, _: &OsStr) -> VfsResult<()> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
+        fn rmdir(&self, _: NodeId, _: &OsStr) -> VfsResult<()> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
+        fn flush(&self, _: FileHandle) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn release(&self, _: FileHandle) -> VfsResult<()> {
+            Ok(())
+        }
+    }
+
+    type Wt = WorkingTree<MemoryByteBackend>;
+
+    /// Untouched names are served straight from the lower, `readdir` merges the
+    /// two layers, and an unmutated overlay seals to a delta that still resolves
+    /// every lower entry on rehydrate.
+    #[test]
+    fn reads_fall_through_and_unmutated_seal_is_empty() {
+        let mut b = Build::new();
+        b.file(ROOT_NODE_ID, "keep.txt", b"lower content");
+        let sub = b.dir(ROOT_NODE_ID, "sub");
+        b.file(sub, "deep.txt", b"deep");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        let keep = wt.lookup(root, OsStr::new("keep.txt")).unwrap();
+        assert_eq!(wt.read_at(keep, 0, 1024).unwrap(), b"lower content");
+        // A repeated lookup returns the *same* overlay id (stable identity).
+        assert_eq!(wt.lookup(root, OsStr::new("keep.txt")).unwrap(), keep);
+
+        let mut top = names(&wt.readdir(root).unwrap());
+        top.sort();
+        assert_eq!(top, vec!["keep.txt".to_string(), "sub".to_string()]);
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let r2 = wt2.root();
+        let keep2 = wt2.lookup(r2, OsStr::new("keep.txt")).unwrap();
+        assert_eq!(wt2.read_at(keep2, 0, 1024).unwrap(), b"lower content");
+        let sub2 = wt2.lookup(r2, OsStr::new("sub")).unwrap();
+        let deep2 = wt2.lookup(sub2, OsStr::new("deep.txt")).unwrap();
+        assert_eq!(wt2.read_at(deep2, 0, 1024).unwrap(), b"deep");
+    }
+
+    /// First write to a fall-through file copies its whole content up into the
+    /// CAS, keeps the same [`NodeId`], reflects the edit, and never touches the
+    /// lower.
+    #[test]
+    fn write_copies_up_and_leaves_lower_untouched() {
+        let mut b = Build::new();
+        let f_lower = b.file(ROOT_NODE_ID, "f.txt", b"original-from-lower");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        let f = wt.lookup(root, OsStr::new("f.txt")).unwrap();
+        wt.write_at(f, 0, b"OVERRIDE").unwrap();
+        assert_eq!(wt.read_at(f, 0, 1024).unwrap(), b"OVERRIDE-from-lower");
+        // Copy-up preserves the inode identity.
+        assert_eq!(wt.lookup(root, OsStr::new("f.txt")).unwrap(), f);
+
+        // The lower blob is unchanged.
+        let from_lower = lower
+            .read(ReadRequest {
+                node_id: f_lower,
+                handle: FileHandle(f_lower.0),
+                offset: 0,
+                size: 1024,
+            })
+            .unwrap();
+        assert_eq!(from_lower, b"original-from-lower");
+
+        // The edit survives seal + rehydrate.
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower, delta).unwrap();
+        let r2 = wt2.root();
+        let f2 = wt2.lookup(r2, OsStr::new("f.txt")).unwrap();
+        assert_eq!(wt2.read_at(f2, 0, 1024).unwrap(), b"OVERRIDE-from-lower");
+    }
+
+    /// Deleting a lower name leaves a whiteout: it disappears from `lookup` and
+    /// `readdir`, and the whiteout survives seal + rehydrate.
+    #[test]
+    fn unlink_lower_leaves_a_whiteout() {
+        let mut b = Build::new();
+        b.file(ROOT_NODE_ID, "a.txt", b"a");
+        b.file(ROOT_NODE_ID, "b.txt", b"b");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        wt.unlink(root, OsStr::new("a.txt")).unwrap();
+        assert_eq!(
+            wt.lookup(root, OsStr::new("a.txt")).unwrap_err(),
+            VfsError::NotFound
+        );
+        assert_eq!(names(&wt.readdir(root).unwrap()), vec!["b.txt".to_string()]);
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower, delta).unwrap();
+        let r2 = wt2.root();
+        assert_eq!(
+            wt2.lookup(r2, OsStr::new("a.txt")).unwrap_err(),
+            VfsError::NotFound
+        );
+        assert_eq!(names(&wt2.readdir(r2).unwrap()), vec!["b.txt".to_string()]);
+    }
+
+    /// Recreating a name that was just whiteout-deleted replaces the tombstone
+    /// with fresh upper content.
+    #[test]
+    fn create_over_a_whiteout() {
+        let mut b = Build::new();
+        b.file(ROOT_NODE_ID, "f", b"lower");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend, lower);
+        let root = wt.root();
+
+        wt.unlink(root, OsStr::new("f")).unwrap();
+        let nf = wt.create(root, OsStr::new("f"), 0o100644).unwrap();
+        wt.write_at(nf, 0, b"upper-new").unwrap();
+        assert_eq!(wt.read_at(nf, 0, 1024).unwrap(), b"upper-new");
+        assert_eq!(names(&wt.readdir(root).unwrap()), vec!["f".to_string()]);
+    }
+
+    /// The sealed delta holds **only** the mutated spine: rehydrating it over an
+    /// *empty* lower shows the copied-up file (and its spine dir) and nothing
+    /// else — the untouched sibling was never stored.
+    #[test]
+    fn seal_stores_only_the_mutated_spine() {
+        let mut b = Build::new();
+        b.file(ROOT_NODE_ID, "keep.txt", b"keep");
+        let sub = b.dir(ROOT_NODE_ID, "sub");
+        b.file(sub, "change.txt", b"old");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower);
+        let root = wt.root();
+        let sub_id = wt.lookup(root, OsStr::new("sub")).unwrap();
+        let ch = wt.lookup(sub_id, OsStr::new("change.txt")).unwrap();
+        wt.write_at(ch, 0, b"new").unwrap();
+        let delta = wt.seal().unwrap();
+
+        // Rehydrate the delta over an EMPTY lower: only the mutated spine remains.
+        let empty = Build::new().build();
+        let mut wt2 = Wt::from_overlay(backend.clone(), empty, delta).unwrap();
+        let r2 = wt2.root();
+        // "keep.txt" was never stored (fell through), so it is absent now.
+        assert_eq!(names(&wt2.readdir(r2).unwrap()), vec!["sub".to_string()]);
+        let s2 = wt2.lookup(r2, OsStr::new("sub")).unwrap();
+        assert_eq!(
+            names(&wt2.readdir(s2).unwrap()),
+            vec!["change.txt".to_string()]
+        );
+        let ch2 = wt2.lookup(s2, OsStr::new("change.txt")).unwrap();
+        assert_eq!(wt2.read_at(ch2, 0, 1024).unwrap(), b"new");
+    }
 }
 
 #[test]
