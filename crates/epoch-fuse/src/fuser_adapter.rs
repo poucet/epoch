@@ -5,8 +5,8 @@ use epoch_vfs_api::{
     OpenRequest, ReadRequest, VfsError, VfsService, WriteRequest,
 };
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    KernelConfig, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, KernelConfig, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 
@@ -20,10 +20,19 @@ impl FuseSpikeFs {
     }
 }
 
+/// Mount the overlay and serve it until unmounted (blocks).
+///
+/// Everywhere except macOS, fuser's own mount works (pure-rust on Linux). On
+/// macOS, fuser's path performs the `mount()` syscall in-process, which macOS 26
+/// rejects with EPERM; [`mount_spike_macos`] routes through macFUSE's privileged
+/// `mount_macfuse` helper instead. See `crate::macfuse`.
+#[cfg(not(target_os = "macos"))]
 pub fn mount_spike(
     mountpoint: impl AsRef<Path>,
     vfs: Arc<dyn VfsService>,
 ) -> Result<(), std::io::Error> {
+    use fuser::{Config, MountOption};
+
     let mut config = Config::default();
     // `AutoUnmount` is intentionally omitted: fuser requires a non-`Owner` ACL
     // (allow_other/allow_root) when it is set, which on macFUSE additionally needs
@@ -37,6 +46,37 @@ pub fn mount_spike(
     fuser::mount2(FuseSpikeFs::new(vfs), mountpoint, &config)
 }
 
+/// macOS variant: mount via macFUSE's `mount_macfuse` helper, then drive the
+/// returned `/dev/macfuse` fd with `Session::from_fd`.
+#[cfg(target_os = "macos")]
+pub fn mount_spike(
+    mountpoint: impl AsRef<Path>,
+    vfs: Arc<dyn VfsService>,
+) -> Result<(), std::io::Error> {
+    use fuser::{Config, Session, SessionACL};
+
+    let mountpoint = mountpoint.as_ref();
+    // Privileged mount through the helper; yields the kernel device fd.
+    let (dev_fd, mount) = crate::macfuse::mount_via_helper(mountpoint, &["fsname=epoch-fuse"])?;
+
+    // Owner-only ACL (no allow_other), matching the non-macOS mount.
+    let session = Session::from_fd(
+        FuseSpikeFs::new(vfs),
+        dev_fd,
+        SessionACL::Owner,
+        Config::default(),
+    )?;
+
+    // `run` is crate-private in fuser; `spawn` + `join` runs the loop on a
+    // worker thread while we block here, giving the same foreground behaviour.
+    let result = session.spawn()?.join();
+
+    // Tear the mount down through the helper on clean exit. (On Ctrl-C the
+    // process is killed outright; mount-mac.sh's trap unmounts in that case.)
+    mount.unmount();
+    result
+}
+
 macro_rules! fuse_log {
     ($($arg:tt)*) => {
         eprintln!("[epoch-fuse:fuse] {}", format_args!($($arg)*));
@@ -47,6 +87,23 @@ impl Filesystem for FuseSpikeFs {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
         fuse_log!("init");
         Ok(())
+    }
+
+    // macFUSE sends an `access` request and, if the filesystem returns ENOSYS
+    // (fuser's default), falls back to its own attribute-based permission check —
+    // which denies directory reads here with EPERM (opendir succeeds, then the
+    // readdir is rejected before it ever reaches us). The overlay enforces its own
+    // policy (reads pass, writes return EROFS), so grant access unconditionally.
+    fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        fuse_log!(
+            "access ino={} mask={:?} req_uid={} req_gid={} pid={}",
+            ino.0,
+            mask,
+            req.uid(),
+            req.gid(),
+            req.pid()
+        );
+        reply.ok();
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -70,10 +127,14 @@ impl Filesystem for FuseSpikeFs {
         match self.vfs.getattr(from_ino(ino)) {
             Ok(attr) => {
                 fuse_log!(
-                    "getattr ok ino={} kind={:?} size={}",
+                    "getattr ok ino={} kind={:?} size={} perm={:o} uid={} gid={} nlink={}",
                     attr.inode_id.0,
                     attr.kind,
-                    attr.size
+                    attr.size,
+                    attr.perm,
+                    attr.uid,
+                    attr.gid,
+                    attr.nlink
                 );
                 let ttl = attr_ttl();
                 let attr = to_file_attr(attr);

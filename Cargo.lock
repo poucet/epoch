@@ -182,6 +182,8 @@ dependencies = [
  "epoch-vfs",
  "epoch-vfs-api",
  "fuser",
+ "libc",
+ "nix",
  "redb",
 ]
 

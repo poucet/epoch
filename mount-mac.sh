@@ -34,16 +34,15 @@ MSG
 fi
 LOWER="$(cd "${LOWER}" && pwd)"   # canonicalize; fail loudly if it doesn't exist
 
-# ── build (links macFUSE via pkg-config `fuse`) ──────────────────────────────
-echo "Building epoch-fuse (release, macFUSE)…" >&2
-cargo build --release -p epoch-fuse --features fuser-mount
+# ── build ────────────────────────────────────────────────────────────────────
+# The `fuser-adapter` feature selects fuser's `macos-no-mount` mode: fuser's own
+# macOS mount does an in-process mount() that macOS 26 rejects with EPERM, so we
+# mount through macFUSE's `mount_macfuse` helper ourselves (see
+# crates/epoch-fuse/src/macfuse.rs) and drive the fd via Session::from_fd. No
+# libfuse linkage, so no pkg-config / FUSE-T entanglement.
+echo "Building epoch-fuse (release, macFUSE helper mount)…" >&2
+cargo build --release -p epoch-fuse --features fuser-adapter
 BIN="${PWD}/target/release/epoch-fuse"
-# Guard against a stale FUSE-T link from an earlier experiment: force macFUSE.
-if otool -L "${BIN}" 2>/dev/null | grep -q 'libfuse-t'; then
-  echo "Relinking fuser against macFUSE…" >&2
-  cargo clean -p fuser >/dev/null 2>&1 || true
-  cargo build --release -p epoch-fuse --features fuser-mount
-fi
 
 # ── mount ────────────────────────────────────────────────────────────────────
 is_mounted() { mount | grep -q " ${MOUNT} "; }

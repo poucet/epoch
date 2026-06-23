@@ -6,3 +6,8 @@
 
 #[cfg(feature = "fuser-support")]
 pub mod fuser_adapter;
+
+/// macOS-only: mount through macFUSE's privileged `mount_macfuse` helper instead
+/// of fuser's in-process `mount()` (which macOS 26 rejects with EPERM).
+#[cfg(all(feature = "fuser-support", target_os = "macos"))]
+mod macfuse;

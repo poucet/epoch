@@ -20,6 +20,13 @@ epoch-timeline-redb = { path = "../epoch-timeline-redb" }
 redb = "2"
 fuser = { version = "0.17", optional = true }
 
+# macOS mounts through the privileged `mount_macfuse` helper (see src/macfuse.rs):
+# socketpair + SCM_RIGHTS fd passing, plus fcntl/umount. `nix` is already in the
+# tree via fuser, so this adds no new transitive cost.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.30", features = ["socket", "fs", "mount"] }
+libc = "0.2"
+
 [[bin]]
 name = "epoch-fuse"
 path = "src/main.rs"
