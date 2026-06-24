@@ -66,10 +66,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use epoch_cas::{Bytes, CASError, SyncByteBackend};
+use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
-use epoch_tree::{EntryId, Tree, TreeEntry, TreeId};
-use epoch_tree_cas::TreeCas;
+use epoch_tree::{EntryId, Tree, TreeEntry, TreeId, TreeStore};
 use epoch_vfs_api::{
     DirEntry, NodeAttr, NodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
     VfsService, ROOT_NODE_ID,
@@ -80,12 +79,12 @@ use epoch_vfs_api::{
 ///
 /// Generic over the byte backend `Bk`. Upper files are stored via [`FileCas`]
 /// and addressed by [`BlobId`]; directories are sealed into [`Tree<BlobId>`]
-/// objects via [`TreeCas`]. With `lower = Some(..)` the tree is a sparse overlay
+/// objects via [`TreeStore`]. With `lower = Some(..)` the tree is a sparse overlay
 /// over that [`VfsService`]; with `lower = None` it is a complete tree. See the
 /// [crate docs](crate) for the layer's role and v1 scope.
 pub struct WorkingTree<Bk> {
     files: FileCas<Bk>,
-    trees: TreeCas<Bk, BlobId>,
+    trees: TreeStore<Bk, BlobId>,
     /// The overlay base. `None` is *pure mode* (today's behaviour): no lower
     /// layer, the working tree is the whole tree.
     lower: Option<Arc<dyn VfsService>>,
@@ -198,7 +197,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         );
         Self {
             files: FileCas::new(backend.clone()),
-            trees: TreeCas::new(backend),
+            trees: TreeStore::new(backend),
             lower,
             inodes,
             next: ROOT_NODE_ID.0 + 1,

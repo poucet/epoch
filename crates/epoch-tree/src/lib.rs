@@ -64,10 +64,12 @@ pub mod codec;
 pub mod entry;
 pub mod error;
 pub mod id;
+pub mod store;
 pub mod tree;
 
 pub use codec::{TreeCodec, TREE_FORMAT_VERSION};
 pub use entry::{TreeEntry, SYMLINK_MODE};
 pub use error::TreeError;
 pub use id::{BlobRef, EntryId, TreeId};
+pub use store::TreeStore;
 pub use tree::Tree;

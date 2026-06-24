@@ -86,6 +86,24 @@ impl TreeId {
     }
 }
 
+/// `From<CASHash>` / `Into<CASHash>`: a [`TreeId`] is a transparent skin over a
+/// content-address, so it satisfies the engine's typed-`Id` bound
+/// (`Copy + From<CASHash> + Into<CASHash>`) and plugs straight into
+/// [`SyncGenericCAS`](epoch_cas::SyncGenericCAS) as its id — that is what
+/// [`TreeStore`](crate::TreeStore) is. Mirrors the const [`from_cas_hash`](TreeId::from_cas_hash)
+/// / [`into_cas_hash`](TreeId::into_cas_hash) helpers.
+impl From<CASHash> for TreeId {
+    fn from(hash: CASHash) -> Self {
+        TreeId(hash)
+    }
+}
+
+impl From<TreeId> for CASHash {
+    fn from(id: TreeId) -> Self {
+        id.0
+    }
+}
+
 /// `Display` is the bare hex, matching [`CASHash`]'s `Display`.
 impl fmt::Display for TreeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

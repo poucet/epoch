@@ -1,8 +1,0 @@
-[package]
-name = "epoch-tree-cas"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-epoch-cas = { path = "../epoch-cas" }
-epoch-tree = { path = "../epoch-tree" }
