@@ -74,6 +74,34 @@ fn write_at_offset_leaves_zero_hole() {
 }
 
 #[test]
+fn truncate_shrinks_zero_extends_and_empties() {
+    let mut wt = Wt::new(MemoryByteBackend::new());
+    let root = wt.root();
+    let f = wt.create(root, OsStr::new("f"), 0o100644).unwrap();
+    wt.write_at(f, 0, b"hello world").unwrap();
+    assert_eq!(wt.getattr(f).unwrap().size, 11);
+
+    // Shrink.
+    wt.truncate(f, 5).unwrap();
+    assert_eq!(wt.getattr(f).unwrap().size, 5);
+    assert_eq!(wt.read_at(f, 0, 1024).unwrap(), b"hello");
+
+    // Zero-extend.
+    wt.truncate(f, 8).unwrap();
+    assert_eq!(wt.getattr(f).unwrap().size, 8);
+    assert_eq!(wt.read_at(f, 0, 1024).unwrap(), b"hello\0\0\0");
+
+    // Empty (the O_TRUNC fast path).
+    wt.truncate(f, 0).unwrap();
+    assert_eq!(wt.getattr(f).unwrap().size, 0);
+    assert!(wt.read_at(f, 0, 1024).unwrap().is_empty());
+
+    // Truncating a directory is rejected.
+    let d = wt.mkdir(root, OsStr::new("d"), 0o040755).unwrap();
+    assert_eq!(wt.truncate(d, 0).unwrap_err(), VfsError::IsDirectory);
+}
+
+#[test]
 fn overwrite_then_reseal_changes_root() {
     let backend = MemoryByteBackend::new();
     let mut wt = Wt::new(backend.clone());
@@ -372,6 +400,38 @@ mod overlay {
         let r2 = wt2.root();
         let f2 = wt2.lookup(r2, OsStr::new("f.txt")).unwrap();
         assert_eq!(wt2.read_at(f2, 0, 1024).unwrap(), b"OVERRIDE-from-lower");
+    }
+
+    /// Truncating a fall-through file copies it up (same NodeId), reflects the
+    /// new length, and never touches the lower.
+    #[test]
+    fn truncate_copies_up_and_leaves_lower_untouched() {
+        let mut b = Build::new();
+        let f_lower = b.file(ROOT_NODE_ID, "f.txt", b"original-from-lower");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        // Truncate to a non-zero length copies the lower content up, then shrinks.
+        let f = wt.lookup(root, OsStr::new("f.txt")).unwrap();
+        wt.truncate(f, 4).unwrap();
+        assert_eq!(wt.read_at(f, 0, 1024).unwrap(), b"orig");
+        assert_eq!(wt.getattr(f).unwrap().size, 4);
+        // Copy-up preserves the inode identity.
+        assert_eq!(wt.lookup(root, OsStr::new("f.txt")).unwrap(), f);
+
+        // The lower blob is unchanged.
+        let from_lower = lower
+            .read(ReadRequest {
+                node_id: f_lower,
+                handle: FileHandle(f_lower.0),
+                offset: 0,
+                size: 1024,
+            })
+            .unwrap();
+        assert_eq!(from_lower, b"original-from-lower");
     }
 
     /// Deleting a lower name leaves a whiteout: it disappears from `lookup` and

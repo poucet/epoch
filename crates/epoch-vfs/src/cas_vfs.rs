@@ -111,13 +111,18 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        // Validate the target exists and is a file; directories are opened via
-        // readdir, not here.
-        if self.lock().getattr(request.node_id)?.kind == NodeKind::Directory {
-            return Err(VfsError::IsDirectory);
+        {
+            let mut tree = self.lock();
+            // Validate the target exists and is a file; directories are opened
+            // via readdir, not here.
+            if tree.getattr(request.node_id)?.kind == NodeKind::Directory {
+                return Err(VfsError::IsDirectory);
+            }
+            // O_TRUNC: empty the file on open (copies up a fall-through file).
+            if request.truncate {
+                tree.truncate(request.node_id, 0)?;
+            }
         }
-        // NOTE(v1): the `truncate` flag (O_TRUNC) is not yet honored — see the
-        // crate TODO; WorkingTree has no truncate primitive.
         Ok(OpenedFile {
             handle: self.next_handle(),
             direct_io: false,
@@ -282,5 +287,27 @@ mod tests {
         let f = svc2.lookup(root, OsStr::new("f")).unwrap().attr.node_id;
         assert_eq!(read_all(&svc2, f), b"first");
         assert_eq!(names(&svc2, root), vec!["f".to_string()]);
+    }
+
+    #[test]
+    fn open_with_truncate_empties_the_file() {
+        let svc = CasVfs::in_memory();
+        let root = ROOT_NODE_ID;
+        let id = write_file(&svc, root, "f", b"some existing content");
+        assert_eq!(svc.getattr(id).unwrap().size, 21);
+
+        // O_TRUNC on open empties the file.
+        let opened = svc
+            .open(OpenRequest {
+                node_id: id,
+                mode: OpenMode::WriteOnly,
+                truncate: true,
+                append: false,
+            })
+            .unwrap();
+        svc.release(opened.handle).unwrap();
+
+        assert_eq!(svc.getattr(id).unwrap().size, 0);
+        assert!(read_all(&svc, id).is_empty());
     }
 }

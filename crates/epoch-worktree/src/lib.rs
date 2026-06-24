@@ -532,6 +532,46 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     ///   keeping the **same [`NodeId`]**, and the write is applied. The lower is
     ///   never mutated.
     pub fn write_at(&mut self, node: NodeId, off: u64, data: &[u8]) -> VfsResult<u32> {
+        self.make_dirty(node)?;
+        self.writer_mut(node)?.write_at(off, data);
+        Ok(data.len() as u32)
+    }
+
+    /// Truncate file `node` to exactly `len` bytes (POSIX `ftruncate`, and the
+    /// `O_TRUNC` open flag): shrinks, or zero-extends if `len` exceeds the
+    /// current size.
+    ///
+    /// Like [`write_at`](Self::write_at) this materializes on first mutation — a
+    /// clean upper file is reopened for editing, a fall-through file is copied up
+    /// (same [`NodeId`]; the lower is never touched). Truncating to `len == 0`
+    /// installs a fresh empty writer directly, so neither the clean blob nor the
+    /// lower content is read.
+    pub fn truncate(&mut self, node: NodeId, len: u64) -> VfsResult<()> {
+        if len == 0 {
+            // Fast path: an empty result needs none of the existing content, so
+            // skip the clean-blob load / lower copy-up entirely.
+            match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
+                Body::Dir { .. } => return Err(VfsError::IsDirectory),
+                Body::Tombstone => return Err(VfsError::NotFound),
+                Body::File(_) | Body::LowerFile(_) => {}
+            }
+            let writer = self.files.edit(None).map_err(io)?;
+            if let Some(inode) = self.inodes.get_mut(&node) {
+                inode.body = Body::File(FileBody::Dirty(writer));
+            }
+            return Ok(());
+        }
+        self.make_dirty(node)?;
+        self.writer_mut(node)?.truncate(len);
+        Ok(())
+    }
+
+    /// Ensure file `node` is backed by a live [`FileWriter`]
+    /// ([`Dirty`](FileBody::Dirty)), materializing it on first mutation: a clean
+    /// file is reopened for editing; a fall-through [`LowerFile`](Body::LowerFile)
+    /// is copied up from the lower (keeping the same [`NodeId`]; the lower is
+    /// never mutated). Errors if `node` is a directory or a tombstone.
+    fn make_dirty(&mut self, node: NodeId) -> VfsResult<()> {
         // Decide the materialization step without holding a borrow across the
         // FileCas / lower calls.
         enum Step {
@@ -546,7 +586,6 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             Body::File(FileBody::Clean(b)) => Step::EditClean(*b),
             Body::LowerFile(ld) => Step::CopyUp(*ld),
         };
-
         match step {
             Step::Ready => {}
             Step::EditClean(b) => {
@@ -565,14 +604,15 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Borrow `node`'s live writer. Call only after
+    /// [`make_dirty`](Self::make_dirty); any other body is a bug.
+    fn writer_mut(&mut self, node: NodeId) -> VfsResult<&mut FileWriter> {
         match &mut self.inodes.get_mut(&node).ok_or(VfsError::NotFound)?.body {
-            Body::File(FileBody::Dirty(writer)) => {
-                writer.write_at(off, data);
-                Ok(data.len() as u32)
-            }
-            // Unreachable: we just ensured the body is Dirty.
-            _ => Err(VfsError::Io("write target changed unexpectedly".into())),
+            Body::File(FileBody::Dirty(writer)) => Ok(writer),
+            _ => Err(VfsError::Io("file body changed unexpectedly".into())),
         }
     }
 
