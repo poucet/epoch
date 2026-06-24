@@ -1,8 +1,8 @@
     //! # epoch-worktree — the mutable copy-on-write overlay
 //!
 //! `WorkingTree` is the live, mutable view that sits *above* the immutable
-//! content-addressed object store (`epoch-file-cas` + `epoch-tree` +
-//! `epoch-tree-cas`) and *below* a VFS/FUSE adapter. It is the home of the two
+//! content-addressed object store (`epoch-file-cas` + `epoch-tree`) and *below*
+//! a VFS/FUSE adapter. It is the home of the two
 //! things the object layer deliberately lacks:
 //!
 //! - **mutable identity** — stable [`NodeId`] inodes that survive edits, so a
@@ -68,7 +68,7 @@ use std::time::UNIX_EPOCH;
 
 use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
-use epoch_tree::{EntryId, Tree, TreeEntry, TreeStore};
+use epoch_tree::{EntryId, Link, LinkKind, Overlay, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
     DirEntry, NodeAttr, NodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
     VfsService, ROOT_NODE_ID,
@@ -83,15 +83,20 @@ pub use epoch_tree::TreeId;
 /// storage.
 ///
 /// Generic over the byte backend `Bk`. Upper files are stored via [`FileCas`]
-/// and addressed by [`BlobId`]; directories are sealed into [`Tree<BlobId>`]
-/// objects via [`TreeStore`]. With `lower = Some(..)` the tree is a sparse overlay
-/// over that [`VfsService`]; with `lower = None` it is a complete tree. See the
-/// [crate docs](crate) for the layer's role and v1 scope.
+/// and addressed by [`BlobId`]; directories are sealed into tree objects via a
+/// [`TreeStore`] constructed on demand over `backend` — a *complete* tree in
+/// pure mode, a *sparse overlay delta* (with tombstones) in overlay mode. With
+/// `lower = Some(..)` the tree is a sparse overlay over that [`VfsService`]; with
+/// `lower = None` it is a complete tree. See the [crate docs](crate) for the
+/// layer's role and v1 scope.
 pub struct WorkingTree<Bk> {
+    /// The byte backend. Typed tree stores ([`TreeStore`]) are built from a clone
+    /// of it on demand — for whichever link the current mode seals/hydrates — so
+    /// the working tree need not commit to one tree type up front.
+    backend: Bk,
     files: FileCas<Bk>,
-    trees: TreeStore<Bk, BlobId>,
-    /// The overlay base. `None` is *pure mode* (today's behaviour): no lower
-    /// layer, the working tree is the whole tree.
+    /// The overlay base. `None` is *pure mode*: no lower layer, the working tree
+    /// is the whole tree.
     lower: Option<Arc<dyn VfsService>>,
     inodes: HashMap<NodeId, Inode>,
     /// Next inode number to hand out (monotonic; starts just past the root).
@@ -132,6 +137,23 @@ enum FileBody {
     Dirty(FileWriter),
 }
 
+/// The complete-tree link sealed/hydrated in **pure mode**: a blob or subtree,
+/// with no tombstone variant — a whiteout is not even representable.
+type CompleteLink = EntryId<BlobId>;
+/// The overlay-tree link sealed/hydrated in **overlay mode**: a populated link or
+/// a [`Tombstone`](Overlay::Tombstone) whiteout.
+type OverlayLink = Overlay<EntryId<BlobId>>;
+
+/// How a directory child seals — computed before mutating `self` so the read
+/// borrow on the inode map is released before any recursive seal / file commit.
+#[derive(Clone, Copy)]
+enum ChildKind {
+    Dir,
+    File,
+    Tombstone,
+    Lower,
+}
+
 /// Map a kernel CAS error into a VFS I/O error.
 fn io(err: CASError) -> VfsError {
     VfsError::Io(err.to_string())
@@ -151,7 +173,8 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// sealed into.
     pub fn from_root(backend: Bk, root: TreeId) -> VfsResult<Self> {
         let mut wt = Self::new(backend);
-        wt.hydrate_into(ROOT_NODE_ID, root)?;
+        let store = wt.tree_store::<CompleteLink>();
+        wt.hydrate_tree(&store, ROOT_NODE_ID, root, None)?;
         Ok(wt)
     }
 
@@ -178,7 +201,8 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     pub fn from_overlay(backend: Bk, lower: Arc<dyn VfsService>, delta: TreeId) -> VfsResult<Self> {
         let mut wt = Self::overlay(backend, lower);
         // The root's lower counterpart is the lower's root.
-        wt.hydrate_overlay_into(ROOT_NODE_ID, delta, Some(ROOT_NODE_ID))?;
+        let store = wt.tree_store::<OverlayLink>();
+        wt.hydrate_tree(&store, ROOT_NODE_ID, delta, Some(ROOT_NODE_ID))?;
         Ok(wt)
     }
 
@@ -202,7 +226,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         );
         Self {
             files: FileCas::new(backend.clone()),
-            trees: TreeStore::new(backend),
+            backend,
             lower,
             inodes,
             next: ROOT_NODE_ID.0 + 1,
@@ -221,83 +245,63 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         ROOT_NODE_ID
     }
 
-    // --- hydration -----------------------------------------------------------
+    // --- store / hydration ---------------------------------------------------
 
-    /// Recursively populate a **pure-mode** `dir`'s children from a complete
-    /// sealed `tree_id`.
-    fn hydrate_into(&mut self, dir: NodeId, tree_id: TreeId) -> VfsResult<()> {
-        let tree: Tree<BlobId> = self.trees.get(&tree_id).map_err(io)?.ok_or(VfsError::NotFound)?;
-        let entries: Vec<(OsString, EntryId<BlobId>, u32)> = tree
-            .entries()
-            .iter()
-            .map(|e| (OsString::from_vec(e.name.to_vec()), e.id, e.mode))
-            .collect();
-
-        let mut children = BTreeMap::new();
-        for (name, id, mode) in entries {
-            let child = self.alloc();
-            match id {
-                EntryId::Blob(blob) => {
-                    self.inodes.insert(child, Inode { mode, body: Body::File(FileBody::Clean(blob)) });
-                }
-                EntryId::Tree(sub) => {
-                    self.inodes.insert(
-                        child,
-                        Inode { mode, body: Body::Dir { children: BTreeMap::new(), lower: None } },
-                    );
-                    self.hydrate_into(child, sub)?;
-                }
-                EntryId::Tombstone => {
-                    // A pure (non-overlay) tree has no lower to hide; skip.
-                    continue;
-                }
-            }
-            children.insert(name, child);
-        }
-
-        if let Some(Inode { body: Body::Dir { children: map, .. }, .. }) = self.inodes.get_mut(&dir) {
-            *map = children;
-        }
-        Ok(())
+    /// Build a typed [`TreeStore`] over a clone of the backend, for whichever
+    /// link `L` the current mode seals/hydrates. The store is a zero-cost facade
+    /// (it just wraps the backend), so constructing one per seal/hydrate is cheap.
+    fn tree_store<L>(&self) -> TreeStore<Bk, L> {
+        TreeStore::new(self.backend.clone())
     }
 
-    /// Recursively populate an **overlay** `dir`'s upper spine from the sparse
-    /// `delta` tree, wiring each materialized directory to its lower counterpart.
+    /// Recursively populate `dir`'s children by loading `tree_id` from `store`
+    /// and hydrating its entries.
     ///
-    /// `dir_lower` is `dir`'s lower-service [`NodeId`] (the dir to resolve child
-    /// directories' lower counterparts against), or `None` if the lower has no
-    /// such dir.
-    fn hydrate_overlay_into(
+    /// One body serves both modes via the [`Link`] trait. In **pure mode** the
+    /// link is `CompleteLink` (a [`LinkKind::Tombstone`] can never occur — the
+    /// type has no such variant — and `dir_lower` is always `None`). In **overlay
+    /// mode** the link is `OverlayLink`: a tombstone becomes a
+    /// [`Tombstone`](Body::Tombstone) whiteout, and each materialized directory's
+    /// lower counterpart is resolved one step down from `dir_lower`.
+    fn hydrate_tree<L>(
         &mut self,
+        store: &TreeStore<Bk, L>,
         dir: NodeId,
-        delta: TreeId,
+        tree_id: TreeId,
         dir_lower: Option<NodeId>,
-    ) -> VfsResult<()> {
-        let tree: Tree<BlobId> = self.trees.get(&delta).map_err(io)?.ok_or(VfsError::NotFound)?;
-        let entries: Vec<(OsString, EntryId<BlobId>, u32)> = tree
+    ) -> VfsResult<()>
+    where
+        L: Link<Blob = BlobId> + Send + Sync + 'static,
+    {
+        let tree: Tree<L> = store.get(&tree_id).map_err(io)?.ok_or(VfsError::NotFound)?;
+        // Snapshot (name, kind, mode) so we don't borrow `tree` across the
+        // self-mutation below.
+        let entries: Vec<(OsString, LinkKind, u32)> = tree
             .entries()
             .iter()
-            .map(|e| (OsString::from_vec(e.name.to_vec()), e.id, e.mode))
+            .map(|e| (OsString::from_vec(e.name.to_vec()), e.id.kind(), e.mode))
             .collect();
 
         let mut children = BTreeMap::new();
-        for (name, id, mode) in entries {
+        for (name, kind, mode) in entries {
             let child = self.alloc();
-            match id {
-                EntryId::Blob(blob) => {
-                    self.inodes.insert(child, Inode { mode, body: Body::File(FileBody::Clean(blob)) });
+            match kind {
+                LinkKind::Blob(h) => {
+                    self.inodes.insert(
+                        child,
+                        Inode { mode, body: Body::File(FileBody::Clean(BlobId::from(h))) },
+                    );
                 }
-                EntryId::Tree(sub) => {
-                    // Resolve this child dir's lower counterpart by walking the
-                    // lower one step from `dir_lower`.
+                LinkKind::Tree(h) => {
+                    // Resolve this child dir's lower counterpart one step down.
                     let child_lower = self.lower_child_dir(dir_lower, &name);
                     self.inodes.insert(
                         child,
                         Inode { mode, body: Body::Dir { children: BTreeMap::new(), lower: child_lower } },
                     );
-                    self.hydrate_overlay_into(child, sub, child_lower)?;
+                    self.hydrate_tree(store, child, TreeId::from_cas_hash(h), child_lower)?;
                 }
-                EntryId::Tombstone => {
+                LinkKind::Tombstone => {
                     self.inodes.insert(child, Inode { mode, body: Body::Tombstone });
                 }
             }
@@ -703,26 +707,49 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Seal the current state into immutable objects, returning the new root
     /// [`TreeId`].
     ///
-    /// In pure mode this is a complete tree. In overlay mode it is a **sparse
-    /// delta**: only the materialized spine and tombstones are emitted; a pure
+    /// **Pure mode** (`lower = None`) seals a *complete* tree — no tombstones are
+    /// even representable in its link type. **Overlay mode** seals a *sparse
+    /// delta*: only the materialized spine and tombstones are emitted; a pure
     /// fall-through directory (no upper entries, has a lower) emits nothing, so
     /// untouched siblings are absent from the delta. The root always emits.
     pub fn seal(&mut self) -> VfsResult<TreeId> {
-        // The root always materializes (even empty), so `seal_dir` returns Some.
-        match self.seal_dir(ROOT_NODE_ID, true)? {
-            Some(id) => Ok(id),
-            None => {
-                // Root with no entries and a lower: still emit an empty tree.
-                let tree = Tree::<BlobId>::empty();
-                self.trees.put(tree).map_err(io)
-            }
+        if self.lower.is_none() {
+            self.seal_root::<CompleteLink>()
+        } else {
+            self.seal_root::<OverlayLink>()
         }
     }
 
-    /// Seal directory `dir`. Returns `None` iff this is a pure fall-through dir
-    /// (produced no entries AND has a lower) and `force_emit` is false — such a
-    /// dir is absent from the delta. Otherwise builds and stores a tree.
-    fn seal_dir(&mut self, dir: NodeId, force_emit: bool) -> VfsResult<Option<TreeId>> {
+    /// Seal the root with link type `L`, always emitting (even when empty).
+    fn seal_root<L>(&mut self) -> VfsResult<TreeId>
+    where
+        L: Link<Blob = BlobId> + Send + Sync + 'static,
+    {
+        let store = self.tree_store::<L>();
+        match self.seal_dir::<L>(&store, ROOT_NODE_ID, true)? {
+            Some(id) => Ok(id),
+            // Root with no entries and a lower: still emit an empty tree.
+            None => store.put(Tree::<L>::empty()).map_err(io),
+        }
+    }
+
+    /// Seal directory `dir` into a [`Tree<L>`], storing it via `store`. Returns
+    /// `None` iff this is a pure fall-through dir (produced no entries AND has a
+    /// lower) and `force_emit` is false — such a dir is absent from the delta.
+    ///
+    /// A [`Body::Tombstone`] child can only be emitted when `L` is an overlay
+    /// link ([`Link::tombstone`] is `Some`); in pure mode a tombstone never
+    /// exists (it is created only when a lower entry is hidden), so the error arm
+    /// is unreachable there.
+    fn seal_dir<L>(
+        &mut self,
+        store: &TreeStore<Bk, L>,
+        dir: NodeId,
+        force_emit: bool,
+    ) -> VfsResult<Option<TreeId>>
+    where
+        L: Link<Blob = BlobId> + Send + Sync + 'static,
+    {
         let (children, has_lower) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
             Body::Dir { children, lower } => (
                 children.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
@@ -731,34 +758,41 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             _ => return Err(VfsError::NotDirectory),
         };
 
-        let mut entries: Vec<TreeEntry<BlobId>> = Vec::with_capacity(children.len());
+        let mut entries: Vec<TreeEntry<L>> = Vec::with_capacity(children.len());
         for (name, id) in children {
             let mode = self.inodes.get(&id).ok_or(VfsError::NotFound)?.mode;
             let name_bytes = Bytes::copy_from_slice(name.as_bytes());
+            // Classify first so the inode-map borrow ends before recursion.
             let kind = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
-                Body::Dir { .. } => 0u8,
-                Body::File(_) => 1u8,
-                Body::Tombstone => 2u8,
-                // A fall-through file that was never copied up is absent (it
-                // falls through to the lower).
-                Body::LowerFile(_) => 3u8,
+                Body::Dir { .. } => ChildKind::Dir,
+                Body::File(_) => ChildKind::File,
+                Body::Tombstone => ChildKind::Tombstone,
+                Body::LowerFile(_) => ChildKind::Lower,
             };
             match kind {
-                0 => {
-                    if let Some(sub) = self.seal_dir(id, false)? {
+                ChildKind::Dir => {
+                    if let Some(sub) = self.seal_dir::<L>(store, id, false)? {
                         entries.push(TreeEntry::dir(name_bytes, sub, mode));
                     }
                     // None ⇒ pure fall-through dir; skip (falls through).
                 }
-                1 => {
+                ChildKind::File => {
                     let (blob, size) = self.seal_file(id)?;
                     entries.push(TreeEntry::file(name_bytes, blob, mode, size));
                 }
-                2 => {
-                    entries.push(TreeEntry::tombstone(name_bytes));
+                ChildKind::Tombstone => {
+                    let link = L::tombstone().ok_or_else(|| {
+                        VfsError::Other("tombstone in a complete (non-overlay) tree".into())
+                    })?;
+                    entries.push(TreeEntry {
+                        name: name_bytes,
+                        id: link,
+                        mode: 0,
+                        size: 0,
+                    });
                 }
-                _ => {
-                    // LowerFile ⇒ skip (absent = fall-through).
+                ChildKind::Lower => {
+                    // A fall-through file never copied up is absent (falls through).
                 }
             }
         }
@@ -770,7 +804,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         }
 
         let tree = Tree::from_entries(entries).map_err(|e| VfsError::Other(e.to_string()))?;
-        Ok(Some(self.trees.put(tree).map_err(io)?))
+        Ok(Some(store.put(tree).map_err(io)?))
     }
 
     /// Seal a single upper file inode, returning its blob id and logical size. A

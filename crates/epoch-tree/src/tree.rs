@@ -8,11 +8,11 @@
 //! same [`TreeId`](crate::TreeId). Determinism is the whole point of the
 //! content-addressed model.
 //!
-//! `Tree<B>` is generic over the foreign blob-id type `B` (see
-//! [`BlobRef`](crate::BlobRef)): the tree object itself imposes no requirement
-//! on `B` for its in-memory operations (sort/lookup are by `name`); only the
-//! codec needs the [`BlobRef`](crate::BlobRef) bound, to convert `B` to/from a
-//! [`CASHash`](epoch_cas::CASHash).
+//! `Tree<L>` is generic over the **link** type `L` (see [`Link`](crate::Link)):
+//! a *complete* tree is `Tree<EntryId<B>>` (no tombstones possible), a *sparse
+//! overlay* tree is `Tree<Overlay<EntryId<B>>>`. The tree object itself imposes
+//! no requirement on `L` for its in-memory operations (sort/lookup are by
+//! `name`); only the codec needs the [`Link`](crate::Link) bound.
 //!
 //! The invariant (sorted, unique names) is established once at construction
 //! ([`Tree::empty`] / [`Tree::from_entries`]) and thereafter relied upon by
@@ -24,18 +24,18 @@ use crate::error::TreeError;
 /// An ordered, name-unique set of [`TreeEntry`]s — the directory object.
 ///
 /// The internal vector is always kept sorted ascending by entry `name`; see the
-/// [module docs](self) for why canonical order matters. Generic over the foreign
-/// blob-id type `B`.
+/// [module docs](self) for why canonical order matters. Generic over the link
+/// type `L`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tree<B> {
+pub struct Tree<L> {
     /// Always sorted ascending by `name`, names unique. Never expose mutable
     /// access that could break this invariant.
-    entries: Vec<TreeEntry<B>>,
+    entries: Vec<TreeEntry<L>>,
 }
 
-impl<B> Tree<B> {
+impl<L> Tree<L> {
     /// The empty tree (no entries).
-    pub fn empty() -> Tree<B> {
+    pub fn empty() -> Tree<L> {
         Tree {
             entries: Vec::new(),
         }
@@ -46,9 +46,9 @@ impl<B> Tree<B> {
     /// Entries are sorted ascending by `name` to establish canonical form.
     /// Returns [`TreeError::DuplicateName`] if any name appears more than once.
     pub fn from_entries(
-        entries: impl IntoIterator<Item = TreeEntry<B>>,
-    ) -> Result<Tree<B>, TreeError> {
-        let mut entries: Vec<TreeEntry<B>> = entries.into_iter().collect();
+        entries: impl IntoIterator<Item = TreeEntry<L>>,
+    ) -> Result<Tree<L>, TreeError> {
+        let mut entries: Vec<TreeEntry<L>> = entries.into_iter().collect();
         // Sort first so equal names are adjacent; a stable comparison on the raw
         // name bytes gives byte-lexicographic order.
         entries.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
@@ -67,7 +67,7 @@ impl<B> Tree<B> {
     /// (sorted ascending by name, names unique). Crate-internal: the decoder
     /// validates order/uniqueness in its single pass, so re-sorting via
     /// [`from_entries`](Tree::from_entries) would be wasted work.
-    pub(crate) fn from_validated(entries: Vec<TreeEntry<B>>) -> Tree<B> {
+    pub(crate) fn from_validated(entries: Vec<TreeEntry<L>>) -> Tree<L> {
         debug_assert!(
             entries.windows(2).all(|w| w[0].name < w[1].name),
             "from_validated requires strictly ascending unique names"
@@ -76,12 +76,12 @@ impl<B> Tree<B> {
     }
 
     /// The entries, in canonical (name-ascending) order.
-    pub fn entries(&self) -> &[TreeEntry<B>] {
+    pub fn entries(&self) -> &[TreeEntry<L>] {
         &self.entries
     }
 
     /// Look up an entry by raw name via binary search (the vector is sorted).
-    pub fn get(&self, name: &[u8]) -> Option<&TreeEntry<B>> {
+    pub fn get(&self, name: &[u8]) -> Option<&TreeEntry<L>> {
         self.entries
             .binary_search_by(|e| e.name.as_ref().cmp(name))
             .ok()
@@ -99,14 +99,14 @@ impl<B> Tree<B> {
     }
 
     /// Iterate entries in canonical order.
-    pub fn iter(&self) -> std::slice::Iter<'_, TreeEntry<B>> {
+    pub fn iter(&self) -> std::slice::Iter<'_, TreeEntry<L>> {
         self.entries.iter()
     }
 }
 
-impl<'a, B> IntoIterator for &'a Tree<B> {
-    type Item = &'a TreeEntry<B>;
-    type IntoIter = std::slice::Iter<'a, TreeEntry<B>>;
+impl<'a, L> IntoIterator for &'a Tree<L> {
+    type Item = &'a TreeEntry<L>;
+    type IntoIter = std::slice::Iter<'a, TreeEntry<L>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
@@ -116,12 +116,14 @@ impl<'a, B> IntoIterator for &'a Tree<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::TreeId;
+    use crate::id::{EntryId, TreeId};
     use epoch_cas::{Bytes, CASHash};
 
-    // Tests instantiate the generic with CASHash as the blob-id type B; it
-    // satisfies BlobRef for free via the reflexive `From<CASHash> for CASHash`.
-    fn blob(name: &'static [u8], seed: u8) -> TreeEntry<CASHash> {
+    // Tests instantiate the generic with a complete-tree link (EntryId<CASHash>);
+    // CASHash satisfies BlobRef for free via the reflexive `From<CASHash>`.
+    type L = EntryId<CASHash>;
+
+    fn blob(name: &'static [u8], seed: u8) -> TreeEntry<L> {
         TreeEntry::file(
             Bytes::from_static(name),
             CASHash::from_bytes([seed; 32]),
@@ -130,7 +132,7 @@ mod tests {
         )
     }
 
-    fn dir(name: &'static [u8], seed: u8) -> TreeEntry<CASHash> {
+    fn dir(name: &'static [u8], seed: u8) -> TreeEntry<L> {
         TreeEntry::dir(
             Bytes::from_static(name),
             TreeId::from_cas_hash(CASHash::from_bytes([seed; 32])),
@@ -140,7 +142,7 @@ mod tests {
 
     #[test]
     fn empty_tree_is_empty() {
-        let t = Tree::<CASHash>::empty();
+        let t = Tree::<L>::empty();
         assert!(t.is_empty());
         assert_eq!(t.len(), 0);
         assert_eq!(t.entries(), &[]);
@@ -149,12 +151,7 @@ mod tests {
 
     #[test]
     fn from_entries_sorts_by_name() {
-        let t = Tree::from_entries([
-            blob(b"zebra", 1),
-            dir(b"apple", 2),
-            blob(b"mango", 3),
-        ])
-        .unwrap();
+        let t = Tree::from_entries([blob(b"zebra", 1), dir(b"apple", 2), blob(b"mango", 3)]).unwrap();
         let names: Vec<&[u8]> = t.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, vec![&b"apple"[..], b"mango", b"zebra"]);
     }

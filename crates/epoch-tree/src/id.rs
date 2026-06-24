@@ -1,39 +1,39 @@
-//! The tree's own id newtype and the blob-id bound, layered on the kernel's
+//! Tree ids and the per-entry **link** types, layered on the kernel's
 //! [`CASHash`].
 //!
 //! `epoch-cas` is deliberately id-agnostic: it speaks only [`CASHash`], the raw
 //! 32-byte content-address. This module gives those addresses *meaning* in the
 //! tree domain:
 //!
-//! - [`TreeId`] — the id of a tree object (the content-address an
-//!   `epoch-tree-cas` produces for a [`Tree`](crate::Tree)'s canonical bytes).
-//!   It is a concrete, zero-cost newtype around [`CASHash`]; a tree object's
-//!   address is always *this* crate's own type.
+//! - [`TreeId`] — the id of a tree object (the content-address a
+//!   [`TreeStore`](crate::TreeStore) produces for a [`Tree`](crate::Tree)'s
+//!   canonical bytes). A concrete, zero-cost newtype around [`CASHash`].
 //! - [`BlobRef`] — the *bound* a foreign blob-id type must satisfy to be
-//!   referenced from a tree. A tree no longer owns its blob-id type: file blob
-//!   ids live in `epoch-file-cas`, and a [`Tree`](crate::Tree) is generic over
-//!   whatever 32-byte, [`CASHash`]-convertible id that crate (or any other)
-//!   provides. The two are wired together at a higher level.
+//!   referenced from a tree (file blob ids live in `epoch-file-cas`).
 //!
-//! [`EntryId<B>`](EntryId) is the tagged union actually stored in a
-//! [`TreeEntry`](crate::TreeEntry): it carries the child address *and* records
-//! whether the child is a blob (`B`), a tree ([`TreeId`]), or a *tombstone*
-//! (whiteout) — the kind a parent needs to interpret (or hide) its children.
+//! ## Two link types, one guarantee
 //!
-//! ## Overlay semantics
+//! A directory entry points at a *child* via a **link**. There are two link
+//! types, and the split is load-bearing — it makes one class of corruption
+//! *unrepresentable*:
 //!
-//! A [`Tree`](crate::Tree) is normally a *complete* directory listing. It can
-//! also act as a **sparse overlay layer** over a lower/base tree, in which case
-//! its entries are read against that base:
+//! - [`EntryId<B>`](EntryId) — a **populated** link: a [`Blob`](EntryId::Blob)
+//!   (`B`) or a [`Tree`](EntryId::Tree) ([`TreeId`]). It has **no** tombstone
+//!   variant, so a tree whose entries are `EntryId<B>` is a *complete* directory
+//!   listing that simply **cannot** contain a whiteout.
+//! - [`Overlay<E>`](Overlay) — wraps a populated link `E`, adding the
+//!   [`Tombstone`](Overlay::Tombstone) whiteout. A tree whose entries are
+//!   `Overlay<EntryId<B>>` is a **sparse overlay layer**: an *absent* name falls
+//!   through to the lower/base layer, a [`Tombstone`](Overlay::Tombstone)
+//!   *hides* the lower entry, and a populated link *overrides* it.
 //!
-//! - an **absent** name falls through to the lower layer;
-//! - a [`Tombstone`](EntryId::Tombstone) entry **hides** the lower entry
-//!   (a whiteout) — the name is treated as deleted in the merged view;
-//! - a [`Blob`](EntryId::Blob)/[`Tree`](EntryId::Tree) entry **overrides** the
-//!   lower entry at that name.
-//!
-//! A tree that contains no tombstones, read with no base, is still a plain
-//! complete tree — the overlay model is backward compatible.
+//! [`Link`] is the trait both implement: it classifies a link for encoding
+//! ([`kind`](Link::kind) → [`LinkKind`]) and reconstructs one while decoding
+//! ([`from_blob`](Link::from_blob) / [`from_tree`](Link::from_tree) /
+//! [`tombstone`](Link::tombstone)). Crucially [`tombstone`](Link::tombstone)
+//! returns `None` for [`EntryId`], so the codec rejects a whiteout in a complete
+//! tree — the type-level guarantee is enforced end to end. A single generic body
+//! (codec, hydrate) serves both link types through this trait.
 
 use std::fmt;
 
@@ -118,24 +118,19 @@ impl fmt::Debug for TreeId {
     }
 }
 
-/// A tree-entry child reference: the kind of object a name points at (or a
-/// whiteout hiding it in an overlay).
+/// A **populated** tree-entry link: the child a present name points at.
 ///
-/// For [`Blob`](EntryId::Blob)/[`Tree`](EntryId::Tree) the variant carries the
-/// strongly-typed child address; the blob arm holds a foreign blob-id type `B`
-/// (see [`BlobRef`]), the tree arm holds this crate's own [`TreeId`]. The third
-/// kind, [`Tombstone`](EntryId::Tombstone), carries no address: it marks the
-/// name as deleted relative to a lower overlay layer. See the
-/// [module docs](self) for the full overlay semantics.
+/// Either a file [`Blob`](EntryId::Blob) (addressed by the foreign blob-id type
+/// `B`, see [`BlobRef`]) or a subtree [`Tree`](EntryId::Tree) (this crate's own
+/// [`TreeId`]). It has **no whiteout variant** by construction — a tree built
+/// over `EntryId<B>` is a complete listing that cannot hold a tombstone. For the
+/// overlay (sparse) form, wrap it in [`Overlay`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum EntryId<B> {
     /// The child is a file blob, addressed by the foreign blob-id type `B`.
     Blob(B),
     /// The child is a subtree.
     Tree(TreeId),
-    /// A whiteout: in an overlay this name is hidden (deleted) relative to the
-    /// lower/base layer. It addresses no object and so has no content-hash.
-    Tombstone,
 }
 
 impl<B> EntryId<B> {
@@ -148,25 +143,144 @@ impl<B> EntryId<B> {
     pub const fn is_tree(&self) -> bool {
         matches!(self, EntryId::Tree(_))
     }
+}
 
-    /// Whether this entry is a whiteout (overlay deletion marker).
+/// An **overlay** tree-entry link: a populated link `E`, or a whiteout.
+///
+/// This is the link type for a *sparse overlay layer*. A
+/// [`Populated`](Overlay::Populated) entry overrides the lower layer at that
+/// name; a [`Tombstone`](Overlay::Tombstone) hides it (a deletion in the merged
+/// view); an *absent* name falls through. `E` is the populated link it wraps —
+/// in practice [`EntryId<B>`](EntryId).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Overlay<E> {
+    /// A present child — overrides the lower layer at this name.
+    Populated(E),
+    /// A whiteout: hides the lower entry of this name (overlay deletion marker).
+    /// It addresses no object and so has no content-hash.
+    Tombstone,
+}
+
+impl<E> Overlay<E> {
+    /// Whether this is a whiteout (overlay deletion marker).
     pub const fn is_tombstone(&self) -> bool {
-        matches!(self, EntryId::Tombstone)
+        matches!(self, Overlay::Tombstone)
+    }
+
+    /// The wrapped populated link, or `None` for a tombstone.
+    pub const fn as_populated(&self) -> Option<&E> {
+        match self {
+            Overlay::Populated(e) => Some(e),
+            Overlay::Tombstone => None,
+        }
     }
 }
 
-impl<B: BlobRef> EntryId<B> {
-    /// The underlying content-address, or `None` for a tombstone.
-    ///
-    /// A [`Blob`](EntryId::Blob) id converts into its [`CASHash`] (consuming the
-    /// `Copy` value) and a [`Tree`](EntryId::Tree) id unwraps its own; a
-    /// [`Tombstone`](EntryId::Tombstone) addresses no object and yields `None`.
-    pub fn cas_hash(&self) -> Option<CASHash> {
-        match self {
-            EntryId::Blob(b) => Some((*b).into()),
-            EntryId::Tree(t) => Some(t.into_cas_hash()),
-            EntryId::Tombstone => None,
+/// The classification of a [`Link`] for the wire format: a present child carries
+/// its raw [`CASHash`], a tombstone carries nothing.
+///
+/// This is the bridge that lets one codec/hydrate body serve both link types —
+/// it speaks the kernel [`CASHash`], not a typed blob/tree id, so it is agnostic
+/// to which link produced it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkKind {
+    /// A file blob child, by its raw content-address.
+    Blob(CASHash),
+    /// A subtree child, by its raw content-address.
+    Tree(CASHash),
+    /// A whiteout (overlay deletion marker) — addresses no object.
+    Tombstone,
+}
+
+/// The shared interface over the two link types ([`EntryId`] and [`Overlay`]).
+///
+/// It lets a single generic body (the [`codec`](crate::codec), the working
+/// tree's hydrate) classify a link for encoding ([`kind`](Link::kind)) and
+/// reconstruct one while decoding ([`from_blob`](Link::from_blob) /
+/// [`from_tree`](Link::from_tree) / [`tombstone`](Link::tombstone)) without
+/// caring which concrete link type it is — or which foreign blob-id type
+/// ([`Blob`](Link::Blob)) backs it.
+///
+/// [`tombstone`](Link::tombstone) is the type-level guarantee in action: a
+/// complete-tree link ([`EntryId`]) returns `None`, so a decoder reconstructing
+/// into a complete tree rejects a whiteout tag rather than admitting an illegal
+/// layout.
+pub trait Link: Sized {
+    /// The foreign blob-id type this link addresses blobs by (see [`BlobRef`]).
+    type Blob: BlobRef;
+
+    /// Classify this link for the wire format.
+    fn kind(&self) -> LinkKind;
+
+    /// Reconstruct a populated *blob* link.
+    fn from_blob(blob: Self::Blob) -> Self;
+
+    /// Reconstruct a populated *tree* link.
+    fn from_tree(tree: TreeId) -> Self;
+
+    /// Reconstruct a *tombstone* link, or `None` if this link type cannot be a
+    /// tombstone (a complete-tree link). The codec turns `None` into a decode
+    /// error for a whiteout tag.
+    fn tombstone() -> Option<Self>;
+
+    /// The link's underlying content-address, or `None` for a tombstone.
+    fn cas_hash(&self) -> Option<CASHash> {
+        match self.kind() {
+            LinkKind::Blob(h) | LinkKind::Tree(h) => Some(h),
+            LinkKind::Tombstone => None,
         }
+    }
+
+    /// Whether this link is a whiteout.
+    fn is_tombstone(&self) -> bool {
+        matches!(self.kind(), LinkKind::Tombstone)
+    }
+}
+
+impl<B: BlobRef> Link for EntryId<B> {
+    type Blob = B;
+
+    fn kind(&self) -> LinkKind {
+        match self {
+            EntryId::Blob(b) => LinkKind::Blob((*b).into()),
+            EntryId::Tree(t) => LinkKind::Tree(t.into_cas_hash()),
+        }
+    }
+
+    fn from_blob(blob: B) -> Self {
+        EntryId::Blob(blob)
+    }
+
+    fn from_tree(tree: TreeId) -> Self {
+        EntryId::Tree(tree)
+    }
+
+    fn tombstone() -> Option<Self> {
+        // A complete-tree link has no whiteout — this is the unrepresentability.
+        None
+    }
+}
+
+impl<E: Link> Link for Overlay<E> {
+    type Blob = E::Blob;
+
+    fn kind(&self) -> LinkKind {
+        match self {
+            Overlay::Populated(e) => e.kind(),
+            Overlay::Tombstone => LinkKind::Tombstone,
+        }
+    }
+
+    fn from_blob(blob: E::Blob) -> Self {
+        Overlay::Populated(E::from_blob(blob))
+    }
+
+    fn from_tree(tree: TreeId) -> Self {
+        Overlay::Populated(E::from_tree(tree))
+    }
+
+    fn tombstone() -> Option<Self> {
+        Some(Overlay::Tombstone)
     }
 }
 
@@ -208,20 +322,43 @@ mod tests {
         let th = sample_hash(5);
         let blob: EntryId<CASHash> = EntryId::Blob(bh);
         let tree: EntryId<CASHash> = EntryId::Tree(TreeId::from_cas_hash(th));
-        let tomb: EntryId<CASHash> = EntryId::Tombstone;
 
-        assert!(blob.is_blob());
-        assert!(!blob.is_tree());
-        assert!(!blob.is_tombstone());
-        assert!(tree.is_tree());
-        assert!(!tree.is_blob());
-        assert!(!tree.is_tombstone());
-        assert!(tomb.is_tombstone());
-        assert!(!tomb.is_blob());
-        assert!(!tomb.is_tree());
+        assert!(blob.is_blob() && !blob.is_tree());
+        assert!(tree.is_tree() && !tree.is_blob());
 
+        assert_eq!(blob.kind(), LinkKind::Blob(bh));
+        assert_eq!(tree.kind(), LinkKind::Tree(th));
         assert_eq!(blob.cas_hash(), Some(bh));
         assert_eq!(tree.cas_hash(), Some(th));
-        assert_eq!(tomb.cas_hash(), None);
+        assert!(!blob.is_tombstone() && !tree.is_tombstone());
+
+        // A complete-tree link can never be a tombstone.
+        assert!(<EntryId<CASHash> as Link>::tombstone().is_none());
+    }
+
+    #[test]
+    fn overlay_wraps_populated_and_adds_tombstone() {
+        let bh = sample_hash(6);
+        let pop: Overlay<EntryId<CASHash>> = Overlay::Populated(EntryId::Blob(bh));
+        let tomb: Overlay<EntryId<CASHash>> = Overlay::Tombstone;
+
+        assert!(!pop.is_tombstone());
+        assert_eq!(pop.as_populated(), Some(&EntryId::Blob(bh)));
+        assert_eq!(pop.kind(), LinkKind::Blob(bh));
+        assert_eq!(pop.cas_hash(), Some(bh));
+
+        assert!(tomb.is_tombstone());
+        assert_eq!(tomb.as_populated(), None);
+        assert_eq!(tomb.kind(), LinkKind::Tombstone);
+        assert_eq!(Link::cas_hash(&tomb), None);
+
+        // The overlay link CAN reconstruct a tombstone (unlike EntryId).
+        assert!(<Overlay<EntryId<CASHash>> as Link>::tombstone().is_some());
+
+        // Reconstruction wraps populated links.
+        assert_eq!(
+            <Overlay<EntryId<CASHash>> as Link>::from_blob(bh),
+            Overlay::Populated(EntryId::Blob(bh))
+        );
     }
 }

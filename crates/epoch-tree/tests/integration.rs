@@ -1,16 +1,20 @@
 //! Integration tests for `epoch-tree`: exercises the public API surface the way
 //! a downstream crate would, end-to-end across modules.
 //!
-//! The tree object is generic over a foreign blob-id type `B: BlobRef`. These
-//! tests instantiate that parameter with [`CASHash`] itself, which satisfies
-//! [`BlobRef`] for free via the reflexive `From<CASHash> for CASHash` — so we
-//! never need to define a fake blob-id newtype just to exercise the API.
+//! The tree object is generic over a foreign blob-id type `B: BlobRef` and over
+//! its per-entry link type. These tests instantiate `B` with [`CASHash`] itself
+//! (which satisfies [`BlobRef`] for free via the reflexive `From<CASHash>`), and
+//! use the complete-tree link `EntryId<CASHash>` except where a tombstone (and so
+//! the overlay link `Overlay<EntryId<CASHash>>`) is under test.
 
 use epoch_cas::{Bytes, CASError, CASHash, Codec};
 use epoch_tree::{
-    BlobRef, EntryId, Tree, TreeCodec, TreeEntry, TreeError, TreeId, SYMLINK_MODE,
+    BlobRef, EntryId, Link, Overlay, Tree, TreeCodec, TreeEntry, TreeError, TreeId, SYMLINK_MODE,
     TREE_FORMAT_VERSION,
 };
+
+/// The complete-tree link used throughout (no tombstones).
+type L = EntryId<CASHash>;
 
 fn hash(seed: u8) -> CASHash {
     let mut bytes = [0u8; 32];
@@ -20,11 +24,11 @@ fn hash(seed: u8) -> CASHash {
     CASHash::from_bytes(bytes)
 }
 
-fn blob(name: &[u8], seed: u8, mode: u32, size: u64) -> TreeEntry<CASHash> {
+fn blob(name: &[u8], seed: u8, mode: u32, size: u64) -> TreeEntry<L> {
     TreeEntry::file(Bytes::copy_from_slice(name), hash(seed), mode, size)
 }
 
-fn dir(name: &[u8], seed: u8) -> TreeEntry<CASHash> {
+fn dir(name: &[u8], seed: u8) -> TreeEntry<L> {
     TreeEntry::dir(Bytes::copy_from_slice(name), TreeId::from_cas_hash(hash(seed)), 0o040000)
 }
 
@@ -48,8 +52,8 @@ fn id_hex_roundtrip_and_formatting() {
     assert_eq!(tree_id.to_string(), h.to_hex());
     assert_eq!(format!("{tree_id:?}"), format!("TreeId({})", h.to_hex()));
 
-    // EntryId carries the tagged hash. The blob arm holds the foreign id (here
-    // CASHash), the tree arm holds a TreeId.
+    // A populated link carries the tagged hash: the blob arm holds the foreign
+    // id (here CASHash), the tree arm holds a TreeId.
     let blob_entry: EntryId<CASHash> = EntryId::Blob(h);
     assert!(blob_entry.is_blob());
     assert_eq!(blob_entry.cas_hash(), Some(h));
@@ -58,10 +62,10 @@ fn id_hex_roundtrip_and_formatting() {
     assert!(tree_entry.is_tree());
     assert_eq!(tree_entry.cas_hash(), Some(h));
 
-    // A tombstone addresses no object.
-    let tomb: EntryId<CASHash> = EntryId::Tombstone;
+    // A whiteout lives only on the overlay link and addresses no object.
+    let tomb: Overlay<EntryId<CASHash>> = Overlay::Tombstone;
     assert!(tomb.is_tombstone());
-    assert_eq!(tomb.cas_hash(), None);
+    assert_eq!(Link::cas_hash(&tomb), None);
 }
 
 #[test]
@@ -77,7 +81,7 @@ fn tree_entry_constructors_and_symlink_as_blob() {
     // A symlink is just a blob entry with SYMLINK_MODE; its blob bytes are the
     // target path (stored elsewhere in the file CAS).
     let target = b"../elsewhere";
-    let link = TreeEntry::<CASHash>::file(
+    let link = TreeEntry::<L>::file(
         Bytes::from_static(b"shortcut"),
         hash(3),
         SYMLINK_MODE,
@@ -106,7 +110,7 @@ fn tree_sorts_dedupes_and_looks_up() {
     assert!(!t.is_empty());
 
     // empty tree.
-    assert!(Tree::<CASHash>::empty().is_empty());
+    assert!(Tree::<L>::empty().is_empty());
 
     // duplicate names are rejected.
     let err = Tree::from_entries([blob(b"x", 1, 0o100644, 0), dir(b"x", 2)]).unwrap_err();
@@ -118,10 +122,10 @@ fn tree_sorts_dedupes_and_looks_up() {
 #[test]
 fn codec_roundtrips_empty_and_multi_entry() {
     // Empty tree.
-    let empty = Tree::<CASHash>::empty();
-    let enc = TreeCodec::<CASHash>::encode(&empty);
+    let empty = Tree::<L>::empty();
+    let enc = TreeCodec::<L>::encode(&empty);
     assert_eq!(enc[0], TREE_FORMAT_VERSION);
-    assert_eq!(TreeCodec::<CASHash>::decode(&enc).unwrap(), empty);
+    assert_eq!(TreeCodec::<L>::decode(&enc).unwrap(), empty);
 
     // Mixed blob + tree entries, a non-UTF8 name, and a huge size.
     let t = Tree::from_entries([
@@ -130,10 +134,10 @@ fn codec_roundtrips_empty_and_multi_entry() {
         blob(b"huge", 12, 0o100644, u64::MAX),
     ])
     .unwrap();
-    let enc = TreeCodec::<CASHash>::encode(&t);
-    let dec = TreeCodec::<CASHash>::decode(&enc).unwrap();
+    let enc = TreeCodec::<L>::encode(&t);
+    let dec = TreeCodec::<L>::decode(&enc).unwrap();
     assert_eq!(dec, t);
-    assert_eq!(TreeCodec::<CASHash>::encode(&dec), enc); // byte-stable round-trip
+    assert_eq!(TreeCodec::<L>::encode(&dec), enc); // byte-stable round-trip
 }
 
 #[test]
@@ -156,36 +160,34 @@ fn codec_encode_is_deterministic_across_insertion_orders() {
     // Same logical tree, different build order => identical bytes => identical
     // hash. This determinism is the whole point.
     assert_eq!(order_a, order_b);
-    assert_eq!(
-        TreeCodec::<CASHash>::encode(&order_a),
-        TreeCodec::<CASHash>::encode(&order_b)
-    );
+    assert_eq!(TreeCodec::<L>::encode(&order_a), TreeCodec::<L>::encode(&order_b));
 }
 
 #[test]
 fn codec_decode_rejects_malformed_input() {
     let t = Tree::from_entries([blob(b"a", 1, 0o100644, 0), blob(b"b", 2, 0o100644, 0)]).unwrap();
-    let good = TreeCodec::<CASHash>::encode(&t).to_vec();
+    let good = TreeCodec::<L>::encode(&t).to_vec();
 
     // Bad version.
     let mut bad_version = good.clone();
     bad_version[0] = TREE_FORMAT_VERSION.wrapping_add(1);
     assert!(matches!(
-        TreeCodec::<CASHash>::decode(&bad_version),
+        TreeCodec::<L>::decode(&bad_version),
         Err(CASError::Codec(_))
     ));
 
-    // Unknown kind tag (first tag byte after 1+4 header).
+    // Unknown kind tag (first tag byte after 1+4 header). Tag 2 is Tombstone, so
+    // an *unknown* tag must be > 2.
     let mut bad_tag = good.clone();
-    bad_tag[5] = 2;
+    bad_tag[5] = 9;
     assert!(matches!(
-        TreeCodec::<CASHash>::decode(&bad_tag),
+        TreeCodec::<L>::decode(&bad_tag),
         Err(CASError::Codec(_))
     ));
 
     // Truncated buffer.
     assert!(matches!(
-        TreeCodec::<CASHash>::decode(&good[..good.len() - 3]),
+        TreeCodec::<L>::decode(&good[..good.len() - 3]),
         Err(CASError::Codec(_))
     ));
 
@@ -202,7 +204,7 @@ fn codec_decode_rejects_malformed_input() {
         unsorted.extend_from_slice(name);
     }
     assert!(matches!(
-        TreeCodec::<CASHash>::decode(&unsorted),
+        TreeCodec::<L>::decode(&unsorted),
         Err(CASError::Codec(_))
     ));
 
@@ -219,7 +221,28 @@ fn codec_decode_rejects_malformed_input() {
         dup.push(b'q');
     }
     assert!(matches!(
-        TreeCodec::<CASHash>::decode(&dup),
+        TreeCodec::<L>::decode(&dup),
+        Err(CASError::Codec(_))
+    ));
+}
+
+#[test]
+fn overlay_codec_roundtrips_tombstones_and_complete_rejects_them() {
+    // An overlay tree mixing a populated entry with a whiteout round-trips.
+    let overlay: Tree<Overlay<L>> = Tree::from_entries([
+        TreeEntry::<Overlay<L>>::file(Bytes::from_static(b"keep"), hash(1), 0o100644, 4),
+        TreeEntry::<Overlay<L>>::tombstone(Bytes::from_static(b"zap")),
+    ])
+    .unwrap();
+    let enc = TreeCodec::<Overlay<L>>::encode(&overlay);
+    let dec = TreeCodec::<Overlay<L>>::decode(&enc).unwrap();
+    assert_eq!(dec, overlay);
+    assert!(dec.get(b"zap").unwrap().id.is_tombstone());
+
+    // Those very bytes are NOT a valid complete tree — the whiteout tag has no
+    // complete-tree link, so decoding into one is rejected.
+    assert!(matches!(
+        TreeCodec::<L>::decode(&enc),
         Err(CASError::Codec(_))
     ));
 }
