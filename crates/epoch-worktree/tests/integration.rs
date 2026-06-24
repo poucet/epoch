@@ -516,6 +516,56 @@ mod overlay {
         let ch2 = wt2.lookup(s2, OsStr::new("change.txt")).unwrap();
         assert_eq!(wt2.read_at(ch2, 0, 1024).unwrap(), b"new");
     }
+
+    /// The mode collapse is byte-faithful: identical content sealed with
+    /// `lower = None` (standalone) and over an *empty* lower produces the
+    /// identical [`TreeId`], confirming nothing on disk shifted.
+    #[test]
+    fn empty_lower_seals_identically_to_standalone() {
+        fn build_content(wt: &mut Wt) {
+            let root = wt.root();
+            let dir = wt.mkdir(root, OsStr::new("dir"), 0o040755).unwrap();
+            let a = wt.create(dir, OsStr::new("a.txt"), 0o100644).unwrap();
+            wt.write_at(a, 0, b"alpha contents").unwrap();
+            let b = wt.create(root, OsStr::new("b.txt"), 0o100644).unwrap();
+            wt.write_at(b, 0, b"beta").unwrap();
+        }
+
+        // Standalone: no lower.
+        let mut standalone = Wt::new(MemoryByteBackend::new());
+        build_content(&mut standalone);
+        let id_standalone = standalone.seal().unwrap();
+
+        // Overlay over an empty lower: nothing falls through, no tombstones.
+        let empty = Build::new().build();
+        let mut over_empty = Wt::overlay(MemoryByteBackend::new(), empty);
+        build_content(&mut over_empty);
+        let id_over_empty = over_empty.seal().unwrap();
+
+        assert_eq!(
+            id_standalone, id_over_empty,
+            "lower=None and overlay-over-empty must seal to the identical TreeId"
+        );
+    }
+}
+
+/// Trees and blobs can live in independent backends; rehydrating with both
+/// reads the content back.
+#[test]
+fn independent_tree_and_file_backends_roundtrip() {
+    let tree_backend = MemoryByteBackend::new();
+    let file_backend = MemoryByteBackend::new();
+
+    let mut wt = WorkingTree::with_stores(tree_backend.clone(), file_backend.clone());
+    let root = wt.root();
+    write_file(&mut wt, root, "hello.txt", b"hi there");
+    let sealed = wt.seal().unwrap();
+
+    let mut wt2 =
+        WorkingTree::from_root_with_stores(tree_backend, file_backend, sealed).unwrap();
+    let root2 = wt2.root();
+    let f = wt2.lookup(root2, OsStr::new("hello.txt")).unwrap();
+    assert_eq!(wt2.read_at(f, 0, 1024).unwrap(), b"hi there");
 }
 
 #[test]
