@@ -21,8 +21,8 @@ use std::{
 };
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, NodeId, NodeKind, OpenedFile,
-    OpenRequest, ROOT_NODE_ID, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind, OpenedFile,
+    OpenRequest, ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
 };
 
 /// A unique scratch directory under the system temp dir, removed on drop.
@@ -69,8 +69,8 @@ pub struct StubVfs {
 
 #[derive(Debug, Default)]
 struct StubIds {
-    name_to_id: HashMap<OsString, NodeId>,
-    id_to_name: HashMap<NodeId, OsString>,
+    name_to_id: HashMap<OsString, InodeId>,
+    id_to_name: HashMap<InodeId, OsString>,
 }
 
 impl StubVfs {
@@ -85,11 +85,11 @@ impl StubVfs {
             files,
             ids: RwLock::new(StubIds::default()),
             // Start low so ids stay well below the control plane's high range.
-            next: AtomicU64::new(ROOT_NODE_ID.0 + 1),
+            next: AtomicU64::new(ROOT_INODE_ID.0 + 1),
         }
     }
 
-    fn id_for(&self, name: &OsStr) -> NodeId {
+    fn id_for(&self, name: &OsStr) -> InodeId {
         {
             let ids = self.ids.read().expect("stub ids read");
             if let Some(id) = ids.name_to_id.get(name) {
@@ -100,51 +100,51 @@ impl StubVfs {
         if let Some(id) = ids.name_to_id.get(name) {
             return *id;
         }
-        let id = NodeId(self.next.fetch_add(1, Ordering::Relaxed));
+        let id = InodeId(self.next.fetch_add(1, Ordering::Relaxed));
         ids.name_to_id.insert(name.to_owned(), id);
         ids.id_to_name.insert(id, name.to_owned());
         id
     }
 
-    fn name_for(&self, node_id: NodeId) -> Option<OsString> {
+    fn name_for(&self, inode_id: InodeId) -> Option<OsString> {
         self.ids
             .read()
             .expect("stub ids read")
             .id_to_name
-            .get(&node_id)
+            .get(&inode_id)
             .cloned()
     }
 
-    fn file_attr(&self, node_id: NodeId, content: &[u8]) -> NodeAttr {
-        NodeAttr::regular_file(node_id, content.len() as u64, SystemTime::now())
+    fn file_attr(&self, inode_id: InodeId, content: &[u8]) -> NodeAttr {
+        NodeAttr::regular_file(inode_id, content.len() as u64, SystemTime::now())
     }
 }
 
 impl VfsService for StubVfs {
-    fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry> {
-        if parent != ROOT_NODE_ID {
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+        if parent != ROOT_INODE_ID {
             return Err(VfsError::NotFound);
         }
         let content = self.files.get(name).ok_or(VfsError::NotFound)?;
         Ok(Entry::new(self.file_attr(self.id_for(name), content)))
     }
 
-    fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr> {
-        if node_id == ROOT_NODE_ID {
-            return Ok(NodeAttr::directory(node_id, SystemTime::now()));
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        if inode_id == ROOT_INODE_ID {
+            return Ok(NodeAttr::directory(inode_id, SystemTime::now()));
         }
-        let name = self.name_for(node_id).ok_or(VfsError::NotFound)?;
+        let name = self.name_for(inode_id).ok_or(VfsError::NotFound)?;
         let content = self.files.get(&name).ok_or(VfsError::NotFound)?;
-        Ok(self.file_attr(node_id, content))
+        Ok(self.file_attr(inode_id, content))
     }
 
-    fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>> {
-        if node_id != ROOT_NODE_ID {
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        if inode_id != ROOT_INODE_ID {
             return Err(VfsError::NotDirectory);
         }
         let mut entries = vec![
-            DirEntry::new(ROOT_NODE_ID, OsString::from("."), NodeKind::Directory),
-            DirEntry::new(ROOT_NODE_ID, OsString::from(".."), NodeKind::Directory),
+            DirEntry::new(ROOT_INODE_ID, OsString::from("."), NodeKind::Directory),
+            DirEntry::new(ROOT_INODE_ID, OsString::from(".."), NodeKind::Directory),
         ];
         for name in self.files.keys() {
             entries.push(DirEntry::new(
@@ -157,19 +157,19 @@ impl VfsService for StubVfs {
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        let name = self.name_for(request.node_id).ok_or(VfsError::NotFound)?;
+        let name = self.name_for(request.inode_id).ok_or(VfsError::NotFound)?;
         if !self.files.contains_key(&name) {
             return Err(VfsError::NotFound);
         }
         Ok(OpenedFile {
-            handle: FileHandle(request.node_id.0),
+            handle: FileHandle(request.inode_id.0),
             direct_io: false,
             keep_cache: false,
         })
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        let name = self.name_for(request.node_id).ok_or(VfsError::NotFound)?;
+        let name = self.name_for(request.inode_id).ok_or(VfsError::NotFound)?;
         let content = self.files.get(&name).ok_or(VfsError::NotFound)?;
         let start = request.offset as usize;
         if start >= content.len() {
@@ -191,11 +191,11 @@ impl VfsService for StubVfs {
         Err(VfsError::ReadOnlyFilesystem)
     }
 
-    fn unlink(&self, _parent: NodeId, _name: &OsStr) -> VfsResult<()> {
+    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
         Err(VfsError::ReadOnlyFilesystem)
     }
 
-    fn rmdir(&self, _parent: NodeId, _name: &OsStr) -> VfsResult<()> {
+    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
         Err(VfsError::ReadOnlyFilesystem)
     }
 

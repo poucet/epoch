@@ -4,7 +4,7 @@
 //! decorators rather than one monolith. From the bottom up:
 //!
 //! 1. [`PassthroughVfs`] — read-through to a lower host directory; owns the
-//!    [`NodeId`](epoch_vfs_api::NodeId) ↔ path and
+//!    [`InodeId`](epoch_vfs_api::InodeId) ↔ path and
 //!    [`FileHandle`](epoch_vfs_api::FileHandle) ↔ path maps. Read-only:
 //!    mutations return [`ReadOnlyFilesystem`](epoch_vfs_api::VfsError::ReadOnlyFilesystem),
 //!    marking the seam for a future writable upper layer.
@@ -53,7 +53,7 @@ pub fn overlay_probe(lower: PathBuf) -> Arc<dyn VfsService> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
-    use epoch_vfs_api::{NodeKind, OpenMode, OpenRequest, ROOT_NODE_ID, ReadRequest};
+    use epoch_vfs_api::{NodeKind, OpenMode, OpenRequest, ROOT_INODE_ID, ReadRequest};
     use std::{
         ffi::{OsStr, OsString},
         fs,
@@ -68,12 +68,12 @@ mod tests {
 
         // Passthrough file works through the whole stack.
         let entry = vfs
-            .lookup(ROOT_NODE_ID, OsStr::new("doc.txt"))
+            .lookup(ROOT_INODE_ID, OsStr::new("doc.txt"))
             .expect("passthrough lookup");
         assert_eq!(entry.attr.kind, NodeKind::RegularFile);
         let opened = vfs
             .open(OpenRequest {
-                node_id: entry.attr.node_id,
+                inode_id: entry.attr.inode_id,
                 mode: OpenMode::ReadOnly,
                 truncate: false,
                 append: false,
@@ -81,7 +81,7 @@ mod tests {
             .expect("passthrough open");
         let data = vfs
             .read(ReadRequest {
-                node_id: entry.attr.node_id,
+                inode_id: entry.attr.inode_id,
                 handle: opened.handle,
                 offset: 0,
                 size: 64,
@@ -92,7 +92,7 @@ mod tests {
 
         // Root listing surfaces both the passthrough file and the `.vfs` plane.
         let root_names: Vec<_> = vfs
-            .readdir(ROOT_NODE_ID)
+            .readdir(ROOT_INODE_ID)
             .expect("root readdir")
             .into_iter()
             .map(|e| e.name)
@@ -101,18 +101,18 @@ mod tests {
         assert!(root_names.contains(&OsString::from(".vfs")));
 
         // `.vfs/cas/<id>` is served synthetically and echoes the id.
-        let vfs_dir = vfs.lookup(ROOT_NODE_ID, OsStr::new(".vfs")).expect(".vfs");
+        let vfs_dir = vfs.lookup(ROOT_INODE_ID, OsStr::new(".vfs")).expect(".vfs");
         let cas_dir = vfs
-            .lookup(vfs_dir.attr.node_id, OsStr::new("cas"))
+            .lookup(vfs_dir.attr.inode_id, OsStr::new("cas"))
             .expect(".vfs/cas");
         let cas_entry = vfs
-            .lookup(cas_dir.attr.node_id, OsStr::new("deadbeef"))
+            .lookup(cas_dir.attr.inode_id, OsStr::new("deadbeef"))
             .expect(".vfs/cas/deadbeef");
         assert_eq!(cas_entry.attr.kind, NodeKind::RegularFile);
 
         let cas_opened = vfs
             .open(OpenRequest {
-                node_id: cas_entry.attr.node_id,
+                inode_id: cas_entry.attr.inode_id,
                 mode: OpenMode::ReadOnly,
                 truncate: false,
                 append: false,
@@ -120,7 +120,7 @@ mod tests {
             .expect("cas open");
         let cas_data = vfs
             .read(ReadRequest {
-                node_id: cas_entry.attr.node_id,
+                inode_id: cas_entry.attr.inode_id,
                 handle: cas_opened.handle,
                 offset: 0,
                 size: 64,

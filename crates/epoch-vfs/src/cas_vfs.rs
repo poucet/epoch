@@ -16,7 +16,7 @@
 //!   [`TreeId`].
 //!
 //! File handles are opaque, monotonically-allocated tokens: reads and writes are
-//! addressed by [`NodeId`] (which the kernel passes alongside the handle), so the
+//! addressed by [`InodeId`] (which the kernel passes alongside the handle), so the
 //! handle carries no per-open state and [`flush`](VfsService::flush) /
 //! [`release`](VfsService::release) are no-ops.
 
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epoch_cas::{MemoryByteBackend, SyncByteBackend};
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, NodeId, NodeKind,
+    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
     OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
 };
 use epoch_worktree::{TreeId, WorkingTree};
@@ -96,18 +96,18 @@ impl CasVfs<MemoryByteBackend> {
 }
 
 impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
-    fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry> {
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
         let mut tree = self.lock();
         let id = tree.lookup(parent, name)?;
         Ok(Entry::new(tree.getattr(id)?))
     }
 
-    fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr> {
-        self.lock().getattr(node_id)
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        self.lock().getattr(inode_id)
     }
 
-    fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>> {
-        self.lock().readdir(node_id)
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        self.lock().readdir(inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
@@ -115,12 +115,12 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
             let mut tree = self.lock();
             // Validate the target exists and is a file; directories are opened
             // via readdir, not here.
-            if tree.getattr(request.node_id)?.kind == NodeKind::Directory {
+            if tree.getattr(request.inode_id)?.kind == NodeKind::Directory {
                 return Err(VfsError::IsDirectory);
             }
             // O_TRUNC: empty the file on open (copies up a fall-through file).
             if request.truncate {
-                tree.truncate(request.node_id, 0)?;
+                tree.truncate(request.inode_id, 0)?;
             }
         }
         Ok(OpenedFile {
@@ -132,12 +132,12 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
         self.lock()
-            .read_at(request.node_id, request.offset, request.size)
+            .read_at(request.inode_id, request.offset, request.size)
     }
 
     fn write(&self, request: WriteRequest<'_>) -> VfsResult<u32> {
         self.lock()
-            .write_at(request.node_id, request.offset, request.data)
+            .write_at(request.inode_id, request.offset, request.data)
     }
 
     fn create(&self, request: CreateRequest) -> VfsResult<CreatedNode> {
@@ -166,11 +166,11 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         Ok(Entry::new(tree.getattr(id)?))
     }
 
-    fn unlink(&self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         self.lock().unlink(parent, name)
     }
 
-    fn rmdir(&self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         self.lock().rmdir(parent, name)
     }
 
@@ -186,18 +186,18 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epoch_vfs_api::{OpenMode, ROOT_NODE_ID};
+    use epoch_vfs_api::{OpenMode, ROOT_INODE_ID};
 
     type Svc = CasVfs<MemoryByteBackend>;
 
     /// Create+write a file through the service, returning its node id.
-    fn write_file(svc: &Svc, parent: NodeId, name: &str, data: &[u8]) -> NodeId {
+    fn write_file(svc: &Svc, parent: InodeId, name: &str, data: &[u8]) -> InodeId {
         let created = svc.create(CreateRequest::file(parent, name, 0o644)).unwrap();
-        let id = created.entry.attr.node_id;
+        let id = created.entry.attr.inode_id;
         let handle = created.opened.expect("create opens the file").handle;
         let n = svc
             .write(WriteRequest {
-                node_id: id,
+                inode_id: id,
                 handle,
                 offset: 0,
                 data,
@@ -209,10 +209,10 @@ mod tests {
     }
 
     /// Open→read→release a whole (small) file through the service.
-    fn read_all(svc: &Svc, id: NodeId) -> Vec<u8> {
+    fn read_all(svc: &Svc, id: InodeId) -> Vec<u8> {
         let opened = svc
             .open(OpenRequest {
-                node_id: id,
+                inode_id: id,
                 mode: OpenMode::ReadOnly,
                 truncate: false,
                 append: false,
@@ -220,7 +220,7 @@ mod tests {
             .unwrap();
         let bytes = svc
             .read(ReadRequest {
-                node_id: id,
+                inode_id: id,
                 handle: opened.handle,
                 offset: 0,
                 size: 4096,
@@ -230,7 +230,7 @@ mod tests {
         bytes
     }
 
-    fn names(svc: &Svc, dir: NodeId) -> Vec<String> {
+    fn names(svc: &Svc, dir: InodeId) -> Vec<String> {
         let mut out: Vec<String> = svc
             .readdir(dir)
             .unwrap()
@@ -244,26 +244,26 @@ mod tests {
     #[test]
     fn create_write_read_through_the_service() {
         let svc = CasVfs::in_memory();
-        let root = ROOT_NODE_ID;
+        let root = ROOT_INODE_ID;
 
         let dir = svc
             .mkdir(CreateRequest::directory(root, "dir", 0o755))
             .unwrap()
             .attr
-            .node_id;
+            .inode_id;
         write_file(&svc, dir, "a.txt", b"alpha");
         write_file(&svc, root, "b.txt", b"beta");
 
         assert_eq!(names(&svc, root), vec!["b.txt".to_string(), "dir".to_string()]);
 
-        let a = svc.lookup(dir, OsStr::new("a.txt")).unwrap().attr.node_id;
+        let a = svc.lookup(dir, OsStr::new("a.txt")).unwrap().attr.inode_id;
         assert_eq!(read_all(&svc, a), b"alpha");
         assert_eq!(svc.getattr(a).unwrap().kind, NodeKind::RegularFile);
 
         // Opening a directory as a file is rejected.
         assert_eq!(
             svc.open(OpenRequest {
-                node_id: dir,
+                inode_id: dir,
                 mode: OpenMode::ReadOnly,
                 truncate: false,
                 append: false,
@@ -277,14 +277,14 @@ mod tests {
     fn seal_then_from_root_roundtrip_through_the_service() {
         let backend = MemoryByteBackend::new();
         let svc = CasVfs::new(backend.clone());
-        let root = ROOT_NODE_ID;
+        let root = ROOT_INODE_ID;
         write_file(&svc, root, "f", b"first");
 
         let sealed = svc.seal().unwrap();
 
         // A fresh service hydrated from the sealed root (shared backend) sees it.
         let svc2 = CasVfs::from_root(backend, sealed).unwrap();
-        let f = svc2.lookup(root, OsStr::new("f")).unwrap().attr.node_id;
+        let f = svc2.lookup(root, OsStr::new("f")).unwrap().attr.inode_id;
         assert_eq!(read_all(&svc2, f), b"first");
         assert_eq!(names(&svc2, root), vec!["f".to_string()]);
     }
@@ -292,14 +292,14 @@ mod tests {
     #[test]
     fn open_with_truncate_empties_the_file() {
         let svc = CasVfs::in_memory();
-        let root = ROOT_NODE_ID;
+        let root = ROOT_INODE_ID;
         let id = write_file(&svc, root, "f", b"some existing content");
         assert_eq!(svc.getattr(id).unwrap().size, 21);
 
         // O_TRUNC on open empties the file.
         let opened = svc
             .open(OpenRequest {
-                node_id: id,
+                inode_id: id,
                 mode: OpenMode::WriteOnly,
                 truncate: true,
                 append: false,

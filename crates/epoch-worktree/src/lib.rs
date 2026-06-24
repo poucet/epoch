@@ -5,7 +5,7 @@
 //! a VFS/FUSE adapter. It is the home of the two
 //! things the object layer deliberately lacks:
 //!
-//! - **mutable identity** — stable [`NodeId`] inodes that survive edits, so a
+//! - **mutable identity** — stable [`InodeId`] inodes that survive edits, so a
 //!   file keeps its identity while its content (and thus its `BlobId`) changes;
 //! - **the read/write bridge** — [`from_root`](WorkingTree::from_root) turns a
 //!   [`TreeId`] into a tree of inodes, and [`seal`](WorkingTree::seal) walks the
@@ -30,10 +30,10 @@
 //!   spine is stored in the upper; every untouched name falls through to the
 //!   lower.
 //!
-//! The overlay **owns the [`NodeId`] space** (allocated from a monotonic
+//! The overlay **owns the [`InodeId`] space** (allocated from a monotonic
 //! counter). Lower-service node ids live only *inside* the overlay's nodes
 //! ([`LowerFile`](Body::LowerFile) and [`Dir::lower`](Body::Dir)); whenever an
-//! attribute or dir-entry is derived from the lower, its `node_id` is **remapped**
+//! attribute or dir-entry is derived from the lower, its `inode_id` is **remapped**
 //! to the overlay's id, so a lower id is never leaked to a caller and a node's
 //! identity is stable across repeated lookups (and matches `readdir`).
 //!
@@ -70,8 +70,8 @@ use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
 use epoch_tree::{EntryId, Link, LinkKind, Overlay, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
-    DirEntry, NodeAttr, NodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
-    VfsService, ROOT_NODE_ID,
+    DirEntry, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
+    VfsService, ROOT_INODE_ID,
 };
 
 /// Re-exported so consumers of [`WorkingTree`] can name the sealed-tree id type
@@ -98,7 +98,7 @@ pub struct WorkingTree<Bk> {
     /// The overlay base. `None` is *pure mode*: no lower layer, the working tree
     /// is the whole tree.
     lower: Option<Arc<dyn VfsService>>,
-    inodes: HashMap<NodeId, Inode>,
+    inodes: HashMap<InodeId, Inode>,
     /// Next inode number to hand out (monotonic; starts just past the root).
     next: u64,
 }
@@ -114,18 +114,18 @@ struct Inode {
 enum Body {
     /// A directory in the upper spine. `children` caches **all** resolved
     /// children (upper values, tombstones, and cached fall-throughs). `lower`
-    /// is the corresponding lower-service directory [`NodeId`] this dir overlays
+    /// is the corresponding lower-service directory [`InodeId`] this dir overlays
     /// (`None` if the dir has no lower counterpart, e.g. a freshly `mkdir`'d
     /// dir).
     Dir {
-        children: BTreeMap<OsString, NodeId>,
-        lower: Option<NodeId>,
+        children: BTreeMap<OsString, InodeId>,
+        lower: Option<InodeId>,
     },
     /// An upper-materialized regular file: `Clean(BlobId)` or `Dirty(FileWriter)`.
     File(FileBody),
     /// A fall-through regular file served from the lower service. The wrapped id
-    /// is the file's *lower* [`NodeId`]; the overlay never exposes it directly.
-    LowerFile(NodeId),
+    /// is the file's *lower* [`InodeId`]; the overlay never exposes it directly.
+    LowerFile(InodeId),
     /// A whiteout: hides the lower entry of this name (overlay deletion marker).
     Tombstone,
 }
@@ -174,19 +174,19 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     pub fn from_root(backend: Bk, root: TreeId) -> VfsResult<Self> {
         let mut wt = Self::new(backend);
         let store = wt.tree_store::<CompleteLink>();
-        wt.hydrate_tree(&store, ROOT_NODE_ID, root, None)?;
+        wt.hydrate_tree(&store, ROOT_INODE_ID, root, None)?;
         Ok(wt)
     }
 
     /// Create an empty **overlay** over `lower`: the root falls through to the
-    /// lower's root ([`ROOT_NODE_ID`]). The root's mode is taken from the
+    /// lower's root ([`ROOT_INODE_ID`]). The root's mode is taken from the
     /// lower's root attrs (fallback `0o755`).
     pub fn overlay(backend: Bk, lower: Arc<dyn VfsService>) -> Self {
         let mode = lower
-            .getattr(ROOT_NODE_ID)
+            .getattr(ROOT_INODE_ID)
             .map(|a| 0o040000 | (a.perm as u32 & 0o7777))
             .unwrap_or(0o040755);
-        Self::with_root(backend, Some(lower), mode, Some(ROOT_NODE_ID))
+        Self::with_root(backend, Some(lower), mode, Some(ROOT_INODE_ID))
     }
 
     /// Rehydrate a persisted delta layer on top of `lower`.
@@ -202,7 +202,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         let mut wt = Self::overlay(backend, lower);
         // The root's lower counterpart is the lower's root.
         let store = wt.tree_store::<OverlayLink>();
-        wt.hydrate_tree(&store, ROOT_NODE_ID, delta, Some(ROOT_NODE_ID))?;
+        wt.hydrate_tree(&store, ROOT_INODE_ID, delta, Some(ROOT_INODE_ID))?;
         Ok(wt)
     }
 
@@ -211,11 +211,11 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         backend: Bk,
         lower: Option<Arc<dyn VfsService>>,
         mode: u32,
-        root_lower: Option<NodeId>,
+        root_lower: Option<InodeId>,
     ) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
-            ROOT_NODE_ID,
+            ROOT_INODE_ID,
             Inode {
                 mode,
                 body: Body::Dir {
@@ -229,20 +229,20 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             backend,
             lower,
             inodes,
-            next: ROOT_NODE_ID.0 + 1,
+            next: ROOT_INODE_ID.0 + 1,
         }
     }
 
     /// Allocate a fresh inode number.
-    fn alloc(&mut self) -> NodeId {
-        let id = NodeId(self.next);
+    fn alloc(&mut self) -> InodeId {
+        let id = InodeId(self.next);
         self.next += 1;
         id
     }
 
-    /// The root directory's inode id ([`ROOT_NODE_ID`]).
-    pub fn root(&self) -> NodeId {
-        ROOT_NODE_ID
+    /// The root directory's inode id ([`ROOT_INODE_ID`]).
+    pub fn root(&self) -> InodeId {
+        ROOT_INODE_ID
     }
 
     // --- store / hydration ---------------------------------------------------
@@ -266,9 +266,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     fn hydrate_tree<L>(
         &mut self,
         store: &TreeStore<Bk, L>,
-        dir: NodeId,
+        dir: InodeId,
         tree_id: TreeId,
-        dir_lower: Option<NodeId>,
+        dir_lower: Option<InodeId>,
     ) -> VfsResult<()>
     where
         L: Link<Blob = BlobId> + Send + Sync + 'static,
@@ -314,15 +314,15 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         Ok(())
     }
 
-    /// Resolve the lower-service [`NodeId`] of the *directory* child `name` under
+    /// Resolve the lower-service [`InodeId`] of the *directory* child `name` under
     /// the lower dir `parent_lower`, or `None` if there is no lower, no such
     /// child, or the child is not a directory.
-    fn lower_child_dir(&self, parent_lower: Option<NodeId>, name: &OsStr) -> Option<NodeId> {
+    fn lower_child_dir(&self, parent_lower: Option<InodeId>, name: &OsStr) -> Option<InodeId> {
         let lower = self.lower.as_ref()?;
         let pl = parent_lower?;
         let entry = lower.lookup(pl, name).ok()?;
         if entry.attr.kind == NodeKind::Directory {
-            Some(entry.attr.node_id)
+            Some(entry.attr.inode_id)
         } else {
             None
         }
@@ -333,7 +333,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Resolve `name` within directory `parent`, materializing a lower entry on
     /// first sight so its overlay id is stable across repeated lookups (and
     /// matches `readdir`).
-    pub fn lookup(&mut self, parent: NodeId, name: &OsStr) -> VfsResult<NodeId> {
+    pub fn lookup(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<InodeId> {
         let (cached, parent_lower) = match self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
             Body::Dir { ref children, lower } => (children.get(name).copied(), lower),
             _ => return Err(VfsError::NotDirectory),
@@ -356,15 +356,15 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     }
 
     /// Build an overlay node from a lower entry's attrs and insert it, returning
-    /// its (newly allocated) overlay [`NodeId`]. A directory becomes a fall-
+    /// its (newly allocated) overlay [`InodeId`]. A directory becomes a fall-
     /// through `Dir` wired to its lower id; a regular file becomes a
     /// `LowerFile`. (Symlinks are treated as regular files for v1.)
-    fn materialize_lower(&mut self, attr: &NodeAttr) -> NodeId {
+    fn materialize_lower(&mut self, attr: &NodeAttr) -> InodeId {
         let id = self.alloc();
         let mode_perm = attr.perm as u32 & 0o7777;
         let body = match attr.kind {
-            NodeKind::Directory => Body::Dir { children: BTreeMap::new(), lower: Some(attr.node_id) },
-            NodeKind::RegularFile | NodeKind::Symlink => Body::LowerFile(attr.node_id),
+            NodeKind::Directory => Body::Dir { children: BTreeMap::new(), lower: Some(attr.inode_id) },
+            NodeKind::RegularFile | NodeKind::Symlink => Body::LowerFile(attr.inode_id),
         };
         let mode = match attr.kind {
             NodeKind::Directory => 0o040000 | mode_perm,
@@ -378,8 +378,8 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
 
     /// Attributes of `node` (kind, mode, size). Upper nodes report
     /// [`UNIX_EPOCH`] timestamps; a fall-through file reports the lower's own
-    /// attrs (with the `node_id` remapped to the overlay id).
-    pub fn getattr(&self, node: NodeId) -> VfsResult<NodeAttr> {
+    /// attrs (with the `inode_id` remapped to the overlay id).
+    pub fn getattr(&self, node: InodeId) -> VfsResult<NodeAttr> {
         let inode = self.inodes.get(&node).ok_or(VfsError::NotFound)?;
         let mut attr = match &inode.body {
             Body::Dir { .. } => NodeAttr::directory(node, UNIX_EPOCH),
@@ -387,7 +387,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             Body::LowerFile(ld) => {
                 let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
                 let mut a = lower.getattr(*ld)?;
-                a.node_id = node;
+                a.inode_id = node;
                 return Ok(a);
             }
             Body::Tombstone => return Err(VfsError::NotFound),
@@ -399,9 +399,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// List the children of directory `node`: cached children (skipping
     /// tombstones) merged with the lower's children whose names are not already
     /// overridden/tombstoned/cached. Lower entries are materialized+cached so a
-    /// later `lookup` returns the same id; every entry's `node_id` is the
+    /// later `lookup` returns the same id; every entry's `inode_id` is the
     /// overlay id.
-    pub fn readdir(&mut self, node: NodeId) -> VfsResult<Vec<DirEntry>> {
+    pub fn readdir(&mut self, node: InodeId) -> VfsResult<Vec<DirEntry>> {
         let (cached, lower_id) = match self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { ref children, lower } => (
                 children.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
@@ -429,7 +429,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                 }
                 // Materialize+cache the lower child via its full attrs so its id
                 // is stable and matches a later lookup.
-                let attr = lower.getattr(de.node_id)?;
+                let attr = lower.getattr(de.inode_id)?;
                 let id = self.materialize_lower(&attr);
                 self.link(node, &de.name, id);
                 let kind = match attr.kind {
@@ -447,7 +447,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Read up to `len` bytes of file `node` at offset `off` (clamped to EOF).
     /// A fall-through file is served from the lower (open/read/release per call
     /// in v1).
-    pub fn read_at(&self, node: NodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
+    pub fn read_at(&self, node: InodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => Err(VfsError::IsDirectory),
             Body::File(FileBody::Clean(blob)) => {
@@ -460,16 +460,16 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     }
 
     /// Read a range from a lower file: open read-only, read, release.
-    fn read_lower(&self, ld: NodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
+    fn read_lower(&self, ld: InodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
         let opened = lower.open(OpenRequest {
-            node_id: ld,
+            inode_id: ld,
             mode: OpenMode::ReadOnly,
             truncate: false,
             append: false,
         })?;
         let res = lower.read(ReadRequest {
-            node_id: ld,
+            inode_id: ld,
             handle: opened.handle,
             offset: off,
             size: len,
@@ -480,11 +480,11 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     }
 
     /// Read the entire lower file (used by copy-up).
-    fn read_lower_all(&self, ld: NodeId) -> VfsResult<Vec<u8>> {
+    fn read_lower_all(&self, ld: InodeId) -> VfsResult<Vec<u8>> {
         let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
         let size = lower.getattr(ld)?.size;
         let opened = lower.open(OpenRequest {
-            node_id: ld,
+            inode_id: ld,
             mode: OpenMode::ReadOnly,
             truncate: false,
             append: false,
@@ -499,7 +499,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                 break;
             }
             let chunk = lower.read(ReadRequest {
-                node_id: ld,
+                inode_id: ld,
                 handle: opened.handle,
                 offset: off,
                 size: want,
@@ -529,9 +529,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     ///   into a [`FileWriter`]) on first write.
     /// - A **fall-through** file is **copied up**: its whole lower content is
     ///   read into a fresh writer, the inode flips to [`File`](Body::File)
-    ///   keeping the **same [`NodeId`]**, and the write is applied. The lower is
+    ///   keeping the **same [`InodeId`]**, and the write is applied. The lower is
     ///   never mutated.
-    pub fn write_at(&mut self, node: NodeId, off: u64, data: &[u8]) -> VfsResult<u32> {
+    pub fn write_at(&mut self, node: InodeId, off: u64, data: &[u8]) -> VfsResult<u32> {
         self.make_dirty(node)?;
         self.writer_mut(node)?.write_at(off, data);
         Ok(data.len() as u32)
@@ -543,10 +543,10 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     ///
     /// Like [`write_at`](Self::write_at) this materializes on first mutation — a
     /// clean upper file is reopened for editing, a fall-through file is copied up
-    /// (same [`NodeId`]; the lower is never touched). Truncating to `len == 0`
+    /// (same [`InodeId`]; the lower is never touched). Truncating to `len == 0`
     /// installs a fresh empty writer directly, so neither the clean blob nor the
     /// lower content is read.
-    pub fn truncate(&mut self, node: NodeId, len: u64) -> VfsResult<()> {
+    pub fn truncate(&mut self, node: InodeId, len: u64) -> VfsResult<()> {
         if len == 0 {
             // Fast path: an empty result needs none of the existing content, so
             // skip the clean-blob load / lower copy-up entirely.
@@ -569,15 +569,15 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Ensure file `node` is backed by a live [`FileWriter`]
     /// ([`Dirty`](FileBody::Dirty)), materializing it on first mutation: a clean
     /// file is reopened for editing; a fall-through [`LowerFile`](Body::LowerFile)
-    /// is copied up from the lower (keeping the same [`NodeId`]; the lower is
+    /// is copied up from the lower (keeping the same [`InodeId`]; the lower is
     /// never mutated). Errors if `node` is a directory or a tombstone.
-    fn make_dirty(&mut self, node: NodeId) -> VfsResult<()> {
+    fn make_dirty(&mut self, node: InodeId) -> VfsResult<()> {
         // Decide the materialization step without holding a borrow across the
         // FileCas / lower calls.
         enum Step {
             Ready,
             EditClean(BlobId),
-            CopyUp(NodeId),
+            CopyUp(InodeId),
         }
         let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
@@ -609,7 +609,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
 
     /// Borrow `node`'s live writer. Call only after
     /// [`make_dirty`](Self::make_dirty); any other body is a bug.
-    fn writer_mut(&mut self, node: NodeId) -> VfsResult<&mut FileWriter> {
+    fn writer_mut(&mut self, node: InodeId) -> VfsResult<&mut FileWriter> {
         match &mut self.inodes.get_mut(&node).ok_or(VfsError::NotFound)?.body {
             Body::File(FileBody::Dirty(writer)) => Ok(writer),
             _ => Err(VfsError::Io("file body changed unexpectedly".into())),
@@ -622,7 +622,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     ///
     /// Recreating over a tombstone (a previously-deleted lower name) replaces
     /// the whiteout.
-    pub fn create(&mut self, parent: NodeId, name: &OsStr, mode: u32) -> VfsResult<NodeId> {
+    pub fn create(&mut self, parent: InodeId, name: &OsStr, mode: u32) -> VfsResult<InodeId> {
         self.ensure_creatable(parent, name)?;
         let writer = self.files.edit(None).map_err(io)?;
         let id = self.alloc();
@@ -633,7 +633,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
 
     /// Create an empty subdirectory `name` under `parent` (upper only, `lower =
     /// None`). Recreating over a tombstone replaces the whiteout.
-    pub fn mkdir(&mut self, parent: NodeId, name: &OsStr, mode: u32) -> VfsResult<NodeId> {
+    pub fn mkdir(&mut self, parent: InodeId, name: &OsStr, mode: u32) -> VfsResult<InodeId> {
         self.ensure_creatable(parent, name)?;
         let id = self.alloc();
         self.inodes.insert(
@@ -650,7 +650,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     ///
     /// If the name also exists in the lower a **tombstone** (whiteout) is left in
     /// its place; a pure-upper name is simply dropped.
-    pub fn unlink(&mut self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    pub fn unlink(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
@@ -665,7 +665,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// "Empty" means no non-tombstone upper children **and** no un-tombstoned
     /// lower children. If the name also exists in the lower a tombstone is left;
     /// a pure-upper directory is simply dropped.
-    pub fn rmdir(&mut self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    pub fn rmdir(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
             Body::File(_) | Body::LowerFile(_) => return Err(VfsError::NotDirectory),
@@ -680,7 +680,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
 
     /// Whether directory `id` has no visible children (no non-tombstone upper
     /// child, and no lower child not shadowed by a tombstone).
-    fn dir_is_empty(&self, id: NodeId) -> VfsResult<bool> {
+    fn dir_is_empty(&self, id: InodeId) -> VfsResult<bool> {
         let (children, lower) = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
             Body::Dir { children, lower } => (children, *lower),
             _ => return Err(VfsError::NotDirectory),
@@ -711,7 +711,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Detach `name`→`id` from `parent`: leave a tombstone if the name also
     /// exists in the lower, otherwise drop it. Frees the removed inode unless it
     /// is replaced by a tombstone (a tombstone is its own fresh node).
-    fn remove_child(&mut self, parent: NodeId, name: &OsStr, id: NodeId) -> VfsResult<()> {
+    fn remove_child(&mut self, parent: InodeId, name: &OsStr, id: InodeId) -> VfsResult<()> {
         if self.name_in_lower(parent, name)? {
             // Whiteout: replace the resolved child with a tombstone, reusing its
             // slot. We free the old inode and install a tombstone in `children`.
@@ -729,7 +729,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Whether `name` resolves to an entry in the lower of `parent` (a
     /// `LowerFile`/fall-through dir already cached counts, as does a fresh lower
     /// lookup).
-    fn name_in_lower(&self, parent: NodeId, name: &OsStr) -> VfsResult<bool> {
+    fn name_in_lower(&self, parent: InodeId, name: &OsStr) -> VfsResult<bool> {
         let parent_lower = match &self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
             Body::Dir { lower, .. } => *lower,
             _ => return Err(VfsError::NotDirectory),
@@ -766,7 +766,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         L: Link<Blob = BlobId> + Send + Sync + 'static,
     {
         let store = self.tree_store::<L>();
-        match self.seal_dir::<L>(&store, ROOT_NODE_ID, true)? {
+        match self.seal_dir::<L>(&store, ROOT_INODE_ID, true)? {
             Some(id) => Ok(id),
             // Root with no entries and a lower: still emit an empty tree.
             None => store.put(Tree::<L>::empty()).map_err(io),
@@ -784,7 +784,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     fn seal_dir<L>(
         &mut self,
         store: &TreeStore<Bk, L>,
-        dir: NodeId,
+        dir: InodeId,
         force_emit: bool,
     ) -> VfsResult<Option<TreeId>>
     where
@@ -850,7 +850,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Seal a single upper file inode, returning its blob id and logical size. A
     /// dirty writer is committed and the inode flipped to clean; a clean file is
     /// left as-is.
-    fn seal_file(&mut self, id: NodeId) -> VfsResult<(BlobId, u64)> {
+    fn seal_file(&mut self, id: InodeId) -> VfsResult<(BlobId, u64)> {
         // Take ownership of a dirty writer (if any) without holding a borrow
         // across `self.files.commit`. Swap in a Tombstone sentinel that is
         // overwritten immediately below.
@@ -899,7 +899,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Error unless `parent` is a directory where `name` can be created: it must
     /// not already resolve to a live (non-tombstone) entry — neither in the
     /// upper nor (un-tombstoned) in the lower. A tombstone is replaceable.
-    fn ensure_creatable(&self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    fn ensure_creatable(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let (cached, parent_lower) = match &self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
             Body::Dir { children, lower } => (children.get(name).copied(), *lower),
             _ => return Err(VfsError::NotDirectory),
@@ -921,13 +921,13 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         Ok(())
     }
 
-    fn link(&mut self, parent: NodeId, name: &OsStr, id: NodeId) {
+    fn link(&mut self, parent: InodeId, name: &OsStr, id: InodeId) {
         if let Some(Inode { body: Body::Dir { children, .. }, .. }) = self.inodes.get_mut(&parent) {
             children.insert(name.to_os_string(), id);
         }
     }
 
-    fn unlink_child(&mut self, parent: NodeId, name: &OsStr) {
+    fn unlink_child(&mut self, parent: InodeId, name: &OsStr) {
         if let Some(Inode { body: Body::Dir { children, .. }, .. }) = self.inodes.get_mut(&parent) {
             children.remove(name);
         }

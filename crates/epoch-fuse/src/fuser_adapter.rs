@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, io, path::Path, sync::Arc};
 
 use epoch_vfs_api::{
-    CreateRequest, Entry, FileHandle as VfsFileHandle, NodeAttr, NodeId, NodeKind, OpenMode,
+    CreateRequest, Entry, FileHandle as VfsFileHandle, NodeAttr, InodeId, NodeKind, OpenMode,
     OpenRequest, ReadRequest, VfsError, VfsService, WriteRequest,
 };
 use fuser::{
@@ -55,7 +55,7 @@ impl Filesystem for FuseSpikeFs {
             Ok(entry) => {
                 fuse_log!(
                     "lookup ok node={} kind={:?} size={}",
-                    entry.attr.node_id.0,
+                    entry.attr.inode_id.0,
                     entry.attr.kind,
                     entry.attr.size
                 );
@@ -71,7 +71,7 @@ impl Filesystem for FuseSpikeFs {
             Ok(attr) => {
                 fuse_log!(
                     "getattr ok ino={} kind={:?} size={}",
-                    attr.node_id.0,
+                    attr.inode_id.0,
                     attr.kind,
                     attr.size
                 );
@@ -86,7 +86,7 @@ impl Filesystem for FuseSpikeFs {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         fuse_log!("open ino={} flags={flags:?}", ino.0);
         let request = OpenRequest {
-            node_id: from_ino(ino),
+            inode_id: from_ino(ino),
             mode: to_open_mode(flags),
             truncate: false,
             append: false,
@@ -120,7 +120,7 @@ impl Filesystem for FuseSpikeFs {
             size
         );
         let request = ReadRequest {
-            node_id: from_ino(ino),
+            inode_id: from_ino(ino),
             handle: from_fh(fh),
             offset,
             size,
@@ -155,7 +155,7 @@ impl Filesystem for FuseSpikeFs {
             data.len()
         );
         let request = WriteRequest {
-            node_id: from_ino(ino),
+            inode_id: from_ino(ino),
             handle: from_fh(fh),
             offset,
             data,
@@ -229,12 +229,12 @@ impl Filesystem for FuseSpikeFs {
                     fuse_log!(
                         "readdir add offset={} node={} name={:?} kind={:?}",
                         index + 1,
-                        entry.node_id.0,
+                        entry.inode_id.0,
                         entry.name,
                         entry.kind
                     );
                     let full = reply.add(
-                        to_ino(entry.node_id),
+                        to_ino(entry.inode_id),
                         (index + 1) as u64,
                         to_file_type(entry.kind),
                         entry.name,
@@ -284,7 +284,7 @@ impl Filesystem for FuseSpikeFs {
                 };
                 fuse_log!(
                     "create ok node={} fh={}",
-                    created.entry.attr.node_id.0,
+                    created.entry.attr.inode_id.0,
                     opened.handle.0
                 );
                 let ttl = created.entry.ttl;
@@ -315,7 +315,7 @@ impl Filesystem for FuseSpikeFs {
 
         match self.vfs.mkdir(request) {
             Ok(entry) => {
-                fuse_log!("mkdir ok node={}", entry.attr.node_id.0);
+                fuse_log!("mkdir ok node={}", entry.attr.inode_id.0);
                 reply_entry(reply, entry);
             }
             Err(err) => reply_error_entry(reply, err),
@@ -393,12 +393,12 @@ fn reply_error_write(reply: ReplyWrite, error: VfsError) {
     reply.error(log_errno(&error));
 }
 
-fn to_ino(node_id: NodeId) -> INodeNo {
-    INodeNo(node_id.0)
+fn to_ino(inode_id: InodeId) -> INodeNo {
+    INodeNo(inode_id.0)
 }
 
-fn from_ino(ino: INodeNo) -> NodeId {
-    NodeId(ino.0)
+fn from_ino(ino: INodeNo) -> InodeId {
+    InodeId(ino.0)
 }
 
 fn to_fh(handle: VfsFileHandle) -> FileHandle {
@@ -411,7 +411,7 @@ fn from_fh(handle: FileHandle) -> VfsFileHandle {
 
 fn to_file_attr(attr: NodeAttr) -> FileAttr {
     FileAttr {
-        ino: to_ino(attr.node_id),
+        ino: to_ino(attr.inode_id),
         size: attr.size,
         blocks: attr.blocks,
         atime: attr.atime,

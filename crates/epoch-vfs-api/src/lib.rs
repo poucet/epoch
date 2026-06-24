@@ -10,10 +10,10 @@ use std::{
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
-pub const ROOT_NODE_ID: NodeId = NodeId(1);
+pub const ROOT_INODE_ID: InodeId = InodeId(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NodeId(pub u64);
+pub struct InodeId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileHandle(pub u64);
@@ -27,7 +27,7 @@ pub enum NodeKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeAttr {
-    pub node_id: NodeId,
+    pub inode_id: InodeId,
     pub kind: NodeKind,
     pub size: u64,
     pub blocks: u64,
@@ -45,9 +45,9 @@ pub struct NodeAttr {
 }
 
 impl NodeAttr {
-    pub fn directory(node_id: NodeId, now: SystemTime) -> Self {
+    pub fn directory(inode_id: InodeId, now: SystemTime) -> Self {
         Self {
-            node_id,
+            inode_id,
             kind: NodeKind::Directory,
             size: 0,
             blocks: 0,
@@ -65,9 +65,9 @@ impl NodeAttr {
         }
     }
 
-    pub fn regular_file(node_id: NodeId, size: u64, now: SystemTime) -> Self {
+    pub fn regular_file(inode_id: InodeId, size: u64, now: SystemTime) -> Self {
         Self {
-            node_id,
+            inode_id,
             kind: NodeKind::RegularFile,
             size,
             blocks: size.div_ceil(512),
@@ -105,15 +105,15 @@ impl Entry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirEntry {
-    pub node_id: NodeId,
+    pub inode_id: InodeId,
     pub name: OsString,
     pub kind: NodeKind,
 }
 
 impl DirEntry {
-    pub fn new(node_id: NodeId, name: impl Into<OsString>, kind: NodeKind) -> Self {
+    pub fn new(inode_id: InodeId, name: impl Into<OsString>, kind: NodeKind) -> Self {
         Self {
-            node_id,
+            inode_id,
             name: name.into(),
             kind,
         }
@@ -129,7 +129,7 @@ pub enum OpenMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenRequest {
-    pub node_id: NodeId,
+    pub inode_id: InodeId,
     pub mode: OpenMode,
     pub truncate: bool,
     pub append: bool,
@@ -144,7 +144,7 @@ pub struct OpenedFile {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadRequest {
-    pub node_id: NodeId,
+    pub inode_id: InodeId,
     pub handle: FileHandle,
     pub offset: u64,
     pub size: u32,
@@ -152,7 +152,7 @@ pub struct ReadRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteRequest<'a> {
-    pub node_id: NodeId,
+    pub inode_id: InodeId,
     pub handle: FileHandle,
     pub offset: u64,
     pub data: &'a [u8],
@@ -160,14 +160,14 @@ pub struct WriteRequest<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRequest {
-    pub parent: NodeId,
+    pub parent: InodeId,
     pub name: OsString,
     pub kind: NodeKind,
     pub mode: u32,
 }
 
 impl CreateRequest {
-    pub fn file(parent: NodeId, name: impl Into<OsString>, mode: u32) -> Self {
+    pub fn file(parent: InodeId, name: impl Into<OsString>, mode: u32) -> Self {
         Self {
             parent,
             name: name.into(),
@@ -176,7 +176,7 @@ impl CreateRequest {
         }
     }
 
-    pub fn directory(parent: NodeId, name: impl Into<OsString>, mode: u32) -> Self {
+    pub fn directory(parent: InodeId, name: impl Into<OsString>, mode: u32) -> Self {
         Self {
             parent,
             name: name.into(),
@@ -228,11 +228,11 @@ impl fmt::Display for VfsError {
 impl Error for VfsError {}
 
 pub trait VfsService: Send + Sync {
-    fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry>;
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry>;
 
-    fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr>;
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr>;
 
-    fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>>;
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>>;
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
 
@@ -244,9 +244,9 @@ pub trait VfsService: Send + Sync {
 
     fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry>;
 
-    fn unlink(&self, parent: NodeId, name: &OsStr) -> VfsResult<()>;
+    fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()>;
 
-    fn rmdir(&self, parent: NodeId, name: &OsStr) -> VfsResult<()>;
+    fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()>;
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()>;
 

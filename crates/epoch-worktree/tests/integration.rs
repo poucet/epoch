@@ -9,7 +9,7 @@ use epoch_worktree::WorkingTree;
 
 type Wt = WorkingTree<MemoryByteBackend>;
 
-fn write_file(wt: &mut Wt, parent: epoch_vfs_api::NodeId, name: &str, content: &[u8]) {
+fn write_file(wt: &mut Wt, parent: epoch_vfs_api::InodeId, name: &str, content: &[u8]) {
     let id = wt.create(parent, OsStr::new(name), 0o100644).unwrap();
     wt.write_at(id, 0, content).unwrap();
 }
@@ -181,9 +181,9 @@ mod overlay {
 
     use epoch_cas::MemoryByteBackend;
     use epoch_vfs_api::{
-        CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, NodeId, NodeKind,
+        CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
         OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
-        ROOT_NODE_ID,
+        ROOT_INODE_ID,
     };
     use epoch_worktree::WorkingTree;
 
@@ -193,32 +193,32 @@ mod overlay {
     /// Mutating operations return [`VfsError::ReadOnlyFilesystem`] so the tests
     /// also assert the overlay never writes down into the lower.
     enum Node {
-        Dir(BTreeMap<OsString, NodeId>),
+        Dir(BTreeMap<OsString, InodeId>),
         File(Vec<u8>),
     }
 
     struct Lower {
-        nodes: HashMap<NodeId, Node>,
+        nodes: HashMap<InodeId, Node>,
     }
 
     /// Fluent builder for a [`Lower`] tree; every inserted node gets a fresh id.
     struct Build {
-        nodes: HashMap<NodeId, Node>,
+        nodes: HashMap<InodeId, Node>,
         next: u64,
     }
 
     impl Build {
         fn new() -> Self {
             let mut nodes = HashMap::new();
-            nodes.insert(ROOT_NODE_ID, Node::Dir(BTreeMap::new()));
+            nodes.insert(ROOT_INODE_ID, Node::Dir(BTreeMap::new()));
             Self {
                 nodes,
-                next: ROOT_NODE_ID.0 + 1,
+                next: ROOT_INODE_ID.0 + 1,
             }
         }
 
-        fn insert(&mut self, parent: NodeId, name: &str, node: Node) -> NodeId {
-            let id = NodeId(self.next);
+        fn insert(&mut self, parent: InodeId, name: &str, node: Node) -> InodeId {
+            let id = InodeId(self.next);
             self.next += 1;
             self.nodes.insert(id, node);
             if let Some(Node::Dir(m)) = self.nodes.get_mut(&parent) {
@@ -227,11 +227,11 @@ mod overlay {
             id
         }
 
-        fn file(&mut self, parent: NodeId, name: &str, content: &[u8]) -> NodeId {
+        fn file(&mut self, parent: InodeId, name: &str, content: &[u8]) -> InodeId {
             self.insert(parent, name, Node::File(content.to_vec()))
         }
 
-        fn dir(&mut self, parent: NodeId, name: &str) -> NodeId {
+        fn dir(&mut self, parent: InodeId, name: &str) -> InodeId {
             self.insert(parent, name, Node::Dir(BTreeMap::new()))
         }
 
@@ -241,7 +241,7 @@ mod overlay {
     }
 
     impl Lower {
-        fn attr(&self, id: NodeId) -> VfsResult<NodeAttr> {
+        fn attr(&self, id: InodeId) -> VfsResult<NodeAttr> {
             match self.nodes.get(&id).ok_or(VfsError::NotFound)? {
                 Node::Dir(_) => Ok(NodeAttr::directory(id, UNIX_EPOCH)),
                 Node::File(b) => Ok(NodeAttr::regular_file(id, b.len() as u64, UNIX_EPOCH)),
@@ -250,7 +250,7 @@ mod overlay {
     }
 
     impl VfsService for Lower {
-        fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry> {
+        fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
             let dir = match self.nodes.get(&parent).ok_or(VfsError::NotFound)? {
                 Node::Dir(m) => m,
                 _ => return Err(VfsError::NotDirectory),
@@ -259,12 +259,12 @@ mod overlay {
             Ok(Entry::new(self.attr(id)?))
         }
 
-        fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr> {
-            self.attr(node_id)
+        fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+            self.attr(inode_id)
         }
 
-        fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>> {
-            let dir = match self.nodes.get(&node_id).ok_or(VfsError::NotFound)? {
+        fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+            let dir = match self.nodes.get(&inode_id).ok_or(VfsError::NotFound)? {
                 Node::Dir(m) => m,
                 _ => return Err(VfsError::NotDirectory),
             };
@@ -282,14 +282,14 @@ mod overlay {
 
         fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
             Ok(OpenedFile {
-                handle: FileHandle(request.node_id.0),
+                handle: FileHandle(request.inode_id.0),
                 direct_io: false,
                 keep_cache: true,
             })
         }
 
         fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-            match self.nodes.get(&request.node_id).ok_or(VfsError::NotFound)? {
+            match self.nodes.get(&request.inode_id).ok_or(VfsError::NotFound)? {
                 Node::File(b) => {
                     let start = (request.offset as usize).min(b.len());
                     let end = start.saturating_add(request.size as usize).min(b.len());
@@ -311,11 +311,11 @@ mod overlay {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
-        fn unlink(&self, _: NodeId, _: &OsStr) -> VfsResult<()> {
+        fn unlink(&self, _: InodeId, _: &OsStr) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
-        fn rmdir(&self, _: NodeId, _: &OsStr) -> VfsResult<()> {
+        fn rmdir(&self, _: InodeId, _: &OsStr) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
@@ -336,8 +336,8 @@ mod overlay {
     #[test]
     fn reads_fall_through_and_unmutated_seal_is_empty() {
         let mut b = Build::new();
-        b.file(ROOT_NODE_ID, "keep.txt", b"lower content");
-        let sub = b.dir(ROOT_NODE_ID, "sub");
+        b.file(ROOT_INODE_ID, "keep.txt", b"lower content");
+        let sub = b.dir(ROOT_INODE_ID, "sub");
         b.file(sub, "deep.txt", b"deep");
         let lower = b.build();
 
@@ -365,12 +365,12 @@ mod overlay {
     }
 
     /// First write to a fall-through file copies its whole content up into the
-    /// CAS, keeps the same [`NodeId`], reflects the edit, and never touches the
+    /// CAS, keeps the same [`InodeId`], reflects the edit, and never touches the
     /// lower.
     #[test]
     fn write_copies_up_and_leaves_lower_untouched() {
         let mut b = Build::new();
-        let f_lower = b.file(ROOT_NODE_ID, "f.txt", b"original-from-lower");
+        let f_lower = b.file(ROOT_INODE_ID, "f.txt", b"original-from-lower");
         let lower = b.build();
 
         let backend = MemoryByteBackend::new();
@@ -386,7 +386,7 @@ mod overlay {
         // The lower blob is unchanged.
         let from_lower = lower
             .read(ReadRequest {
-                node_id: f_lower,
+                inode_id: f_lower,
                 handle: FileHandle(f_lower.0),
                 offset: 0,
                 size: 1024,
@@ -402,12 +402,12 @@ mod overlay {
         assert_eq!(wt2.read_at(f2, 0, 1024).unwrap(), b"OVERRIDE-from-lower");
     }
 
-    /// Truncating a fall-through file copies it up (same NodeId), reflects the
+    /// Truncating a fall-through file copies it up (same InodeId), reflects the
     /// new length, and never touches the lower.
     #[test]
     fn truncate_copies_up_and_leaves_lower_untouched() {
         let mut b = Build::new();
-        let f_lower = b.file(ROOT_NODE_ID, "f.txt", b"original-from-lower");
+        let f_lower = b.file(ROOT_INODE_ID, "f.txt", b"original-from-lower");
         let lower = b.build();
 
         let backend = MemoryByteBackend::new();
@@ -425,7 +425,7 @@ mod overlay {
         // The lower blob is unchanged.
         let from_lower = lower
             .read(ReadRequest {
-                node_id: f_lower,
+                inode_id: f_lower,
                 handle: FileHandle(f_lower.0),
                 offset: 0,
                 size: 1024,
@@ -439,8 +439,8 @@ mod overlay {
     #[test]
     fn unlink_lower_leaves_a_whiteout() {
         let mut b = Build::new();
-        b.file(ROOT_NODE_ID, "a.txt", b"a");
-        b.file(ROOT_NODE_ID, "b.txt", b"b");
+        b.file(ROOT_INODE_ID, "a.txt", b"a");
+        b.file(ROOT_INODE_ID, "b.txt", b"b");
         let lower = b.build();
 
         let backend = MemoryByteBackend::new();
@@ -469,7 +469,7 @@ mod overlay {
     #[test]
     fn create_over_a_whiteout() {
         let mut b = Build::new();
-        b.file(ROOT_NODE_ID, "f", b"lower");
+        b.file(ROOT_INODE_ID, "f", b"lower");
         let lower = b.build();
 
         let backend = MemoryByteBackend::new();
@@ -489,8 +489,8 @@ mod overlay {
     #[test]
     fn seal_stores_only_the_mutated_spine() {
         let mut b = Build::new();
-        b.file(ROOT_NODE_ID, "keep.txt", b"keep");
-        let sub = b.dir(ROOT_NODE_ID, "sub");
+        b.file(ROOT_INODE_ID, "keep.txt", b"keep");
+        let sub = b.dir(ROOT_INODE_ID, "sub");
         b.file(sub, "change.txt", b"old");
         let lower = b.build();
 

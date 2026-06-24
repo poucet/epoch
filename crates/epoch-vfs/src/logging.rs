@@ -8,7 +8,7 @@
 use std::{ffi::OsStr, sync::Arc};
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, NodeId, OpenRequest,
+    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, OpenRequest,
     OpenedFile, ReadRequest, VfsResult, VfsService, WriteRequest,
 };
 
@@ -31,19 +31,19 @@ impl LoggingVfs {
 }
 
 impl VfsService for LoggingVfs {
-    fn lookup(&self, parent: NodeId, name: &OsStr) -> VfsResult<Entry> {
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
         eprintln!("[epoch-vfs] lookup parent={} name={:?}", parent.0, name);
         let entry = self.inner.lookup(parent, name)?;
         eprintln!(
             "[epoch-vfs] lookup -> node={} kind={:?} size={}",
-            entry.attr.node_id.0, entry.attr.kind, entry.attr.size
+            entry.attr.inode_id.0, entry.attr.kind, entry.attr.size
         );
         Ok(entry)
     }
 
-    fn getattr(&self, node_id: NodeId) -> VfsResult<NodeAttr> {
-        eprintln!("[epoch-vfs] getattr node={}", node_id.0);
-        let attr = self.inner.getattr(node_id)?;
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        eprintln!("[epoch-vfs] getattr node={}", inode_id.0);
+        let attr = self.inner.getattr(inode_id)?;
         eprintln!(
             "[epoch-vfs] getattr -> kind={:?} size={}",
             attr.kind, attr.size
@@ -51,9 +51,9 @@ impl VfsService for LoggingVfs {
         Ok(attr)
     }
 
-    fn readdir(&self, node_id: NodeId) -> VfsResult<Vec<DirEntry>> {
-        eprintln!("[epoch-vfs] readdir node={}", node_id.0);
-        let entries = self.inner.readdir(node_id)?;
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        eprintln!("[epoch-vfs] readdir node={}", inode_id.0);
+        let entries = self.inner.readdir(inode_id)?;
         eprintln!("[epoch-vfs] readdir -> {} entries", entries.len());
         Ok(entries)
     }
@@ -61,7 +61,7 @@ impl VfsService for LoggingVfs {
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
         eprintln!(
             "[epoch-vfs] open node={} mode={:?} truncate={} append={}",
-            request.node_id.0, request.mode, request.truncate, request.append
+            request.inode_id.0, request.mode, request.truncate, request.append
         );
         let opened = self.inner.open(request)?;
         eprintln!("[epoch-vfs] open -> fh={}", opened.handle.0);
@@ -71,7 +71,7 @@ impl VfsService for LoggingVfs {
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
         eprintln!(
             "[epoch-vfs] read node={} fh={} offset={} size={}",
-            request.node_id.0, request.handle.0, request.offset, request.size
+            request.inode_id.0, request.handle.0, request.offset, request.size
         );
         let data = self.inner.read(request)?;
         eprintln!("[epoch-vfs] read -> {} bytes", data.len());
@@ -81,7 +81,7 @@ impl VfsService for LoggingVfs {
     fn write(&self, request: WriteRequest<'_>) -> VfsResult<u32> {
         eprintln!(
             "[epoch-vfs] write node={} fh={} offset={} bytes={}",
-            request.node_id.0,
+            request.inode_id.0,
             request.handle.0,
             request.offset,
             request.data.len()
@@ -105,12 +105,12 @@ impl VfsService for LoggingVfs {
         self.inner.mkdir(request)
     }
 
-    fn unlink(&self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         eprintln!("[epoch-vfs] unlink parent={} name={:?}", parent.0, name);
         self.inner.unlink(parent, name)
     }
 
-    fn rmdir(&self, parent: NodeId, name: &OsStr) -> VfsResult<()> {
+    fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         eprintln!("[epoch-vfs] rmdir parent={} name={:?}", parent.0, name);
         self.inner.rmdir(parent, name)
     }
@@ -130,7 +130,7 @@ impl VfsService for LoggingVfs {
 mod tests {
     use super::*;
     use crate::test_support::StubVfs;
-    use epoch_vfs_api::{NodeKind, OpenMode, ROOT_NODE_ID};
+    use epoch_vfs_api::{NodeKind, OpenMode, ROOT_INODE_ID};
     use std::ffi::OsString;
 
     #[test]
@@ -140,29 +140,29 @@ mod tests {
 
         // lookup result matches the inner result exactly.
         let logged = logging
-            .lookup(ROOT_NODE_ID, OsStr::new("file.txt"))
+            .lookup(ROOT_INODE_ID, OsStr::new("file.txt"))
             .expect("logged lookup");
         let direct = stub
-            .lookup(ROOT_NODE_ID, OsStr::new("file.txt"))
+            .lookup(ROOT_INODE_ID, OsStr::new("file.txt"))
             .expect("direct lookup");
-        assert_eq!(logged.attr.node_id, direct.attr.node_id);
+        assert_eq!(logged.attr.inode_id, direct.attr.inode_id);
         assert_eq!(logged.attr.kind, NodeKind::RegularFile);
 
         // readdir, getattr, open, read all pass the inner value back unchanged.
         let names: Vec<_> = logging
-            .readdir(ROOT_NODE_ID)
+            .readdir(ROOT_INODE_ID)
             .expect("readdir")
             .into_iter()
             .map(|e| e.name)
             .collect();
         assert!(names.contains(&OsString::from("file.txt")));
 
-        let attr = logging.getattr(logged.attr.node_id).expect("getattr");
+        let attr = logging.getattr(logged.attr.inode_id).expect("getattr");
         assert_eq!(attr.size, b"payload".len() as u64);
 
         let opened = logging
             .open(OpenRequest {
-                node_id: logged.attr.node_id,
+                inode_id: logged.attr.inode_id,
                 mode: OpenMode::ReadOnly,
                 truncate: false,
                 append: false,
@@ -170,7 +170,7 @@ mod tests {
             .expect("open");
         let data = logging
             .read(ReadRequest {
-                node_id: logged.attr.node_id,
+                inode_id: logged.attr.inode_id,
                 handle: opened.handle,
                 offset: 0,
                 size: 64,
@@ -180,8 +180,8 @@ mod tests {
 
         // An error from the inner service is propagated verbatim.
         assert_eq!(
-            logging.lookup(ROOT_NODE_ID, OsStr::new("missing")),
-            stub.lookup(ROOT_NODE_ID, OsStr::new("missing"))
+            logging.lookup(ROOT_INODE_ID, OsStr::new("missing")),
+            stub.lookup(ROOT_INODE_ID, OsStr::new("missing"))
         );
     }
 }
