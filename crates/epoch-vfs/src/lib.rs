@@ -24,6 +24,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use epoch_vfs_api::VfsService;
 
+pub mod cas_vfs;
 pub mod control_plane;
 pub mod logging;
 pub mod passthrough;
@@ -31,6 +32,7 @@ pub mod passthrough;
 #[cfg(test)]
 mod test_support;
 
+pub use cas_vfs::CasVfs;
 pub use control_plane::ControlPlaneVfs;
 pub use logging::LoggingVfs;
 pub use passthrough::PassthroughVfs;

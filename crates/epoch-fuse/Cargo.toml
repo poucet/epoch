@@ -12,6 +12,7 @@ fuser-support = ["dep:fuser"]
 [dependencies]
 epoch-vfs-api = { path = "../epoch-vfs-api" }
 epoch-vfs = { path = "../epoch-vfs" }
+epoch-cas = { path = "../epoch-cas" }
 fuser = { version = "0.17", optional = true }
 
 [[bin]]

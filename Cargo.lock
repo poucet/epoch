@@ -127,6 +127,7 @@ dependencies = [
 name = "epoch-fuse"
 version = "0.1.0"
 dependencies = [
+ "epoch-cas",
  "epoch-vfs",
  "epoch-vfs-api",
  "fuser",
@@ -145,7 +146,9 @@ dependencies = [
 name = "epoch-vfs"
 version = "0.1.0"
 dependencies = [
+ "epoch-cas",
  "epoch-vfs-api",
+ "epoch-worktree",
 ]
 
 [[package]]

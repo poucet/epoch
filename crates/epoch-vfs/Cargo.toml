@@ -5,3 +5,5 @@ edition.workspace = true
 
 [dependencies]
 epoch-vfs-api = { path = "../epoch-vfs-api" }
+epoch-worktree = { path = "../epoch-worktree" }
+epoch-cas = { path = "../epoch-cas" }

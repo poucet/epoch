@@ -68,11 +68,16 @@ use std::time::UNIX_EPOCH;
 
 use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
-use epoch_tree::{EntryId, Tree, TreeEntry, TreeId, TreeStore};
+use epoch_tree::{EntryId, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
     DirEntry, NodeAttr, NodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
     VfsService, ROOT_NODE_ID,
 };
+
+/// Re-exported so consumers of [`WorkingTree`] can name the sealed-tree id type
+/// — returned by [`seal`](WorkingTree::seal), taken by
+/// [`from_root`](WorkingTree::from_root) — without also depending on `epoch-tree`.
+pub use epoch_tree::TreeId;
 
 /// A mutable, in-memory copy-on-write overlay backed by content-addressed
 /// storage.
