@@ -112,13 +112,15 @@ struct Inode {
 }
 
 enum Body {
-    /// A directory in the upper spine. `children` caches **all** resolved
-    /// children (upper values, tombstones, and cached fall-throughs). `lower`
-    /// is the corresponding lower-service directory [`InodeId`] this dir overlays
+    /// A directory in the upper spine. `children` is the upper child set,
+    /// faulted in lazily: [`Sealed`](DirChildren::Sealed) until first accessed,
+    /// then [`Open`](DirChildren::Open) — a live map of resolved children (upper
+    /// values, tombstones, and cached fall-throughs). `lower` is the
+    /// corresponding lower-service directory [`InodeId`] this dir overlays
     /// (`None` if the dir has no lower counterpart, e.g. a freshly `mkdir`'d
     /// dir).
     Dir {
-        children: BTreeMap<OsString, InodeId>,
+        children: DirChildren,
         lower: Option<InodeId>,
     },
     /// An upper-materialized regular file: `Clean(BlobId)` or `Dirty(FileWriter)`.
@@ -135,6 +137,43 @@ enum FileBody {
     Clean(BlobId),
     /// Content is being edited; the writer holds the live bytes until `seal`.
     Dirty(FileWriter),
+}
+
+/// A directory's upper children: lazily faulted in from the CAS.
+///
+/// A committed directory starts [`Sealed`](Self::Sealed) — just the [`TreeId`]
+/// of its tree object, not yet read. The first access that needs the child set
+/// ([`resolve_dir`](WorkingTree::resolve_dir)) loads *that one* tree object,
+/// materializes its immediate children as inodes (sub-directories landing
+/// `Sealed` again, so spines fault in one level at a time), and flips to
+/// [`Open`](Self::Open). This keeps load cost proportional to the paths actually
+/// touched and lets [`seal`](WorkingTree::seal) re-emit a never-touched subtree
+/// by its original id without walking it.
+enum DirChildren {
+    /// Not yet faulted in: the tree-object id to load on first access.
+    Sealed(TreeId),
+    /// Faulted in / being edited: the live `name → inode` map.
+    Open(BTreeMap<OsString, InodeId>),
+}
+
+impl DirChildren {
+    /// The live child map. The caller must have run
+    /// [`resolve_dir`](WorkingTree::resolve_dir) first; a still-`Sealed` dir here
+    /// is an internal invariant violation.
+    fn open(&self) -> VfsResult<&BTreeMap<OsString, InodeId>> {
+        match self {
+            DirChildren::Open(map) => Ok(map),
+            DirChildren::Sealed(_) => Err(VfsError::Other("directory not resolved".into())),
+        }
+    }
+
+    /// The live child map, mutably (see [`open`](Self::open)).
+    fn open_mut(&mut self) -> VfsResult<&mut BTreeMap<OsString, InodeId>> {
+        match self {
+            DirChildren::Open(map) => Ok(map),
+            DirChildren::Sealed(_) => Err(VfsError::Other("directory not resolved".into())),
+        }
+    }
 }
 
 /// The complete-tree link sealed/hydrated in **pure mode**: a blob or subtree,
@@ -168,13 +207,14 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
 
     /// Hydrate a **pure-mode** working tree from a sealed root [`TreeId`].
     ///
-    /// v1 loads the whole tree eagerly. The `backend` must be able to read the
-    /// objects `root` references — pass a clone of the backend the tree was
-    /// sealed into.
+    /// Hydration is lazy: only the root is recorded here (as
+    /// [`Sealed`](DirChildren::Sealed)); each directory's children fault in from
+    /// the CAS on first access (see [`DirChildren`]). The `backend` must be able
+    /// to read the objects `root` references — pass a clone of the backend the
+    /// tree was sealed into.
     pub fn from_root(backend: Bk, root: TreeId) -> VfsResult<Self> {
         let mut wt = Self::new(backend);
-        let store = wt.tree_store::<CompleteLink>();
-        wt.hydrate_tree(&store, ROOT_INODE_ID, root, None)?;
+        wt.mark_root_sealed(root);
         Ok(wt)
     }
 
@@ -192,17 +232,16 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Rehydrate a persisted delta layer on top of `lower`.
     ///
     /// `delta` is a sparse overlay tree (as produced by [`seal`](Self::seal)):
-    /// a `Blob` entry becomes an upper [`File`](Body::File) (clean), a `Tree`
-    /// becomes an upper [`Dir`](Body::Dir) (recursively), and a `Tombstone`
-    /// becomes a [`Tombstone`](Body::Tombstone) whiteout. Each materialized
-    /// directory's `lower` is resolved by walking `lower` from its root along the
-    /// directory's path (`None` if the lower has no such directory). Names absent
-    /// from the delta fall through to the lower.
+    /// on fault-in, a `Blob` entry becomes an upper [`File`](Body::File) (clean),
+    /// a `Tree` becomes an upper [`Dir`](Body::Dir), and a `Tombstone` becomes a
+    /// [`Tombstone`](Body::Tombstone) whiteout. Hydration is lazy — only the root
+    /// is recorded here (as [`Sealed`](DirChildren::Sealed)); deeper directories
+    /// fault in on first access, each resolving its `lower` counterpart one step
+    /// down. Names absent from the delta fall through to the lower.
     pub fn from_overlay(backend: Bk, lower: Arc<dyn VfsService>, delta: TreeId) -> VfsResult<Self> {
         let mut wt = Self::overlay(backend, lower);
-        // The root's lower counterpart is the lower's root.
-        let store = wt.tree_store::<OverlayLink>();
-        wt.hydrate_tree(&store, ROOT_INODE_ID, delta, Some(ROOT_INODE_ID))?;
+        // The root's lower counterpart (the lower's root) is wired by `overlay`.
+        wt.mark_root_sealed(delta);
         Ok(wt)
     }
 
@@ -219,7 +258,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             Inode {
                 mode,
                 body: Body::Dir {
-                    children: BTreeMap::new(),
+                    children: DirChildren::Open(BTreeMap::new()),
                     lower: root_lower,
                 },
             },
@@ -254,25 +293,52 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         TreeStore::new(self.backend.clone())
     }
 
-    /// Recursively populate `dir`'s children by loading `tree_id` from `store`
-    /// and hydrating its entries.
+    /// Record the root as [`Sealed`](DirChildren::Sealed) so its children fault
+    /// in from `tid` on first access. Used by [`from_root`](Self::from_root) and
+    /// [`from_overlay`](Self::from_overlay).
+    fn mark_root_sealed(&mut self, tid: TreeId) {
+        if let Some(Inode { body: Body::Dir { children, .. }, .. }) =
+            self.inodes.get_mut(&ROOT_INODE_ID)
+        {
+            *children = DirChildren::Sealed(tid);
+        }
+    }
+
+    /// Fault `dir`'s upper children in from the CAS if it is still
+    /// [`Sealed`](DirChildren::Sealed); a no-op if already
+    /// [`Open`](DirChildren::Open) or not a directory.
+    ///
+    /// Dispatches on the current mode to the [`Link`]-typed body. Every reader or
+    /// mutator of a directory's child map calls this first.
+    fn resolve_dir(&mut self, dir: InodeId) -> VfsResult<()> {
+        if self.lower.is_none() {
+            self.resolve_dir_typed::<CompleteLink>(dir)
+        } else {
+            self.resolve_dir_typed::<OverlayLink>(dir)
+        }
+    }
+
+    /// Load `dir`'s tree object and materialize its **immediate** children as
+    /// inodes — sub-directories landing [`Sealed`](DirChildren::Sealed) again, so
+    /// the spine faults in one level per access.
     ///
     /// One body serves both modes via the [`Link`] trait. In **pure mode** the
     /// link is `CompleteLink` (a [`LinkKind::Tombstone`] can never occur — the
     /// type has no such variant — and `dir_lower` is always `None`). In **overlay
     /// mode** the link is `OverlayLink`: a tombstone becomes a
-    /// [`Tombstone`](Body::Tombstone) whiteout, and each materialized directory's
-    /// lower counterpart is resolved one step down from `dir_lower`.
-    fn hydrate_tree<L>(
-        &mut self,
-        store: &TreeStore<Bk, L>,
-        dir: InodeId,
-        tree_id: TreeId,
-        dir_lower: Option<InodeId>,
-    ) -> VfsResult<()>
+    /// [`Tombstone`](Body::Tombstone) whiteout, and each child directory's lower
+    /// counterpart is resolved one step down from `dir_lower`.
+    fn resolve_dir_typed<L>(&mut self, dir: InodeId) -> VfsResult<()>
     where
         L: Link<Blob = BlobId> + Send + Sync + 'static,
     {
+        let (tree_id, dir_lower) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
+            Body::Dir { children: DirChildren::Sealed(tid), lower } => (*tid, *lower),
+            // Already faulted in (or not a directory) — nothing to do.
+            _ => return Ok(()),
+        };
+
+        let store = self.tree_store::<L>();
         let tree: Tree<L> = store.get(&tree_id).map_err(io)?.ok_or(VfsError::NotFound)?;
         // Snapshot (name, kind, mode) so we don't borrow `tree` across the
         // self-mutation below.
@@ -293,13 +359,19 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                     );
                 }
                 LinkKind::Tree(h) => {
-                    // Resolve this child dir's lower counterpart one step down.
+                    // Resolve this child dir's lower counterpart one step down;
+                    // leave its own children Sealed (faulted in on later access).
                     let child_lower = self.lower_child_dir(dir_lower, &name);
                     self.inodes.insert(
                         child,
-                        Inode { mode, body: Body::Dir { children: BTreeMap::new(), lower: child_lower } },
+                        Inode {
+                            mode,
+                            body: Body::Dir {
+                                children: DirChildren::Sealed(TreeId::from_cas_hash(h)),
+                                lower: child_lower,
+                            },
+                        },
                     );
-                    self.hydrate_tree(store, child, TreeId::from_cas_hash(h), child_lower)?;
                 }
                 LinkKind::Tombstone => {
                     self.inodes.insert(child, Inode { mode, body: Body::Tombstone });
@@ -308,8 +380,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             children.insert(name, child);
         }
 
-        if let Some(Inode { body: Body::Dir { children: map, .. }, .. }) = self.inodes.get_mut(&dir) {
-            *map = children;
+        if let Some(Inode { body: Body::Dir { children: slot, .. }, .. }) = self.inodes.get_mut(&dir)
+        {
+            *slot = DirChildren::Open(children);
         }
         Ok(())
     }
@@ -334,8 +407,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// first sight so its overlay id is stable across repeated lookups (and
     /// matches `readdir`).
     pub fn lookup(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<InodeId> {
+        self.resolve_dir(parent)?;
         let (cached, parent_lower) = match self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { ref children, lower } => (children.get(name).copied(), lower),
+            Body::Dir { ref children, lower } => (children.open()?.get(name).copied(), lower),
             _ => return Err(VfsError::NotDirectory),
         };
 
@@ -351,7 +425,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
         let entry = lower.lookup(ld, name)?;
         let id = self.materialize_lower(&entry.attr);
-        self.link(parent, name, id);
+        self.link(parent, name, id)?;
         Ok(id)
     }
 
@@ -363,7 +437,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         let id = self.alloc();
         let mode_perm = attr.perm as u32 & 0o7777;
         let body = match attr.kind {
-            NodeKind::Directory => Body::Dir { children: BTreeMap::new(), lower: Some(attr.inode_id) },
+            NodeKind::Directory => {
+                Body::Dir { children: DirChildren::Open(BTreeMap::new()), lower: Some(attr.inode_id) }
+            }
             NodeKind::RegularFile | NodeKind::Symlink => Body::LowerFile(attr.inode_id),
         };
         let mode = match attr.kind {
@@ -402,9 +478,10 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// later `lookup` returns the same id; every entry's `inode_id` is the
     /// overlay id.
     pub fn readdir(&mut self, node: InodeId) -> VfsResult<Vec<DirEntry>> {
+        self.resolve_dir(node)?;
         let (cached, lower_id) = match self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { ref children, lower } => (
-                children.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
+                children.open()?.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
                 lower,
             ),
             _ => return Err(VfsError::NotDirectory),
@@ -431,7 +508,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
                 // is stable and matches a later lookup.
                 let attr = lower.getattr(de.inode_id)?;
                 let id = self.materialize_lower(&attr);
-                self.link(node, &de.name, id);
+                self.link(node, &de.name, id)?;
                 let kind = match attr.kind {
                     NodeKind::Directory => NodeKind::Directory,
                     _ => NodeKind::RegularFile,
@@ -623,24 +700,26 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// Recreating over a tombstone (a previously-deleted lower name) replaces
     /// the whiteout.
     pub fn create(&mut self, parent: InodeId, name: &OsStr, mode: u32) -> VfsResult<InodeId> {
+        self.resolve_dir(parent)?;
         self.ensure_creatable(parent, name)?;
         let writer = self.files.edit(None).map_err(io)?;
         let id = self.alloc();
         self.inodes.insert(id, Inode { mode, body: Body::File(FileBody::Dirty(writer)) });
-        self.link(parent, name, id);
+        self.link(parent, name, id)?;
         Ok(id)
     }
 
     /// Create an empty subdirectory `name` under `parent` (upper only, `lower =
     /// None`). Recreating over a tombstone replaces the whiteout.
     pub fn mkdir(&mut self, parent: InodeId, name: &OsStr, mode: u32) -> VfsResult<InodeId> {
+        self.resolve_dir(parent)?;
         self.ensure_creatable(parent, name)?;
         let id = self.alloc();
         self.inodes.insert(
             id,
-            Inode { mode, body: Body::Dir { children: BTreeMap::new(), lower: None } },
+            Inode { mode, body: Body::Dir { children: DirChildren::Open(BTreeMap::new()), lower: None } },
         );
-        self.link(parent, name, id);
+        self.link(parent, name, id)?;
         Ok(id)
     }
 
@@ -672,6 +751,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             Body::Tombstone => return Err(VfsError::NotFound),
             Body::Dir { .. } => {}
         }
+        self.resolve_dir(id)?;
         if !self.dir_is_empty(id)? {
             return Err(VfsError::DirectoryNotEmpty);
         }
@@ -682,7 +762,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// child, and no lower child not shadowed by a tombstone).
     fn dir_is_empty(&self, id: InodeId) -> VfsResult<bool> {
         let (children, lower) = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children, lower } => (children, *lower),
+            Body::Dir { children, lower } => (children.open()?, *lower),
             _ => return Err(VfsError::NotDirectory),
         };
         // Any non-tombstone upper child means non-empty.
@@ -718,9 +798,9 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
             self.inodes.remove(&id);
             let tomb = self.alloc();
             self.inodes.insert(tomb, Inode { mode: 0, body: Body::Tombstone });
-            self.link(parent, name, tomb);
+            self.link(parent, name, tomb)?;
         } else {
-            self.unlink_child(parent, name);
+            self.unlink_child(parent, name)?;
             self.inodes.remove(&id);
         }
         Ok(())
@@ -791,8 +871,11 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         L: Link<Blob = BlobId> + Send + Sync + 'static,
     {
         let (children, has_lower) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children, lower } => (
-                children.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
+            // Never faulted in ⇒ unchanged subtree: re-emit its id without
+            // walking (structural sharing of clean subtrees comes for free).
+            Body::Dir { children: DirChildren::Sealed(tid), .. } => return Ok(Some(*tid)),
+            Body::Dir { children: DirChildren::Open(map), lower } => (
+                map.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
                 lower.is_some(),
             ),
             _ => return Err(VfsError::NotDirectory),
@@ -901,7 +984,7 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
     /// upper nor (un-tombstoned) in the lower. A tombstone is replaceable.
     fn ensure_creatable(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let (cached, parent_lower) = match &self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children, lower } => (children.get(name).copied(), *lower),
+            Body::Dir { children, lower } => (children.open()?.get(name).copied(), *lower),
             _ => return Err(VfsError::NotDirectory),
         };
         if let Some(id) = cached {
@@ -921,15 +1004,21 @@ impl<Bk: SyncByteBackend + Clone> WorkingTree<Bk> {
         Ok(())
     }
 
-    fn link(&mut self, parent: InodeId, name: &OsStr, id: InodeId) {
+    /// Insert `name → id` into `parent`'s child map. The caller must have
+    /// [`resolve_dir`](Self::resolve_dir)'d `parent` first.
+    fn link(&mut self, parent: InodeId, name: &OsStr, id: InodeId) -> VfsResult<()> {
         if let Some(Inode { body: Body::Dir { children, .. }, .. }) = self.inodes.get_mut(&parent) {
-            children.insert(name.to_os_string(), id);
+            children.open_mut()?.insert(name.to_os_string(), id);
         }
+        Ok(())
     }
 
-    fn unlink_child(&mut self, parent: InodeId, name: &OsStr) {
+    /// Remove `name` from `parent`'s child map. The caller must have
+    /// [`resolve_dir`](Self::resolve_dir)'d `parent` first.
+    fn unlink_child(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         if let Some(Inode { body: Body::Dir { children, .. }, .. }) = self.inodes.get_mut(&parent) {
-            children.remove(name);
+            children.open_mut()?.remove(name);
         }
+        Ok(())
     }
 }

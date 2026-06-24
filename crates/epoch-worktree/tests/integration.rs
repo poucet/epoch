@@ -534,3 +534,112 @@ fn unlink_and_rmdir_remove_entries() {
 
     assert!(wt.readdir(root).unwrap().is_empty());
 }
+
+/// Hydration is lazy: a sealed tree faults in one spine level per access, and an
+/// untouched subtree is neither loaded on `from_root` nor walked on `seal`.
+mod lazy_hydration {
+    use std::ffi::OsStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use epoch_cas::{Bytes, CASError, CASHash, MemoryByteBackend, SyncByteBackend};
+    use epoch_worktree::WorkingTree;
+
+    fn write_file(wt: &mut Wt, parent: epoch_vfs_api::InodeId, name: &str, content: &[u8]) {
+        let id = wt.create(parent, OsStr::new(name), 0o100644).unwrap();
+        wt.write_at(id, 0, content).unwrap();
+    }
+
+    /// A `SyncByteBackend` that counts object reads, delegating to an in-memory
+    /// store. Lets a test observe exactly when the CAS is touched.
+    #[derive(Clone)]
+    struct CountingBackend {
+        inner: MemoryByteBackend,
+        gets: Arc<AtomicUsize>,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self { inner: MemoryByteBackend::new(), gets: Arc::new(AtomicUsize::new(0)) }
+        }
+        fn gets(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
+        fn reset(&self) {
+            self.gets.store(0, Ordering::SeqCst);
+        }
+    }
+
+    impl SyncByteBackend for CountingBackend {
+        fn get(&self, key: &CASHash) -> Result<Option<Bytes>, CASError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+        fn put(&self, key: &CASHash, bytes: Bytes) -> Result<(), CASError> {
+            self.inner.put(key, bytes)
+        }
+        fn has(&self, key: &CASHash) -> Result<bool, CASError> {
+            self.inner.has(key)
+        }
+        fn delete(&self, key: &CASHash) -> Result<(), CASError> {
+            self.inner.delete(key)
+        }
+    }
+
+    type Wt = WorkingTree<CountingBackend>;
+
+    /// Build `a/x.txt`, `a/sub/y.txt`, `b/z.txt` under a fresh root and seal it.
+    fn seal_sample(backend: &CountingBackend) -> epoch_worktree::TreeId {
+        let mut wt = Wt::new(backend.clone());
+        let root = wt.root();
+        let a = wt.mkdir(root, OsStr::new("a"), 0o040755).unwrap();
+        write_file(&mut wt, a, "x.txt", b"x contents");
+        let sub = wt.mkdir(a, OsStr::new("sub"), 0o040755).unwrap();
+        write_file(&mut wt, sub, "y.txt", b"y contents");
+        let b = wt.mkdir(root, OsStr::new("b"), 0o040755).unwrap();
+        write_file(&mut wt, b, "z.txt", b"z contents");
+        wt.seal().unwrap()
+    }
+
+    #[test]
+    fn from_root_loads_nothing_until_accessed_and_siblings_fault_in_lazily() {
+        let backend = CountingBackend::new();
+        let sealed = seal_sample(&backend);
+
+        // from_root must not read a single object — it only records the root id.
+        backend.reset();
+        let mut wt = Wt::from_root(backend.clone(), sealed).unwrap();
+        assert_eq!(backend.gets(), 0, "from_root must not eagerly load any object");
+
+        // Descending into `a` faults in the root tree, then a's, then a/sub's —
+        // one object per level, on demand.
+        let root = wt.root();
+        let a = wt.lookup(root, OsStr::new("a")).unwrap();
+        assert!(backend.gets() > 0, "the root tree faults in on first access");
+        let sub = wt.lookup(a, OsStr::new("sub")).unwrap();
+        let y = wt.lookup(sub, OsStr::new("y.txt")).unwrap();
+        assert_eq!(wt.read_at(y, 0, 64).unwrap(), b"y contents");
+
+        // `b` has not been touched. Accessing it now causes *new* reads — proof
+        // its spine was never hydrated up front.
+        backend.reset();
+        let b = wt.lookup(root, OsStr::new("b")).unwrap();
+        let z = wt.lookup(b, OsStr::new("z.txt")).unwrap();
+        assert!(backend.gets() > 0, "an untouched sibling faults in only when accessed");
+        assert_eq!(wt.read_at(z, 0, 64).unwrap(), b"z contents");
+    }
+
+    #[test]
+    fn sealing_an_untouched_tree_walks_nothing_and_reseals_identically() {
+        let backend = CountingBackend::new();
+        let sealed = seal_sample(&backend);
+
+        // Hydrate then immediately reseal without touching anything: the root is
+        // still Sealed, so seal short-circuits to the original id with zero reads.
+        backend.reset();
+        let mut wt = Wt::from_root(backend.clone(), sealed).unwrap();
+        let resealed = wt.seal().unwrap();
+        assert_eq!(resealed, sealed, "an untouched tree reseals to the identical root id");
+        assert_eq!(backend.gets(), 0, "sealing an untouched tree walks no objects");
+    }
+}
