@@ -28,6 +28,7 @@
 
 mod backend;
 mod batching;
+mod caching;
 mod bridge;
 mod cas;
 mod codec;
@@ -42,6 +43,7 @@ pub use backend::{
     AsyncByteBackend, AsyncMemoryByteBackend, MemoryByteBackend, SyncByteBackend,
 };
 pub use batching::BatchingCAS;
+pub use caching::CachingByteBackend;
 pub use bridge::{Asyncify, Blocking};
 pub use cas::{AsyncCAS, SyncCAS};
 pub use codec::{Codec, IdentityCodec};
