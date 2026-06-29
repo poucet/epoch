@@ -1,0 +1,11 @@
+[package]
+name = "epoch-cas-redb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+redb = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/epoch-cas",
     "crates/epoch-cas-moka",
+    "crates/epoch-cas-redb",
     "crates/epoch-file-cas",
     "crates/epoch-fuse",
     "crates/epoch-tree",
