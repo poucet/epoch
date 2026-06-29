@@ -36,6 +36,7 @@ mod error;
 mod generic;
 mod hash;
 mod hasher;
+mod tiered;
 
 pub use backend::{
     AsyncByteBackend, AsyncMemoryByteBackend, MemoryByteBackend, SyncByteBackend,
@@ -49,6 +50,7 @@ pub use error::CASError;
 pub use generic::{AsyncGenericCAS, SyncGenericCAS};
 pub use hash::{CASHash, ParseHashError};
 pub use hasher::{Blake3Hasher, ContentHasher};
+pub use tiered::TieredByteBackend;
 
 // Re-export `bytes::Bytes` so downstream crates use the exact same type the
 // kernel signatures speak (D5).
