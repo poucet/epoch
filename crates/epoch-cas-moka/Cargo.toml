@@ -1,0 +1,8 @@
+[package]
+name = "epoch-cas-moka"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+moka = { version = "0.12", features = ["sync"] }
