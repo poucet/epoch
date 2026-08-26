@@ -181,6 +181,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "epoch-history"
+version = "0.1.0"
+dependencies = [
+ "epoch-cas",
+ "epoch-file-cas",
+ "epoch-timeline",
+ "epoch-tree",
+ "epoch-vfs-api",
+ "epoch-worktree",
+ "thiserror",
+]
+
+[[package]]
 name = "epoch-timeline"
 version = "0.1.0"
 dependencies = [

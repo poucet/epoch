@@ -1,0 +1,15 @@
+[package]
+name = "epoch-history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+epoch-file-cas = { path = "../epoch-file-cas" }
+epoch-timeline = { path = "../epoch-timeline" }
+epoch-tree = { path = "../epoch-tree" }
+thiserror = "2"
+
+[dev-dependencies]
+epoch-vfs-api = { path = "../epoch-vfs-api" }
+epoch-worktree = { path = "../epoch-worktree" }
