@@ -263,8 +263,10 @@ name = "epoch-vfs"
 version = "0.1.0"
 dependencies = [
  "epoch-cas",
+ "epoch-file-cas",
  "epoch-history",
  "epoch-timeline",
+ "epoch-tree",
  "epoch-vfs-api",
  "epoch-worktree",
  "ignore",

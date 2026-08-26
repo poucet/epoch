@@ -25,6 +25,7 @@ use std::{path::PathBuf, sync::Arc};
 use epoch_vfs_api::VfsService;
 
 pub mod cas_dir;
+pub mod cas_obj_dir;
 pub mod cas_vfs;
 pub mod checkpointing;
 pub mod control_plane;
@@ -36,11 +37,13 @@ pub mod logging;
 pub mod passthrough;
 pub mod router;
 pub mod signal;
+pub(crate) mod submount;
 
 #[cfg(test)]
 mod test_support;
 
 pub use cas_dir::CasEchoDir;
+pub use cas_obj_dir::CasObjectDir;
 pub use cas_vfs::CasVfs;
 pub use checkpointing::CheckpointedFs;
 pub use control_plane::ControlPlaneVfs;

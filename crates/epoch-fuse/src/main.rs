@@ -14,7 +14,7 @@ use epoch_history::{CheckpointPolicy, History, Scheduler};
 use epoch_timeline_redb::RedbTimelineStore;
 use epoch_vfs::router::EPOCHIGNORE_FILE;
 use epoch_vfs::{
-    overlay_probe, CasEchoDir, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugDir, DebugStats,
+    overlay_probe, CasObjectDir, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugDir, DebugStats,
     HistoryDir, PassthroughVfs, RouterVfs, SignalVfs,
 };
 use epoch_vfs_api::VfsService;
@@ -63,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return mount_durable(mountpoint, state_dir, lower_dir, head, hard_fsync);
         }
 
+        let backend = MemoryByteBackend::new();
         let (live, lower_path): (Arc<CasVfs<MemoryByteBackend>>, Option<PathBuf>) = match lower_dir
         {
             Some(lower_dir) => {
@@ -72,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let lower: Arc<dyn VfsService> = Arc::new(PassthroughVfs::new(lower_dir.clone()));
                 (
-                    Arc::new(CasVfs::overlay(MemoryByteBackend::new(), lower)),
+                    Arc::new(CasVfs::overlay(backend.clone(), lower)),
                     Some(lower_dir),
                 )
             }
@@ -80,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "[epoch-fuse] mounting empty in-memory CAS filesystem mountpoint={mountpoint:?}"
                 );
-                (Arc::new(CasVfs::in_memory()), None)
+                (Arc::new(CasVfs::new(backend.clone())), None)
             }
         };
         // Graft `.vfs` on so `.vfs/debug` serves the live tree's statistics.
@@ -92,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let vfs = Arc::new(
             ControlPlaneVfs::new(inner)
-                .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
+                .with_feature("cas", move |slot| Arc::new(CasObjectDir::new(slot, backend)))
                 .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
         );
         mount_spike(mountpoint, vfs)?;
@@ -195,9 +196,12 @@ fn mount_durable(
         Some(lower_dir) => route_ignored(signaled, lower_dir)?,
         None => signaled,
     };
+    let portal_tier = tier.clone();
     let vfs = Arc::new(
         ControlPlaneVfs::new(inner)
-            .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
+            .with_feature("cas", move |slot| {
+                Arc::new(CasObjectDir::new(slot, portal_tier))
+            })
             .with_feature("history", move |slot| {
                 Arc::new(HistoryDir::new(history, slot, lower))
             })

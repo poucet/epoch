@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 epoch-vfs-api = { path = "../epoch-vfs-api" }
 epoch-worktree = { path = "../epoch-worktree" }
+epoch-file-cas = { path = "../epoch-file-cas" }
+epoch-tree = { path = "../epoch-tree" }
 epoch-cas = { path = "../epoch-cas" }
 epoch-history = { path = "../epoch-history" }
 epoch-timeline = { path = "../epoch-timeline" }
