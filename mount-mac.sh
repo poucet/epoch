@@ -12,16 +12,28 @@
 # (FUSE-T, the kext-less alternative, does not work here: fuser 0.17 hard-codes
 # the macFUSE wire protocol and can't talk to FUSE-T — cberner/fuser#273.)
 #
-# The overlay (OverlayProbeVfs) is strictly read-only: it reads through to the
-# lower dir and returns EROFS on any write, so the lower dir is never touched.
+# Two modes, picked by whether EPOCH_STATE is set:
+#
+#   (default)      read-only overlay probe (OverlayProbeVfs): reads through to
+#                  the lower dir, EROFS on any write — the lower is never touched.
+#   EPOCH_STATE=…  durable, checkpointed copy-on-write overlay: writes/deletes
+#                  land in the CAS, are checkpointed on flush/close (debounced),
+#                  persist in $EPOCH_STATE/epoch.redb, and resume on remount.
+#                  Time travel: ls <mount>/.vfs/history/
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # ── config (override via positional args or env) ─────────────────────────────
-# LOWER  pristine tree the overlay reads through (defaults to this repo, like
-#        docker-run.sh's `-v $PWD:/work:ro`). MOUNT  where it appears (~/epoch).
+# LOWER  pristine tree the overlay reads through / copies up from (defaults to
+#        this repo, like docker-run.sh's `-v $PWD:/work:ro`).
+# MOUNT  where it appears (~/epoch).
+# EPOCH_STATE       state dir for the durable mode (holds epoch.redb).
+# EPOCH_HEAD        timeline head this mount advances (default: main).
+# EPOCH_HARD_FSYNC  set to 1 to make fsync(2) a synchronous checkpoint barrier.
 LOWER="${EPOCH_LOWER:-${1:-$PWD}}"
 MOUNT="${EPOCH_MOUNT:-${2:-$HOME/epoch}}"
+STATE="${EPOCH_STATE:-}"
+HEAD="${EPOCH_HEAD:-main}"
 
 # ── preflight ────────────────────────────────────────────────────────────────
 if [[ ! -d /Library/Filesystems/macfuse.fs ]]; then
@@ -56,7 +68,29 @@ mkdir -p "${MOUNT}"
 trap unmount EXIT
 trap 'exit 130' INT TERM
 
-cat <<EOF
+if [[ -n "${STATE}" ]]; then
+  mkdir -p "${STATE}"
+  cat <<EOF
+
+── epoch FUSE mount (durable checkpointed overlay) ─────────────────
+  lower (read-only)  ${LOWER}
+  mountpoint         ${MOUNT}
+  state              ${STATE}/epoch.redb   (head: ${HEAD})
+
+Poke it from another terminal:
+  echo hi > ${MOUNT}/note.txt          # copy-up into the overlay
+  ls ${MOUNT}/.vfs/history/            # checkpoints, by unix-millis
+  cat ${MOUNT}/.vfs/history/5s-ago/note.txt
+Remounting with the same EPOCH_STATE resumes from the last checkpoint.
+
+Ctrl-C here unmounts (running a final checkpoint) — or \`umount ${MOUNT}\`.
+────────────────────────────────────────────────────────────────────
+EOF
+  ARGS=(cas "${MOUNT}" --state "${STATE}" --head "${HEAD}")
+  [[ "${EPOCH_HARD_FSYNC:-0}" == 1 ]] && ARGS+=(--hard-fsync)
+  "${BIN}" "${ARGS[@]}" "${LOWER}"
+else
+  cat <<EOF
 
 ── epoch FUSE mount (macOS / macFUSE) ──────────────────────────────
   lower (read-only)  ${LOWER}
@@ -73,5 +107,5 @@ If you get "Operation not permitted", macFUSE's kernel extension is not
 enabled yet — see docs/MOUNTING.md.
 ────────────────────────────────────────────────────────────────────
 EOF
-
-"${BIN}" "${LOWER}" "${MOUNT}"
+  "${BIN}" "${LOWER}" "${MOUNT}"
+fi
