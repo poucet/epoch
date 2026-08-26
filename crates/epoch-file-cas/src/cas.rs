@@ -80,7 +80,7 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
     /// Fetch the whole file addressed by `id`, reassembled, or `None` if no such
     /// manifest exists.
     pub fn get(&self, id: &BlobId) -> Result<Option<Bytes>, CASError> {
-        let object = match self.load_manifest(id)? {
+        let object = match self.manifest(id)? {
             None => return Ok(None),
             Some(object) => object,
         };
@@ -105,7 +105,7 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
     /// to the bytes that exist. Errors with [`CASError::NotFound`] if the
     /// manifest is missing (a present-but-empty read range is *not* an error).
     pub fn read_at(&self, id: &BlobId, off: u64, len: u32) -> Result<Bytes, CASError> {
-        let object = self.load_manifest(id)?.ok_or(CASError::NotFound)?;
+        let object = self.manifest(id)?.ok_or(CASError::NotFound)?;
         let size = object.logical_len();
         // Clamp the request to what the file actually holds.
         if off >= size {
@@ -148,7 +148,7 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
 
     /// The logical size of the file addressed by `id`, or `None` if absent.
     pub fn size(&self, id: &BlobId) -> Result<Option<u64>, CASError> {
-        Ok(self.load_manifest(id)?.map(|o| o.logical_len()))
+        Ok(self.manifest(id)?.map(|o| o.logical_len()))
     }
 
     /// Whether a manifest for `id` is present.
@@ -225,8 +225,13 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
         Ok(BlobId::from_cas_hash(hash))
     }
 
-    /// Load a manifest by `BlobId`.
-    fn load_manifest(&self, id: &BlobId) -> Result<Option<FileObject>, CASError> {
+    /// Load the [`FileObject`] manifest addressed by `id`, or `None` if absent.
+    ///
+    /// This is the structural view of a blob: callers that need to enumerate
+    /// the CAS objects a blob is made of (e.g. a checkpoint closure walk
+    /// promoting chunks and the manifest to durable storage) read the
+    /// [`ChunkRef`]s from here rather than reassembling content.
+    pub fn manifest(&self, id: &BlobId) -> Result<Option<FileObject>, CASError> {
         self.manifests.get(id.as_cas_hash())
     }
 
@@ -396,6 +401,32 @@ mod tests {
 
         let missing = BlobId::from_cas_hash(CASHash::from_bytes([0xab; 32]));
         assert_eq!(cas.size(&missing).unwrap(), None);
+    }
+
+    #[test]
+    fn manifest_exposes_structure() {
+        let cas = FileCas::in_memory();
+
+        let small = cas.put(Bytes::from_static(b"tiny")).unwrap();
+        assert!(matches!(
+            cas.manifest(&small).unwrap(),
+            Some(FileObject::Inline(_))
+        ));
+
+        let big = cas.put(big_content(CHUNK_SIZE * 2 + 1)).unwrap();
+        match cas.manifest(&big).unwrap() {
+            Some(FileObject::Chunked { chunks }) => {
+                assert_eq!(chunks.len(), 3);
+                // Every referenced chunk is fetchable by its id.
+                for c in &chunks {
+                    assert!(cas.fetch_chunk(&c.id).is_ok());
+                }
+            }
+            other => panic!("expected chunked manifest, got {other:?}"),
+        }
+
+        let missing = BlobId::from_cas_hash(CASHash::from_bytes([0x77; 32]));
+        assert_eq!(cas.manifest(&missing).unwrap(), None);
     }
 
     #[test]
