@@ -57,7 +57,20 @@ pub fn mount_spike(
 
     let mountpoint = mountpoint.as_ref();
     // Privileged mount through the helper; yields the kernel device fd.
-    let (dev_fd, mount) = crate::macfuse::mount_via_helper(mountpoint, &["fsname=epoch-fuse"])?;
+    // `local` marks the volume as a local (not network/removable) disk. Without
+    // it, macOS's privacy layer (TCC) treats the mount as a protected volume
+    // class and silently answers EPERM to every open/opendir from apps the
+    // user hasn't granted "Files and Folders" access — metadata ops pass, but
+    // `ls`/`cat` fail with "Operation not permitted" and the request never
+    // reaches the filesystem. `nobrowse` keeps Finder/Spotlight from indexing
+    // the (frequently remounted) volume.
+    // `noappledouble` refuses `._*` AppleDouble companions outright — without
+    // it, macOS materializes them as real files (which the overlay would then
+    // dutifully checkpoint) whenever xattrs can't be stored natively.
+    let (dev_fd, mount) = crate::macfuse::mount_via_helper(
+        mountpoint,
+        &["fsname=epoch-fuse", "local", "nobrowse", "noappledouble"],
+    )?;
 
     // Owner-only ACL (no allow_other), matching the non-macOS mount.
     let session = Session::from_fd(
@@ -144,13 +157,52 @@ impl Filesystem for FuseSpikeFs {
         }
     }
 
+    // Truncation (`O_TRUNC`, `truncate(2)`) usually arrives here as a
+    // size-setting request rather than as an open flag. Other attribute
+    // changes (chmod/chown/utimes) are accepted and ignored for now — the
+    // tree format doesn't persist them yet, and erroring would break everyday
+    // tools (`touch`, `cp -p`, editors) rather than degrade gracefully.
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        fuse_log!("setattr ino={} size={size:?} mode={mode:?} uid={uid:?} gid={gid:?}", ino.0);
+        let result = match size {
+            Some(size) => self.vfs.truncate(from_ino(ino), size),
+            None => self.vfs.getattr(from_ino(ino)),
+        };
+        match result {
+            Ok(attr) => {
+                fuse_log!("setattr ok ino={} size={}", attr.inode_id.0, attr.size);
+                let ttl = attr_ttl();
+                let attr = to_file_attr(attr);
+                reply.attr(&ttl, &attr);
+            }
+            Err(err) => reply_error_attr(reply, err),
+        }
+    }
+
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         fuse_log!("open ino={} flags={flags:?}", ino.0);
         let request = OpenRequest {
             inode_id: from_ino(ino),
             mode: to_open_mode(flags),
-            truncate: false,
-            append: false,
+            truncate: flags.0 & libc::O_TRUNC != 0,
+            append: flags.0 & libc::O_APPEND != 0,
         };
 
         match self.vfs.open(request) {

@@ -214,6 +214,10 @@ impl VfsService for PassthroughVfs {
         Err(VfsError::ReadOnlyFilesystem)
     }
 
+    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }

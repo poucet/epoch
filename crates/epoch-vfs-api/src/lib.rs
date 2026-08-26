@@ -248,6 +248,12 @@ pub trait VfsService: Send + Sync {
 
     fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()>;
 
+    /// Set the file's size (`truncate(2)` / `O_TRUNC`, or `ftruncate` growth),
+    /// returning the updated attributes. Kernels commonly deliver `O_TRUNC` as
+    /// a size-setting `setattr` rather than an open flag, so writable
+    /// filesystems must implement this for shell redirection (`>`) to work.
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr>;
+
     fn flush(&self, handle: FileHandle) -> VfsResult<()>;
 
     /// Explicit durability request (`fsync(2)`/`fdatasync(2)`) for an open

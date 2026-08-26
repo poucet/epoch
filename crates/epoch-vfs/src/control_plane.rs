@@ -333,6 +333,16 @@ impl VfsService for ControlPlaneVfs {
         self.inner.rmdir(parent, name)
     }
 
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
+        if is_hist(inode_id.0) {
+            return self.history()?.truncate(inode_id, size);
+        }
+        if is_cp(inode_id.0) {
+            return Err(VfsError::ReadOnlyFilesystem);
+        }
+        self.inner.truncate(inode_id, size)
+    }
+
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {
         if is_hist(handle.0) {
             return self.history()?.flush(handle);

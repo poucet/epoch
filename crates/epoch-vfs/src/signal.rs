@@ -88,6 +88,14 @@ impl VfsService for SignalVfs {
         Ok(())
     }
 
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
+        let attr = self.inner.truncate(inode_id, size)?;
+        // A truncate mutates state with no write/flush pair of its own; mark
+        // dirty so the next durability signal checkpoints it.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        Ok(attr)
+    }
+
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {
         self.inner.flush(handle)?;
         self.scheduler.signal(TriggerEvent::Flush);

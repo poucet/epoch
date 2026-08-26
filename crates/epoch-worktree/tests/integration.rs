@@ -319,6 +319,10 @@ mod overlay {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
+        fn truncate(&self, _: InodeId, _: u64) -> VfsResult<NodeAttr> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
         fn flush(&self, _: FileHandle) -> VfsResult<()> {
             Ok(())
         }

@@ -174,6 +174,12 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         self.lock().rmdir(parent, name)
     }
 
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
+        let mut tree = self.lock();
+        tree.truncate(inode_id, size)?;
+        tree.getattr(inode_id)
+    }
+
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }
@@ -315,5 +321,21 @@ mod tests {
 
         assert_eq!(svc.getattr(id).unwrap().size, 0);
         assert!(read_all(&svc, id).is_empty());
+    }
+
+    /// The `setattr(size)` path kernels use for `> file` and `truncate(2)`:
+    /// shrink, grow (zero-filled), and the returned attrs reflect the change.
+    #[test]
+    fn truncate_shrinks_and_grows_through_the_service() {
+        let svc = CasVfs::in_memory();
+        let id = write_file(&svc, ROOT_INODE_ID, "f", b"0123456789");
+
+        let attr = svc.truncate(id, 4).unwrap();
+        assert_eq!(attr.size, 4);
+        assert_eq!(read_all(&svc, id), b"0123");
+
+        let attr = svc.truncate(id, 6).unwrap();
+        assert_eq!(attr.size, 6);
+        assert_eq!(read_all(&svc, id), b"0123\0\0");
     }
 }

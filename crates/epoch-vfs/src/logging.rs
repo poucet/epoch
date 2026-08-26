@@ -115,6 +115,11 @@ impl VfsService for LoggingVfs {
         self.inner.rmdir(parent, name)
     }
 
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
+        eprintln!("[epoch-vfs] truncate node={} size={size}", inode_id.0);
+        self.inner.truncate(inode_id, size)
+    }
+
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {
         eprintln!("[epoch-vfs] flush fh={}", handle.0);
         self.inner.flush(handle)
