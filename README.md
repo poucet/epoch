@@ -29,14 +29,13 @@ Every mount grafts a synthetic `.vfs/` directory serving pluggable features:
 |---|---|
 | `.vfs/history/<unix-millis>/…` | read-only snapshot at the newest checkpoint ≤ that time |
 | `.vfs/history/<N><unit>-ago/…` | relative time travel: `500ms-ago`, `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago` |
-| `.vfs/history/head` | the current checkpoint: event id, root tree hash, timestamp |
+| `.vfs/history/head` | the head checkpoint's root tree hash (feed it to `.vfs/cas/`) |
 | `.vfs/history/id/<event-hex>/…` | any timeline event by id |
 | `.vfs/cas/<hash>` | typed object portal: a tree hash browses as a read-only directory, a file hash `cat`s its content |
 | `.vfs/debug/…` | live stats: staged object count, dirty files, the overlay delta |
 
 ```sh
-cat .vfs/history/head                                   # what's checkpointed right now
-ls  .vfs/cas/$(grep '^root: ' .vfs/history/head | cut -d' ' -f2)
+ls .vfs/cas/$(cat .vfs/history/head)     # browse the head checkpoint by hash
 ```
 
 Drop a gitignore-syntax **`.epochignore`** in the lower directory to route

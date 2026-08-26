@@ -13,8 +13,8 @@ The single-machine filesystem is **feature-complete for daily use**: durable che
 ## 1. Running it
 
 ```sh
-EPOCH_STATE=~/.epoch ./mount-mac.sh ~/some/project    # durable checkpointed overlay at ~/epoch
-./mount-mac.sh                                        # legacy read-only probe (unchanged)
+./mount-mac.sh ~/some/project        # durable checkpointed overlay at ~/epoch (state: ~/.epoch)
+EPOCH_PROBE=1 ./mount-mac.sh         # legacy read-only probe (no CAS/timeline; .vfs has only the cas stub)
 ```
 
 Knobs: `EPOCH_HEAD` (timeline head, default `main`), `EPOCH_HARD_FSYNC=1`, `EPOCH_MOUNT`.
@@ -25,12 +25,12 @@ Inside the mount, `.vfs/` is the control plane (a registry of pluggable features
 |---|---|
 | `.vfs/history/<unix-millis>` | read-only snapshot at the newest checkpoint ≤ that time |
 | `.vfs/history/<N><unit>-ago` | relative form (`500ms-ago`, `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago`) |
-| `.vfs/history/head` | current checkpoint: event id, **root tree hash**, timestamp |
+| `.vfs/history/head` | the head checkpoint's **root tree hash** (empty before the first) |
 | `.vfs/history/id/<event-hex>` | any event by id (dir itself unlistable) |
 | `.vfs/cas/<hash>` | typed object portal: tree hash ⇒ browsable read-only dir, file hash ⇒ `cat`-able file, chunks hidden (dir unlistable) |
 | `.vfs/debug/{near-objects,dirty-files,overlay}` | live stats: staging object count, un-sealed writers, overlay delta listing |
 
-Explore by hand: `` ls .vfs/cas/$(grep '^root: ' .vfs/history/head | cut -d' ' -f2) ``
+Explore by hand: `ls .vfs/cas/$(cat .vfs/history/head)`
 
 A gitignore-syntax **`.epochignore`** in the lower directory routes matching
 subtrees (`node_modules/`, `.git/`, `.jj/`, caches, …) straight to the host —

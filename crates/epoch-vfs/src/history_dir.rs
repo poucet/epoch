@@ -13,9 +13,8 @@
 //! - `.vfs/history/<N><unit>-ago` — relative form of the same (`500ms-ago`,
 //!   `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago`). Served with a zero entry TTL so
 //!   the kernel re-resolves it every time.
-//! - `.vfs/history/head` — a small text file naming the current checkpoint:
-//!   its event id, its **root tree hash** (feed it to `.vfs/cas/<hash>` to
-//!   browse), and its timestamp.
+//! - `.vfs/history/head` — exactly the head checkpoint's **root tree hash**
+//!   (empty before the first checkpoint): `ls .vfs/cas/$(cat .vfs/history/head)`.
 //! - `.vfs/history/id/<64-hex event id>` — any event, on this head's chain or
 //!   not. `id/` itself is intentionally not listable (ids are addressable, not
 //!   enumerable). Listing `.vfs/history` shows the newest checkpoints (up to
@@ -120,23 +119,20 @@ where
         InodeId(self.slot.base + 2)
     }
 
-    /// Render `.vfs/history/head`: the current checkpoint's identity, giving
-    /// shell users a root tree hash to feed straight into `.vfs/cas/`.
+    /// Render `.vfs/history/head`: exactly the head checkpoint's **root tree
+    /// hash** (newline-terminated), so it composes directly with the object
+    /// portal: `ls .vfs/cas/$(cat .vfs/history/head)`. Empty before the first
+    /// checkpoint.
     fn render_head(&self) -> VfsResult<Vec<u8>> {
         let text = match self.history.head().map_err(history_error)? {
-            None => "no checkpoints yet\n".to_owned(),
+            None => String::new(),
             Some(id) => {
                 let event = self
                     .history
                     .event(&id)
                     .map_err(history_error)?
                     .ok_or(VfsError::NotFound)?;
-                format!(
-                    "event: {}\nroot: {}\ntimestamp_ms: {}\n",
-                    id.to_hex(),
-                    event.root.to_hex(),
-                    event.timestamp_ms
-                )
+                format!("{}\n", event.root.to_hex())
             }
         };
         Ok(text.into_bytes())

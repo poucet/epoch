@@ -329,15 +329,14 @@ fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
     let f = Fixture { live, history, cp };
     let hist = history_dir_id(&f.cp);
 
-    // Before any checkpoint the file exists and says so.
-    assert_eq!(read_all(&f.cp, hist, "head").unwrap(), b"no checkpoints yet\n");
+    // Before any checkpoint the file exists and is empty.
+    assert_eq!(read_all(&f.cp, hist, "head").unwrap(), b"");
 
     write_and_checkpoint(&f, "log.txt", b"v1", 1_000);
     write_and_checkpoint(&f, "log.txt", b"v2", 2_000);
 
-    // `head` names the newest checkpoint; readdir lists it.
+    // `head` is exactly the newest checkpoint's root hash; readdir lists it.
     let head = String::from_utf8(read_all(&f.cp, hist, "head").unwrap()).unwrap();
-    assert!(head.contains("timestamp_ms: 2000"), "head:\n{head}");
     let names: Vec<String> = f
         .cp
         .readdir(hist)
@@ -348,10 +347,8 @@ fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
     assert!(names.contains(&"head".to_string()));
 
     // The printed root hash browses through the cas portal.
-    let root_hex = head
-        .lines()
-        .find_map(|line| line.strip_prefix("root: "))
-        .expect("head names the root");
+    let root_hex = head.trim();
+    assert_eq!(root_hex.len(), 64, "head is a bare 64-hex hash: {head:?}");
     let vfs_dir = f.cp.lookup(ROOT_INODE_ID, OsStr::new(".vfs")).unwrap();
     let cas = f
         .cp
