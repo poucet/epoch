@@ -250,6 +250,12 @@ pub trait VfsService: Send + Sync {
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()>;
 
+    /// Explicit durability request (`fsync(2)`/`fdatasync(2)`) for an open
+    /// file. `datasync` asks for data-only durability (metadata may be
+    /// skipped). Filesystems whose durability is managed elsewhere (e.g. a
+    /// checkpoint layer) may treat this as a signal and return `Ok(())`.
+    fn fsync(&self, inode_id: InodeId, handle: FileHandle, datasync: bool) -> VfsResult<()>;
+
     fn release(&self, handle: FileHandle) -> VfsResult<()>;
 }
 

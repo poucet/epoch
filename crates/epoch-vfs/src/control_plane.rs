@@ -284,6 +284,14 @@ impl VfsService for ControlPlaneVfs {
         self.inner.flush(handle)
     }
 
+    fn fsync(&self, inode_id: InodeId, handle: FileHandle, datasync: bool) -> VfsResult<()> {
+        if is_cp(handle.0) {
+            // Synthetic nodes are read-only; nothing to make durable.
+            return Ok(());
+        }
+        self.inner.fsync(inode_id, handle, datasync)
+    }
+
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
         if is_cp(handle.0) {
             // Synthetic handles carry no state to drop.

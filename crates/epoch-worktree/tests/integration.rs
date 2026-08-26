@@ -323,6 +323,10 @@ mod overlay {
             Ok(())
         }
 
+        fn fsync(&self, _: InodeId, _: FileHandle, _: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
         fn release(&self, _: FileHandle) -> VfsResult<()> {
             Ok(())
         }

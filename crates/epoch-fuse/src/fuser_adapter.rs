@@ -188,6 +188,17 @@ impl Filesystem for FuseSpikeFs {
         }
     }
 
+    fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        fuse_log!("fsync ino={} fh={} datasync={datasync}", ino.0, fh.0);
+        match self.vfs.fsync(from_ino(ino), from_fh(fh), datasync) {
+            Ok(()) => {
+                fuse_log!("fsync ok");
+                reply.ok();
+            }
+            Err(err) => reply_error_empty(reply, err),
+        }
+    }
+
     fn release(
         &self,
         _req: &Request,

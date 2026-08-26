@@ -178,6 +178,12 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         Ok(())
     }
 
+    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
+        // Durability is the checkpoint layer's job (soft-fsync contract); a
+        // signaling decorator turns this call into a checkpoint trigger event.
+        Ok(())
+    }
+
     fn release(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }

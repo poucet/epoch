@@ -218,6 +218,11 @@ impl VfsService for PassthroughVfs {
         Ok(())
     }
 
+    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
+        // Read-only view: nothing of ours to make durable.
+        Ok(())
+    }
+
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
         let mut state = self.write_state()?;
         state.path_by_handle.remove(&handle);

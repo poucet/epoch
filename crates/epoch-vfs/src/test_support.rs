@@ -203,6 +203,10 @@ impl VfsService for StubVfs {
         Ok(())
     }
 
+    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn release(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }

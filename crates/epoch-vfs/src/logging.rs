@@ -120,6 +120,14 @@ impl VfsService for LoggingVfs {
         self.inner.flush(handle)
     }
 
+    fn fsync(&self, inode_id: InodeId, handle: FileHandle, datasync: bool) -> VfsResult<()> {
+        eprintln!(
+            "[epoch-vfs] fsync ino={} fh={} datasync={datasync}",
+            inode_id.0, handle.0
+        );
+        self.inner.fsync(inode_id, handle, datasync)
+    }
+
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
         eprintln!("[epoch-vfs] release fh={}", handle.0);
         self.inner.release(handle)
