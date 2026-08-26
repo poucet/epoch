@@ -271,6 +271,21 @@ impl VfsService for ControlPlaneVfs {
         }
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        // Renames stay inside the wrapped filesystem; anything touching the
+        // synthetic `.vfs` half is read-only.
+        match (self.route(parent.0), self.route(new_parent.0)) {
+            (Route::Inner, Route::Inner) => self.inner.rename(parent, name, new_parent, new_name),
+            _ => Err(VfsError::ReadOnlyFilesystem),
+        }
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         match self.route(inode_id.0) {
             Route::Feature(feature) => feature.service.truncate(inode_id, size),

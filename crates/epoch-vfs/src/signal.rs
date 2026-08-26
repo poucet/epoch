@@ -97,6 +97,20 @@ impl VfsService for SignalVfs {
         Ok(())
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        self.inner.rename(parent, name, new_parent, new_name)?;
+        // A rename mutates the tree with no write/flush pair of its own.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        self.scheduler.signal(TriggerEvent::Flush);
+        Ok(())
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         let attr = self.inner.truncate(inode_id, size)?;
         // A truncate mutates state with no write/flush pair of its own; mark

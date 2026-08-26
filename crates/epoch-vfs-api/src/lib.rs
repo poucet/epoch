@@ -12,6 +12,21 @@ pub type VfsResult<T> = Result<T, VfsError>;
 
 pub const ROOT_INODE_ID: InodeId = InodeId(1);
 
+/// The uid/gid stamped on synthesized attrs: the mounting process's effective
+/// ids, so CAS-backed and synthetic nodes appear owned by the user who
+/// mounted (instead of root). Passthrough attrs carry the host's real ids and
+/// don't go through these helpers.
+#[cfg(unix)]
+fn process_ids() -> (u32, u32) {
+    // SAFETY: geteuid/getegid are trivially safe (no arguments, no errors).
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+#[cfg(not(unix))]
+fn process_ids() -> (u32, u32) {
+    (0, 0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InodeId(pub u64);
 
@@ -57,8 +72,8 @@ impl NodeAttr {
             created: now,
             perm: 0o755,
             nlink: 2,
-            uid: 0,
-            gid: 0,
+            uid: process_ids().0,
+            gid: process_ids().1,
             rdev: 0,
             block_size: 4096,
             flags: 0,
@@ -77,8 +92,8 @@ impl NodeAttr {
             created: now,
             perm: 0o644,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: process_ids().0,
+            gid: process_ids().1,
             rdev: 0,
             block_size: 4096,
             flags: 0,
@@ -201,6 +216,10 @@ pub enum VfsError {
     DirectoryNotEmpty,
     PermissionDenied,
     ReadOnlyFilesystem,
+    /// The operation would cross a boundary it cannot (e.g. a rename between
+    /// the overlay and a routed pass-through subtree, or out of a fall-through
+    /// directory). Maps to `EXDEV`, so callers fall back to copy + delete.
+    CrossDevice,
     InvalidInput(String),
     Unsupported(&'static str),
     Io(String),
@@ -217,6 +236,7 @@ impl fmt::Display for VfsError {
             Self::DirectoryNotEmpty => f.write_str("directory not empty"),
             Self::PermissionDenied => f.write_str("permission denied"),
             Self::ReadOnlyFilesystem => f.write_str("read-only filesystem"),
+            Self::CrossDevice => f.write_str("cross-device link"),
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Unsupported(operation) => write!(f, "unsupported operation: {operation}"),
             Self::Io(message) => write!(f, "io error: {message}"),
@@ -247,6 +267,20 @@ pub trait VfsService: Send + Sync {
     fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()>;
 
     fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()>;
+
+    /// Move `parent/name` to `new_parent/new_name` (POSIX `rename(2)`:
+    /// atomically replaces an existing target file, or an existing *empty*
+    /// target directory). Editors rely on this for atomic saves
+    /// (write-temp-then-rename). Implementations that cannot move across an
+    /// internal boundary return [`VfsError::CrossDevice`] so callers fall
+    /// back to copy + delete.
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()>;
 
     /// Set the file's size (`truncate(2)` / `O_TRUNC`, or `ftruncate` growth),
     /// returning the updated attributes. Kernels commonly deliver `O_TRUNC` as
@@ -335,6 +369,16 @@ impl<T: ReadOnlyFeature> VfsService for T {
     }
 
     fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn rename(
+        &self,
+        _parent: InodeId,
+        _name: &OsStr,
+        _new_parent: InodeId,
+        _new_name: &OsStr,
+    ) -> VfsResult<()> {
         Err(VfsError::ReadOnlyFilesystem)
     }
 

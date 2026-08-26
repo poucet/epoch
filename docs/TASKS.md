@@ -1,7 +1,7 @@
 # epoch — Tasks & Handoff
 
 **Status:** Working notes / handoff (for review)
-**As of:** 2026-08-26 (evening)
+**As of:** 2026-08-26 (late)
 **Scope:** Current state and what to pick up next. Architecture: `docs/ARCHITECTURE.md` (as-built); checkpoint/timeline design: `docs/TIMELINE.md`.
 
 ---
@@ -39,12 +39,17 @@ reads AND writes bypass the overlay and are never checkpointed.
 
 ## 2. This session's additions (all on the linear trunk, `main` at the tip)
 
-`fuse-mount-fix → vfs-debug → vfs-plugins → route-ignore → cas-kind-tags → cas-object-portal → history-head`
+`fuse-mount-fix → vfs-debug → vfs-plugins → route-ignore → cas-kind-tags → cas-object-portal → history-head → …` (see `jj log`; later additions below)
 
 - **macOS mount fixed**: `local`/`nobrowse`/`noappledouble` mount options (TCC was silently EPERM-ing every open on the un-flagged volume); `VfsService::truncate` + fuser `setattr` (kernels deliver `O_TRUNC`/`truncate(2)` as `setattr(size)` — was ENOSYS).
 - **`.vfs` as a feature registry**: every entry is a plain `VfsService` registered via `ControlPlaneVfs::with_feature(name, |slot| …)` owning a `1<<56`-sized id slice; routing is arithmetic. `SubMounts<K>` is the shared "mount a read-only sub-filesystem, remap its ids" helper used by both history (per `EventId`) and the cas portal (per `TreeId`).
 - **Object-kind domain tags** (breaking: all hashes changed — wipe old `--state` dirs): canonical encodings start with a hashed kind byte, `'T'` tree / `'F'` file manifest / `'C'` chunk. Type confusion structurally impossible; portal type-sniffs one byte.
 - **`.epochignore` routing**: writable `PassthroughVfs` + `RouterVfs` (ids in `[0x4000…, 0x8000…)`); routed traffic emits no checkpoint signals.
+- **`.vfs/history/head`** (the head checkpoint's bare root hash) and **`.vfs/history/latest/`** (its merged snapshot); the cas portal is **overlay-aware** (tree hashes rehydrate over the lower).
+- **One shared `TreeMounts` table**: history *resolves* names to root `TreeId`s served by the cas portal — one instance and one inode space per root, however it is reached. `ReadOnlyFeature` (blanket EROFS/no-op boilerplate) and `TreeBrowseFeature` (own-nodes-then-mounts combinators) keep the features slim; the `CasEchoDir` stub is gone.
+- **`rename(2)`** end to end (editors' atomic saves work): POSIX replace semantics, fall-through files copy up and move, fall-through directories answer `EXDEV` (callers fall back to copy+delete), routed↔overlay moves answer `EXDEV` likewise; renames arm the checkpoint trigger.
+- **xattr stubs** (`ENOTSUP` + empty list — no more `ENOSYS` noise from macOS) and **synthesized attrs stamped with the mounting user's uid/gid** (files no longer appear root-owned).
+- Trigger fixes: metadata-only mutations (`touch`, bare `mkdir`) checkpoint; `mount-mac.sh` defaults to the durable overlay (`EPOCH_PROBE=1` for the legacy probe, whose `.vfs` is now bare).
 
 ## 3. What's next (ordered)
 
@@ -61,8 +66,9 @@ reads AND writes bypass the overlay and are never checkpointed.
    `.epochignore` fall-through caveats).
 4. **GC by retention** (`epoch-gc`) — mark from heads (+ live volatile roots),
    sweep unreachable objects/events; cleans checkpoint crash orphans.
-5. **VfsService gaps** — `rename`, `symlink`, full `setattr` persistence
-   (mode/times are currently accepted-and-ignored); seal-on-close in `release`.
+5. **VfsService gaps** — `symlink`; full `setattr` persistence (mode/times
+   are accepted-and-ignored); xattr *storage* (currently `ENOTSUP` stubs);
+   seal-on-close in `release`; `statfs`.
 
 ## 4. Deferred (agreed, not started)
 

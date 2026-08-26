@@ -204,6 +204,16 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         self.lock().rmdir(parent, name)
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        self.lock().rename(parent, name, new_parent, new_name)
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         let mut tree = self.lock();
         tree.truncate(inode_id, size)?;

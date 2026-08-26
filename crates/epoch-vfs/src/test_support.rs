@@ -199,6 +199,16 @@ impl VfsService for StubVfs {
         Err(VfsError::ReadOnlyFilesystem)
     }
 
+    fn rename(
+        &self,
+        _parent: InodeId,
+        _name: &OsStr,
+        _new_parent: InodeId,
+        _new_name: &OsStr,
+    ) -> VfsResult<()> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
     fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
         Err(VfsError::ReadOnlyFilesystem)
     }

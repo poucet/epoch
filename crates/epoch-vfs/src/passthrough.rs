@@ -354,6 +354,52 @@ impl VfsService for PassthroughVfs {
         self.drop_path(&child)
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        self.require_writable()?;
+        let old_rel = child_path(&self.path_for_node(parent)?, name)?;
+        let new_rel = child_path(&self.path_for_node(new_parent)?, new_name)?;
+        fs::rename(self.lower_path(&old_rel), self.lower_path(&new_rel)).map_err(map_io_error)?;
+
+        // Fix the id ↔ path bookkeeping: a replaced target's identity dies,
+        // and every recorded path at or under the old name (the node itself,
+        // its descendants, open handles) moves under the new one.
+        let mut state = self.write_state()?;
+        if let Some(dead) = state.id_by_path.remove(&new_rel) {
+            state.path_by_id.remove(&dead);
+        }
+        let rebase = |path: &PathBuf| -> Option<PathBuf> {
+            let suffix = path.strip_prefix(&old_rel).ok()?;
+            Some(if suffix.as_os_str().is_empty() {
+                new_rel.clone()
+            } else {
+                new_rel.join(suffix)
+            })
+        };
+        let moved: Vec<(InodeId, PathBuf)> = state
+            .path_by_id
+            .iter()
+            .filter_map(|(id, path)| rebase(path).map(|new_path| (*id, new_path)))
+            .collect();
+        for (id, new_path) in moved {
+            if let Some(old_path) = state.path_by_id.insert(id, new_path.clone()) {
+                state.id_by_path.remove(&old_path);
+            }
+            state.id_by_path.insert(new_path, id);
+        }
+        for open in state.handles.values_mut() {
+            if let Some(new_path) = rebase(&open.path) {
+                open.path = new_path;
+            }
+        }
+        Ok(())
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         self.require_writable()?;
         let path = self.path_for_node(inode_id)?;

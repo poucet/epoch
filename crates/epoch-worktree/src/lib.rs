@@ -873,6 +873,145 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         Ok(lower.lookup(ld, name).is_ok())
     }
 
+    // --- rename --------------------------------------------------------------
+
+    /// Move `parent/name` to `new_parent/new_name` (POSIX `rename(2)`).
+    ///
+    /// - An existing target **file** is replaced; an existing **empty** target
+    ///   directory is replaced; other combinations error per POSIX.
+    /// - A fall-through **file** is copied up first — its content becomes
+    ///   CAS-owned and therefore location-independent. Upper files (clean or
+    ///   dirty) and fully-materialized directories re-link as-is: blobs and
+    ///   sealed subtrees are content-addressed, so moving them is free.
+    /// - A fall-through **directory** (one that still merges lower content)
+    ///   cannot move: overlay fall-through is positional, so the merge would
+    ///   silently detach at the new location. Errors
+    ///   [`VfsError::CrossDevice`], and callers (e.g. `mv`) fall back to
+    ///   copy + delete — which routes through the normal copy-up paths and
+    ///   does the right thing.
+    /// - Tombstone bookkeeping mirrors [`unlink`](Self::unlink): the vacated
+    ///   name is whited-out when it also exists in the lower.
+    pub fn rename(
+        &mut self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        self.resolve_dir(parent)?;
+        self.resolve_dir(new_parent)?;
+        let src = self.lookup(parent, name)?;
+        let src_is_dir = match &self.inodes.get(&src).ok_or(VfsError::NotFound)?.body {
+            Body::Tombstone => return Err(VfsError::NotFound),
+            Body::Dir { lower, .. } => {
+                if lower.is_some() {
+                    // Fall-through dirs are positional; see the doc comment.
+                    return Err(VfsError::CrossDevice);
+                }
+                true
+            }
+            Body::File(_) | Body::LowerFile(_) => false,
+        };
+
+        // Renaming a node onto itself is a no-op.
+        if parent == new_parent && name == new_name {
+            return Ok(());
+        }
+        // A directory must not move into its own subtree (POSIX EINVAL).
+        if src_is_dir && self.is_in_subtree(src, new_parent)? {
+            return Err(VfsError::InvalidInput(
+                "cannot move a directory into its own subtree".to_owned(),
+            ));
+        }
+        // A fall-through file becomes upper-owned before it moves.
+        if !src_is_dir
+            && matches!(
+                self.inodes.get(&src).map(|n| &n.body),
+                Some(Body::LowerFile(_))
+            )
+        {
+            self.make_dirty(src)?;
+        }
+
+        // POSIX replace semantics for an existing target.
+        match self.lookup(new_parent, new_name) {
+            Err(VfsError::NotFound) => {}
+            Err(e) => return Err(e),
+            Ok(dst) => {
+                let dst_is_dir = match &self.inodes.get(&dst).ok_or(VfsError::NotFound)?.body {
+                    Body::Tombstone => false, // a whiteout: nothing visible to replace
+                    Body::Dir { .. } => true,
+                    Body::File(_) | Body::LowerFile(_) => false,
+                };
+                match (src_is_dir, dst_is_dir) {
+                    (true, false) => return Err(VfsError::NotDirectory),
+                    (false, true) => return Err(VfsError::IsDirectory),
+                    (true, true) => {
+                        self.resolve_dir(dst)?;
+                        if !self.dir_is_empty(dst)? {
+                            return Err(VfsError::DirectoryNotEmpty);
+                        }
+                        self.remove_child(new_parent, new_name, dst)?;
+                    }
+                    (false, false) => {
+                        if dst != src {
+                            self.remove_child(new_parent, new_name, dst)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Vacate the old name (whiteout if it also exists in the lower),
+        // keeping the moved inode alive.
+        if self.name_in_lower(parent, name)? {
+            let tomb = self.alloc();
+            self.inodes.insert(tomb, Inode { mode: 0, body: Body::Tombstone });
+            self.link(parent, name, tomb)?;
+        } else {
+            self.unlink_child(parent, name)?;
+        }
+
+        // Attach at the new location, freeing a leftover whiteout slot if the
+        // target map still holds one (created by `remove_child` above, or by
+        // an earlier deletion of a lower name).
+        let leftover = match &self.inodes.get(&new_parent).ok_or(VfsError::NotFound)?.body {
+            Body::Dir { children, .. } => children.open()?.get(new_name).copied(),
+            _ => None,
+        };
+        if let Some(existing) = leftover
+            && matches!(self.inodes.get(&existing).map(|n| &n.body), Some(Body::Tombstone))
+        {
+            self.inodes.remove(&existing);
+        }
+        self.link(new_parent, new_name, src)
+    }
+
+    /// Whether `candidate` equals `root` or lies anywhere below it in the
+    /// **hydrated** upper spine. Sufficient for the rename cycle check: a
+    /// hydrated node's ancestors are necessarily hydrated too (children are
+    /// only ever reached through their parent), so if `candidate` descends
+    /// from `root` the whole path between them is walkable.
+    fn is_in_subtree(&self, root: InodeId, candidate: InodeId) -> VfsResult<bool> {
+        if root == candidate {
+            return Ok(true);
+        }
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            if let Some(Inode { body: Body::Dir { children: DirChildren::Open(map), .. }, .. }) =
+                self.inodes.get(&dir)
+            {
+                for child in map.values() {
+                    if *child == candidate {
+                        return Ok(true);
+                    }
+                    stack.push(*child);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     // --- seal ----------------------------------------------------------------
 
     /// Seal the current state into immutable objects, returning the new root

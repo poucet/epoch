@@ -115,6 +115,20 @@ impl VfsService for LoggingVfs {
         self.inner.rmdir(parent, name)
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        eprintln!(
+            "[epoch-vfs] rename parent={} name={:?} new_parent={} new_name={:?}",
+            parent.0, name, new_parent.0, new_name
+        );
+        self.inner.rename(parent, name, new_parent, new_name)
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         eprintln!("[epoch-vfs] truncate node={} size={size}", inode_id.0);
         self.inner.truncate(inode_id, size)

@@ -462,6 +462,46 @@ impl VfsService for RouterVfs {
         self.overlay.rmdir(parent, name)
     }
 
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+        new_parent: InodeId,
+        new_name: &OsStr,
+    ) -> VfsResult<()> {
+        match (is_routed(parent.0), is_routed(new_parent.0)) {
+            // Entirely inside a routed subtree: the host handles it.
+            (true, true) => self.passthrough.rename(
+                self.local_of(parent)?,
+                name,
+                self.local_of(new_parent)?,
+                new_name,
+            ),
+            // Crossing the overlay ↔ host boundary cannot be a rename; EXDEV
+            // makes callers fall back to copy + delete, which routes each
+            // side correctly.
+            (true, false) | (false, true) => Err(VfsError::CrossDevice),
+            (false, false) => {
+                // Both parents are overlay-side, but either *name* may still
+                // match the routing rules (e.g. `mv build node_modules`).
+                let src_matches = match self.overlay_child_path(parent, name)? {
+                    Some((_, child)) => self.route_for(&child)?.is_some(),
+                    None => false,
+                };
+                let dst_matches = match self.overlay_child_path(new_parent, new_name)? {
+                    Some((_, child)) => {
+                        self.path_matches(&child, false) || self.path_matches(&child, true)
+                    }
+                    None => false,
+                };
+                if src_matches || dst_matches {
+                    return Err(VfsError::CrossDevice);
+                }
+                self.overlay.rename(parent, name, new_parent, new_name)
+            }
+        }
+    }
+
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         if is_routed(inode_id.0) {
             let attr = self.passthrough.truncate(self.local_of(inode_id)?, size)?;

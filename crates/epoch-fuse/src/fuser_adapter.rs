@@ -312,6 +312,65 @@ impl Filesystem for FuseSpikeFs {
         }
     }
 
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        fuse_log!(
+            "rename parent={} name={name:?} newparent={} newname={newname:?}",
+            parent.0,
+            newparent.0
+        );
+        match self
+            .vfs
+            .rename(from_ino(parent), name, from_ino(newparent), newname)
+        {
+            Ok(()) => {
+                fuse_log!("rename ok");
+                reply.ok();
+            }
+            Err(err) => reply_error_empty(reply, err),
+        }
+    }
+
+    // Extended attributes are not stored (the tree format has no xattr slot
+    // yet): get/set/remove answer ENOTSUP so callers degrade silently, and
+    // the attribute list is served as genuinely empty.
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: fuser::ReplyXattr) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
+    }
+
     fn release(
         &self,
         _req: &Request,
@@ -578,6 +637,7 @@ fn to_errno(error: &VfsError) -> Errno {
         VfsError::DirectoryNotEmpty => Errno::ENOTEMPTY,
         VfsError::PermissionDenied => Errno::EACCES,
         VfsError::ReadOnlyFilesystem => Errno::EROFS,
+        VfsError::CrossDevice => Errno::EXDEV,
         VfsError::InvalidInput(_) => Errno::EINVAL,
         VfsError::Unsupported(_) => Errno::ENOSYS,
         VfsError::Io(_) | VfsError::Other(_) => Errno::EIO,

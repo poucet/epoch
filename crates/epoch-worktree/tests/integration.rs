@@ -102,6 +102,51 @@ fn truncate_shrinks_zero_extends_and_empties() {
 }
 
 #[test]
+fn rename_moves_replaces_and_survives_seal() {
+    let backend = MemoryByteBackend::new();
+    let mut wt = Wt::new(backend.clone());
+    let root = wt.root();
+    let dir = wt.mkdir(root, OsStr::new("dir"), 0o040755).unwrap();
+    write_file(&mut wt, root, "a.txt", b"alpha");
+    write_file(&mut wt, root, "b.txt", b"beta");
+
+    // Plain move into a subdirectory.
+    wt.rename(root, OsStr::new("a.txt"), dir, OsStr::new("moved.txt")).unwrap();
+    assert_eq!(wt.lookup(root, OsStr::new("a.txt")).unwrap_err(), VfsError::NotFound);
+    let moved = wt.lookup(dir, OsStr::new("moved.txt")).unwrap();
+    assert_eq!(wt.read_at(moved, 0, 64).unwrap(), b"alpha");
+
+    // The editor atomic-save pattern: rename over an existing file replaces it.
+    write_file(&mut wt, root, "b.txt.tmp", b"beta v2");
+    wt.rename(root, OsStr::new("b.txt.tmp"), root, OsStr::new("b.txt")).unwrap();
+    let b = wt.lookup(root, OsStr::new("b.txt")).unwrap();
+    assert_eq!(wt.read_at(b, 0, 64).unwrap(), b"beta v2");
+    assert_eq!(wt.lookup(root, OsStr::new("b.txt.tmp")).unwrap_err(), VfsError::NotFound);
+
+    // Directory rename (fully-materialized dirs re-link freely).
+    wt.rename(root, OsStr::new("dir"), root, OsStr::new("renamed-dir")).unwrap();
+    let rd = wt.lookup(root, OsStr::new("renamed-dir")).unwrap();
+    assert_eq!(names(&wt.readdir(rd).unwrap()), vec!["moved.txt".to_string()]);
+
+    // A directory cannot move into its own subtree.
+    let sub = wt.mkdir(rd, OsStr::new("sub"), 0o040755).unwrap();
+    assert!(matches!(
+        wt.rename(root, OsStr::new("renamed-dir"), sub, OsStr::new("cycle")),
+        Err(VfsError::InvalidInput(_))
+    ));
+
+    // Everything survives a seal → rehydrate roundtrip.
+    let sealed = wt.seal().unwrap();
+    let mut wt2 = Wt::from_root(backend, sealed).unwrap();
+    let root2 = wt2.root();
+    let rd2 = wt2.lookup(root2, OsStr::new("renamed-dir")).unwrap();
+    let mv2 = wt2.lookup(rd2, OsStr::new("moved.txt")).unwrap();
+    assert_eq!(wt2.read_at(mv2, 0, 64).unwrap(), b"alpha");
+    let b2 = wt2.lookup(root2, OsStr::new("b.txt")).unwrap();
+    assert_eq!(wt2.read_at(b2, 0, 64).unwrap(), b"beta v2");
+}
+
+#[test]
 fn overwrite_then_reseal_changes_root() {
     let backend = MemoryByteBackend::new();
     let mut wt = Wt::new(backend.clone());
@@ -319,6 +364,10 @@ mod overlay {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
+        fn rename(&self, _: InodeId, _: &OsStr, _: InodeId, _: &OsStr) -> VfsResult<()> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
         fn truncate(&self, _: InodeId, _: u64) -> VfsResult<NodeAttr> {
             Err(VfsError::ReadOnlyFilesystem)
         }
@@ -337,6 +386,38 @@ mod overlay {
     }
 
     type Wt = WorkingTree<MemoryByteBackend>;
+
+    /// Renames in overlay mode: a fall-through file is copied up and moved
+    /// (tombstoning its old lower name); a fall-through directory answers
+    /// CrossDevice so callers fall back to copy + delete.
+    #[test]
+    fn rename_copies_up_fall_through_files_and_refuses_fall_through_dirs() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "keep.txt", b"lower content");
+        let sub = b.dir(ROOT_INODE_ID, "sub");
+        b.file(sub, "inner.txt", b"inner");
+        let lower = b.build();
+        let mut wt = WorkingTree::overlay(MemoryByteBackend::new(), lower);
+        let root = wt.root();
+
+        // Fall-through file: copy-up + move, whiteout at the old name.
+        wt.rename(root, OsStr::new("keep.txt"), root, OsStr::new("kept.txt"))
+            .unwrap();
+        assert_eq!(
+            wt.lookup(root, OsStr::new("keep.txt")).unwrap_err(),
+            VfsError::NotFound,
+            "old lower name is tombstoned"
+        );
+        let moved = wt.lookup(root, OsStr::new("kept.txt")).unwrap();
+        assert_eq!(wt.read_at(moved, 0, 64).unwrap(), b"lower content");
+
+        // Fall-through directory: positional merge cannot move.
+        assert_eq!(
+            wt.rename(root, OsStr::new("sub"), root, OsStr::new("sub2"))
+                .unwrap_err(),
+            VfsError::CrossDevice
+        );
+    }
 
     /// Untouched names are served straight from the lower, `readdir` merges the
     /// two layers, and an unmutated overlay seals to a delta that still resolves

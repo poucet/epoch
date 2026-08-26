@@ -276,6 +276,9 @@ dependencies = [
 [[package]]
 name = "epoch-vfs-api"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "epoch-worktree"
