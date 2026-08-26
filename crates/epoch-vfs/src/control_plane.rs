@@ -37,10 +37,14 @@ use epoch_vfs_api::{
     WriteRequest,
 };
 
+use crate::history_dir::{HIST_ROOT_ID, is_hist};
+
 /// Name of the synthetic control-plane directory at the mount root.
 const CONTROL_DIR: &str = ".vfs";
 /// Name of the content-addressed-store directory inside the control plane.
 const CAS_DIR: &str = "cas";
+/// Name of the time-travel directory inside the control plane.
+const HISTORY_DIR: &str = "history";
 
 /// First [`InodeId`]/[`FileHandle`] value owned by the control plane.
 ///
@@ -49,7 +53,7 @@ const CAS_DIR: &str = "cas";
 pub const CP_BASE: u64 = 0x8000_0000_0000_0000;
 
 /// Reserved node id of the `.vfs` directory.
-const VFS_NODE_ID: InodeId = InodeId(CP_BASE);
+pub(crate) const VFS_NODE_ID: InodeId = InodeId(CP_BASE);
 /// Reserved node id of the `.vfs/cas` directory.
 const CAS_NODE_ID: InodeId = InodeId(CP_BASE + 1);
 /// First mintable id for `.vfs/cas/<id>` entries and synthetic file handles.
@@ -65,6 +69,11 @@ pub struct ControlPlaneVfs {
     inner: Arc<dyn VfsService>,
     state: RwLock<CasState>,
     next_id: AtomicU64,
+    /// The `.vfs/history` sub-service (a [`crate::HistoryDir`]), when the
+    /// mount has a timeline. It owns every id at/above
+    /// [`HIST_BASE`](crate::history_dir::HIST_BASE) — a sub-range of the
+    /// control plane's — so routing checks `is_hist` before `is_cp`.
+    history: Option<Arc<dyn VfsService>>,
 }
 
 impl std::fmt::Debug for ControlPlaneVfs {
@@ -92,7 +101,24 @@ impl ControlPlaneVfs {
             inner,
             state: RwLock::new(CasState::default()),
             next_id: AtomicU64::new(FIRST_DYNAMIC),
+            history: None,
         }
+    }
+
+    /// Like [`new`](Self::new), additionally grafting `history` (a
+    /// [`crate::HistoryDir`]) at `.vfs/history`.
+    pub fn with_history(inner: Arc<dyn VfsService>, history: Arc<dyn VfsService>) -> Self {
+        Self {
+            history: Some(history),
+            ..Self::new(inner)
+        }
+    }
+
+    /// The history sub-service, or `NotFound` where a caller reached a
+    /// history id without one configured (impossible in practice: only the
+    /// sub-service mints those ids).
+    fn history(&self) -> VfsResult<&Arc<dyn VfsService>> {
+        self.history.as_ref().ok_or(VfsError::NotFound)
     }
 
     fn read_state(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, CasState>> {
@@ -141,11 +167,20 @@ impl VfsService for ControlPlaneVfs {
             return Ok(Entry::new(control_dir_attr(VFS_NODE_ID)));
         }
 
+        // History ids (including `.vfs/history` itself) route to the
+        // sub-service, which owns everything below that directory.
+        if is_hist(parent.0) {
+            return self.history()?.lookup(parent, name);
+        }
+
         // Resolve within an existing control-plane node.
         if is_cp(parent.0) {
             if parent == VFS_NODE_ID {
                 if name == OsStr::new(CAS_DIR) {
                     return Ok(Entry::new(control_dir_attr(CAS_NODE_ID)));
+                }
+                if self.history.is_some() && name == OsStr::new(HISTORY_DIR) {
+                    return self.history()?.getattr(HIST_ROOT_ID).map(Entry::new);
                 }
                 // `.vfs/<other>` is not a defined control entry yet.
                 return Err(VfsError::NotFound);
@@ -165,6 +200,9 @@ impl VfsService for ControlPlaneVfs {
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
         if inode_id == VFS_NODE_ID || inode_id == CAS_NODE_ID {
             return Ok(control_dir_attr(inode_id));
+        }
+        if is_hist(inode_id.0) {
+            return self.history()?.getattr(inode_id);
         }
         if is_cp(inode_id.0) {
             let name = self.cas_name(inode_id)?.ok_or(VfsError::NotFound)?;
@@ -189,11 +227,23 @@ impl VfsService for ControlPlaneVfs {
 
         if inode_id == VFS_NODE_ID {
             // `.vfs` exposes only the feature directories it implements.
-            return Ok(vec![
+            let mut entries = vec![
                 DirEntry::new(VFS_NODE_ID, OsString::from("."), NodeKind::Directory),
                 DirEntry::new(ROOT_INODE_ID, OsString::from(".."), NodeKind::Directory),
                 DirEntry::new(CAS_NODE_ID, OsString::from(CAS_DIR), NodeKind::Directory),
-            ]);
+            ];
+            if self.history.is_some() {
+                entries.push(DirEntry::new(
+                    HIST_ROOT_ID,
+                    OsString::from(HISTORY_DIR),
+                    NodeKind::Directory,
+                ));
+            }
+            return Ok(entries);
+        }
+
+        if is_hist(inode_id.0) {
+            return self.history()?.readdir(inode_id);
         }
 
         if inode_id == CAS_NODE_ID {
@@ -213,6 +263,9 @@ impl VfsService for ControlPlaneVfs {
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+        if is_hist(request.inode_id.0) {
+            return self.history()?.open(request);
+        }
         if is_cp(request.inode_id.0) {
             if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
                 return Err(VfsError::ReadOnlyFilesystem);
@@ -232,6 +285,9 @@ impl VfsService for ControlPlaneVfs {
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+        if is_hist(request.inode_id.0) {
+            return self.history()?.read(request);
+        }
         if is_cp(request.inode_id.0) {
             if request.inode_id == VFS_NODE_ID || request.inode_id == CAS_NODE_ID {
                 return Err(VfsError::IsDirectory);
@@ -278,6 +334,9 @@ impl VfsService for ControlPlaneVfs {
     }
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {
+        if is_hist(handle.0) {
+            return self.history()?.flush(handle);
+        }
         if is_cp(handle.0) {
             return Ok(());
         }
@@ -293,6 +352,9 @@ impl VfsService for ControlPlaneVfs {
     }
 
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
+        if is_hist(handle.0) {
+            return self.history()?.release(handle);
+        }
         if is_cp(handle.0) {
             // Synthetic handles carry no state to drop.
             return Ok(());

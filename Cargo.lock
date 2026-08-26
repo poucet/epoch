@@ -227,6 +227,8 @@ name = "epoch-vfs"
 version = "0.1.0"
 dependencies = [
  "epoch-cas",
+ "epoch-history",
+ "epoch-timeline",
  "epoch-vfs-api",
  "epoch-worktree",
 ]
