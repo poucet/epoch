@@ -25,17 +25,21 @@ use std::{path::PathBuf, sync::Arc};
 use epoch_vfs_api::VfsService;
 
 pub mod cas_vfs;
+pub mod checkpointing;
 pub mod control_plane;
 pub mod history_dir;
 pub mod logging;
 pub mod passthrough;
+pub mod signal;
 
 #[cfg(test)]
 mod test_support;
 
 pub use cas_vfs::CasVfs;
+pub use checkpointing::CheckpointedFs;
 pub use control_plane::ControlPlaneVfs;
 pub use history_dir::HistoryDir;
+pub use signal::SignalVfs;
 pub use logging::LoggingVfs;
 pub use passthrough::PassthroughVfs;
 

@@ -21,4 +21,7 @@ pub enum HistoryError {
     /// A reachable blob manifest is absent from the store.
     #[error("blob manifest missing from store: {0:?}")]
     MissingBlob(BlobId),
+    /// Sealing the working tree failed (the step before any promotion).
+    #[error("seal failed: {0}")]
+    Seal(String),
 }

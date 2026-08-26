@@ -28,7 +28,11 @@
 mod closure;
 mod error;
 mod history;
+mod policy;
+mod scheduler;
 
 pub use closure::pending_closure;
 pub use error::HistoryError;
 pub use history::History;
+pub use policy::{CheckpointPolicy, Decision, TriggerEvent};
+pub use scheduler::{CheckpointFn, Scheduler, SchedulerHandle};
