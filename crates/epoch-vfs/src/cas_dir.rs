@@ -18,11 +18,11 @@ use std::{
 };
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenMode,
-    OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenRequest, OpenedFile,
+    ReadRequest, VfsError, VfsResult,
 };
 
-use crate::feature::{FeatureSlot, control_dir_attr, cp_file_attr, slice_bytes};
+use crate::feature::{FeatureSlot, ReadOnlyFeature, control_dir_attr, cp_file_attr, slice_bytes};
 
 /// The `.vfs/cas` feature. See the [module docs](self).
 pub struct CasEchoDir {
@@ -101,7 +101,7 @@ fn os_str_bytes(name: &OsStr) -> Vec<u8> {
     name.to_string_lossy().into_owned().into_bytes()
 }
 
-impl VfsService for CasEchoDir {
+impl ReadOnlyFeature for CasEchoDir {
     fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
         if parent == self.slot.root_id() {
             let inode_id = self.cas_node_id(name)?;
@@ -132,9 +132,6 @@ impl VfsService for CasEchoDir {
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
-            return Err(VfsError::ReadOnlyFilesystem);
-        }
         if request.inode_id == self.slot.root_id() {
             return Err(VfsError::IsDirectory);
         }
@@ -154,40 +151,12 @@ impl VfsService for CasEchoDir {
         slice_bytes(&cas_content(&name), request.offset, request.size)
     }
 
-    fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn create(&self, _request: CreateRequest) -> VfsResult<CreatedNode> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn mkdir(&self, _request: CreateRequest) -> VfsResult<Entry> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
-        Ok(())
-    }
 
-    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
-        Ok(())
-    }
 
-    fn release(&self, _handle: FileHandle) -> VfsResult<()> {
-        // Synthetic handles carry no state to drop.
-        Ok(())
-    }
 }

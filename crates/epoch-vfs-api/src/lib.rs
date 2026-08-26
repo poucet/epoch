@@ -265,6 +265,97 @@ pub trait VfsService: Send + Sync {
     fn release(&self, handle: FileHandle) -> VfsResult<()>;
 }
 
+/// The slim contract a **read-only** control-plane feature implements: just
+/// the read surface. The blanket [`VfsService`] impl below supplies
+/// everything else uniformly — every mutation (`write`, `create`, `mkdir`,
+/// `unlink`, `rmdir`, `truncate`) answers
+/// [`ReadOnlyFilesystem`](VfsError::ReadOnlyFilesystem), `flush`/`fsync` are
+/// no-ops (there is nothing to make durable), and writable/truncating/
+/// appending opens are rejected *before* [`open`](Self::open) is called, so
+/// implementations only ever see read-only requests.
+///
+/// Every `.vfs` feature (`cas`, `history`, `debug`) implements this instead
+/// of the full trait.
+pub trait ReadOnlyFeature: Send + Sync {
+    /// See [`VfsService::lookup`].
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry>;
+    /// See [`VfsService::getattr`].
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr>;
+    /// See [`VfsService::readdir`].
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>>;
+    /// Read-only open (writable modes were already rejected).
+    fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
+    /// See [`VfsService::read`].
+    fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>>;
+    /// Drop a handle minted by [`open`](Self::open). Default: handles are
+    /// stateless, nothing to do.
+    fn release(&self, _handle: FileHandle) -> VfsResult<()> {
+        Ok(())
+    }
+}
+
+impl<T: ReadOnlyFeature> VfsService for T {
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+        ReadOnlyFeature::lookup(self, parent, name)
+    }
+
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        ReadOnlyFeature::getattr(self, inode_id)
+    }
+
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        ReadOnlyFeature::readdir(self, inode_id)
+    }
+
+    fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+        if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
+            return Err(VfsError::ReadOnlyFilesystem);
+        }
+        ReadOnlyFeature::open(self, request)
+    }
+
+    fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+        ReadOnlyFeature::read(self, request)
+    }
+
+    fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn create(&self, _request: CreateRequest) -> VfsResult<CreatedNode> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn mkdir(&self, _request: CreateRequest) -> VfsResult<Entry> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
+        // Read-only features have nothing to make durable.
+        Ok(())
+    }
+
+    fn release(&self, handle: FileHandle) -> VfsResult<()> {
+        ReadOnlyFeature::release(self, handle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::VfsService;

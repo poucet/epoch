@@ -25,8 +25,9 @@
 //! [`HistoryDir`](crate::HistoryDir) does) wrap further sub-services freely
 //! inside its own slice.
 
-use epoch_vfs_api::{InodeId, NodeAttr, VfsError, VfsResult};
 use std::time::SystemTime;
+
+use epoch_vfs_api::{InodeId, NodeAttr, VfsError, VfsResult};
 
 /// The size of one feature's id slice. 2^56 ids per feature leaves room for
 /// 127 features above [`CP_BASE`](crate::control_plane::CP_BASE) — both
@@ -81,3 +82,5 @@ pub(crate) fn slice_bytes(data: &[u8], offset: u64, size: u32) -> VfsResult<Vec<
     let end = start.saturating_add(size).min(data.len());
     Ok(data[start..end].to_vec())
 }
+
+pub use epoch_vfs_api::ReadOnlyFeature;

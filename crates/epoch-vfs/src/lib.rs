@@ -49,7 +49,7 @@ pub use checkpointing::CheckpointedFs;
 pub use control_plane::ControlPlaneVfs;
 pub use debug::{DebugSnapshot, DebugStats, NearCount};
 pub use debug_dir::DebugDir;
-pub use feature::{FEATURE_RANGE, FeatureSlot};
+pub use feature::{FEATURE_RANGE, FeatureSlot, ReadOnlyFeature};
 pub use history_dir::HistoryDir;
 pub use router::RouterVfs;
 pub use signal::SignalVfs;

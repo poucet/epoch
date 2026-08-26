@@ -40,12 +40,12 @@ use epoch_cas::{CASHash, SyncByteBackend, decompress, object_kind};
 use epoch_file_cas::{BlobId, FileCas};
 use epoch_tree::TreeId;
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenMode,
-    OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenRequest, OpenedFile,
+    ReadRequest, VfsError, VfsResult, VfsService,
 };
 
 use crate::cas_vfs::CasVfs;
-use crate::feature::{FeatureSlot, control_dir_attr, cp_file_attr};
+use crate::feature::{FeatureSlot, ReadOnlyFeature, control_dir_attr, cp_file_attr};
 use crate::submount::TreeMounts;
 
 /// The `.vfs/cas` typed object portal. See the [module docs](self).
@@ -113,13 +113,17 @@ where
         Arc::clone(&self.mounts)
     }
 
-    fn read_blobs(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, BlobState>> {
+    /// Shared-read guard over the blob **bookkeeping tables** (id maps and
+    /// handle liveness) — nothing here ever writes blob *content*.
+    fn blob_state(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, BlobState>> {
         self.blobs
             .read()
             .map_err(|_| VfsError::Other("cas portal read lock poisoned".to_owned()))
     }
 
-    fn write_blobs(&self) -> VfsResult<std::sync::RwLockWriteGuard<'_, BlobState>> {
+    /// Exclusive guard over the same tables, for minting a synthetic id or
+    /// registering/dropping a read handle.
+    fn blob_state_mut(&self) -> VfsResult<std::sync::RwLockWriteGuard<'_, BlobState>> {
         self.blobs
             .write()
             .map_err(|_| VfsError::Other("cas portal write lock poisoned".to_owned()))
@@ -137,10 +141,10 @@ where
 
     /// The stable synthetic file node for a blob (minted on first use).
     fn blob_node(&self, blob: BlobId) -> VfsResult<InodeId> {
-        if let Some(id) = self.read_blobs()?.node_of.get(&blob) {
+        if let Some(id) = self.blob_state()?.node_of.get(&blob) {
             return Ok(*id);
         }
-        let mut state = self.write_blobs()?;
+        let mut state = self.blob_state_mut()?;
         if let Some(id) = state.node_of.get(&blob) {
             return Ok(*id);
         }
@@ -182,11 +186,11 @@ where
     }
 
     fn blob_of(&self, id: InodeId) -> VfsResult<Option<BlobId>> {
-        Ok(self.read_blobs()?.blob_of.get(&id).copied())
+        Ok(self.blob_state()?.blob_of.get(&id).copied())
     }
 }
 
-impl<Bk> VfsService for CasObjectDir<Bk>
+impl<Bk> ReadOnlyFeature for CasObjectDir<Bk>
 where
     Bk: SyncByteBackend<CASHash> + Clone + 'static,
 {
@@ -227,9 +231,6 @@ where
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
-            return Err(VfsError::ReadOnlyFilesystem);
-        }
         if request.inode_id == self.slot.root_id() {
             return Err(VfsError::IsDirectory);
         }
@@ -238,7 +239,7 @@ where
         }
         let blob = self.blob_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
         let handle = FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.write_blobs()?.handles.insert(handle, blob);
+        self.blob_state_mut()?.handles.insert(handle, blob);
         Ok(OpenedFile {
             handle,
             direct_io: false,
@@ -257,40 +258,16 @@ where
             .map_err(|_| VfsError::NotFound)
     }
 
-    fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn create(&self, _request: CreateRequest) -> VfsResult<CreatedNode> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn mkdir(&self, _request: CreateRequest) -> VfsResult<Entry> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
-        Ok(())
-    }
 
-    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
-        Ok(())
-    }
 
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
-        if self.write_blobs()?.handles.remove(&handle).is_some() {
+        if self.blob_state_mut()?.handles.remove(&handle).is_some() {
             return Ok(());
         }
         self.mounts.subs().release(handle)

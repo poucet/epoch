@@ -55,11 +55,11 @@ use epoch_cas::{CASHash, SyncByteBackend};
 use epoch_history::History;
 use epoch_timeline::EventId;
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenMode,
-    OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenRequest, OpenedFile,
+    ReadRequest, VfsError, VfsResult,
 };
 
-use crate::feature::{FeatureSlot, cp_file_attr, slice_bytes};
+use crate::feature::{FeatureSlot, ReadOnlyFeature, cp_file_attr, slice_bytes};
 use crate::submount::TreeMounts;
 
 /// How many checkpoints a `readdir` of `.vfs/history` lists (newest first).
@@ -180,7 +180,7 @@ where
     }
 }
 
-impl<Near, Far> VfsService for HistoryDir<Near, Far>
+impl<Near, Far> ReadOnlyFeature for HistoryDir<Near, Far>
 where
     Near: SyncByteBackend<CASHash> + Clone + 'static,
     Far: SyncByteBackend<CASHash> + Clone + 'static,
@@ -263,9 +263,6 @@ where
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
-            return Err(VfsError::ReadOnlyFilesystem);
-        }
         if request.inode_id == self.slot.root_id() || request.inode_id == self.id_dir() {
             return Err(VfsError::IsDirectory);
         }
@@ -288,43 +285,14 @@ where
         Err(VfsError::NotFound)
     }
 
-    fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn create(&self, _request: CreateRequest) -> VfsResult<CreatedNode> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn mkdir(&self, _request: CreateRequest) -> VfsResult<Entry> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
 
-    fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
-        Ok(())
-    }
 
-    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
-        Ok(())
-    }
 
-    fn release(&self, handle: FileHandle) -> VfsResult<()> {
-        // Only (stateless) head-file handles are minted here.
-        let _ = handle;
-        Ok(())
-    }
 }
 
 /// Attr for the fixed `.vfs/history` / `.vfs/history/id` directories.
