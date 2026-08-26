@@ -66,11 +66,20 @@ impl VfsService for SignalVfs {
     }
 
     fn create(&self, request: CreateRequest) -> VfsResult<CreatedNode> {
-        self.inner.create(request)
+        let created = self.inner.create(request)?;
+        // An empty create (`touch`) may never be written or flushed — mark
+        // dirty and arm the debounce here, or it would never checkpoint.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        self.scheduler.signal(TriggerEvent::Flush);
+        Ok(created)
     }
 
     fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry> {
-        self.inner.mkdir(request)
+        let entry = self.inner.mkdir(request)?;
+        // A bare mkdir has no write/flush/release of its own either.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        self.scheduler.signal(TriggerEvent::Flush);
+        Ok(entry)
     }
 
     fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {

@@ -136,6 +136,48 @@ mod tests {
         assert_eq!(history.head().unwrap(), Some(head));
     }
 
+    /// A bare `touch` (create, no write, release) must checkpoint on its own —
+    /// metadata-only mutations arm the trigger too.
+    #[test]
+    fn create_without_writes_checkpoints() {
+        let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
+        let live = Arc::new(CasVfs::new(tier.clone()));
+        let history = Arc::new(History::new(
+            tier,
+            Arc::new(MemoryTimelineStore::new()),
+            "main",
+        ));
+        let fs = CheckpointedFs::new(Arc::clone(&live), Arc::clone(&history));
+        let scheduler = Scheduler::spawn(
+            CheckpointPolicy::new(
+                Duration::from_millis(5),
+                Duration::from_millis(100),
+                u64::MAX,
+            ),
+            Box::new(move || fs.checkpoint()),
+        );
+        let vfs = SignalVfs::new(live, scheduler.handle(), false);
+
+        // `touch foo`: create + release, zero bytes written. And `mkdir d`.
+        let created = vfs
+            .create(CreateRequest::file(ROOT_INODE_ID, "foo", 0o644))
+            .unwrap();
+        if let Some(opened) = created.opened {
+            vfs.release(opened.handle).unwrap();
+        }
+        vfs.mkdir(CreateRequest::directory(ROOT_INODE_ID, "d", 0o755))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while history.head().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a metadata-only mutation never checkpointed"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Hard fsync blocks until the checkpoint is durable.
     #[test]
     fn hard_fsync_is_a_synchronous_barrier() {
