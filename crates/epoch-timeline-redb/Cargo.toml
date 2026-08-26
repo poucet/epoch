@@ -1,0 +1,13 @@
+[package]
+name = "epoch-timeline-redb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+epoch-timeline = { path = "../epoch-timeline" }
+redb = "2"
+
+[dev-dependencies]
+epoch-tree = { path = "../epoch-tree" }
+tempfile = "3"

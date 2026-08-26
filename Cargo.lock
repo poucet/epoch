@@ -190,6 +190,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "epoch-timeline-redb"
+version = "0.1.0"
+dependencies = [
+ "epoch-cas",
+ "epoch-timeline",
+ "epoch-tree",
+ "redb",
+ "tempfile",
+]
+
+[[package]]
 name = "epoch-tree"
 version = "0.1.0"
 dependencies = [

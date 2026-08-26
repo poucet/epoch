@@ -7,6 +7,7 @@ members = [
     "crates/epoch-file-cas",
     "crates/epoch-fuse",
     "crates/epoch-timeline",
+    "crates/epoch-timeline-redb",
     "crates/epoch-tree",
     "crates/epoch-vfs",
     "crates/epoch-worktree",
