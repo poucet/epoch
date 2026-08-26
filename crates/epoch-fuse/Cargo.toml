@@ -13,6 +13,11 @@ fuser-support = ["dep:fuser"]
 epoch-vfs-api = { path = "../epoch-vfs-api" }
 epoch-vfs = { path = "../epoch-vfs" }
 epoch-cas = { path = "../epoch-cas" }
+epoch-cas-moka = { path = "../epoch-cas-moka" }
+epoch-cas-redb = { path = "../epoch-cas-redb" }
+epoch-history = { path = "../epoch-history" }
+epoch-timeline-redb = { path = "../epoch-timeline-redb" }
+redb = "2"
 fuser = { version = "0.17", optional = true }
 
 [[bin]]

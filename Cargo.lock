@@ -175,9 +175,14 @@ name = "epoch-fuse"
 version = "0.1.0"
 dependencies = [
  "epoch-cas",
+ "epoch-cas-moka",
+ "epoch-cas-redb",
+ "epoch-history",
+ "epoch-timeline-redb",
  "epoch-vfs",
  "epoch-vfs-api",
  "fuser",
+ "redb",
 ]
 
 [[package]]
