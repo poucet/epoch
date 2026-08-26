@@ -6,3 +6,9 @@
 /.worktrees/*
 !/.worktrees/.gitkeep
 .DS_Store
+SYSTEM.md
+.workspaces/
+.screenshots/
+docs/live/
+.claude/agents
+.pi/agents
