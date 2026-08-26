@@ -60,7 +60,7 @@ use epoch_vfs_api::{
 };
 
 use crate::feature::{FeatureSlot, ReadOnlyFeature, cp_file_attr, slice_bytes};
-use crate::submount::TreeMounts;
+use crate::submount::{TreeBrowseFeature, TreeMounts};
 
 /// How many checkpoints a `readdir` of `.vfs/history` lists (newest first).
 /// Older checkpoints stay reachable by lookup — listing is a courtesy, not the
@@ -180,19 +180,23 @@ where
     }
 }
 
-impl<Near, Far> ReadOnlyFeature for HistoryDir<Near, Far>
+impl<Near, Far> TreeBrowseFeature for HistoryDir<Near, Far>
 where
     Near: SyncByteBackend<CASHash> + Clone + 'static,
     Far: SyncByteBackend<CASHash> + Clone + 'static,
 {
-    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+    fn mounts(&self) -> &TreeMounts {
+        &self.mounts
+    }
+
+    fn lookup_own(&self, parent: InodeId, name: &OsStr) -> VfsResult<Option<Entry>> {
         if parent == self.slot.root_id() {
             if name == OsStr::new("id") {
-                return Ok(Entry::new(hist_dir_attr(self.id_dir())));
+                return Ok(Some(Entry::new(hist_dir_attr(self.id_dir()))));
             }
             if name == OsStr::new("head") {
                 let size = self.render_head()?.len() as u64;
-                return Ok(Entry::new(cp_file_attr(self.head_file(), size)));
+                return Ok(Some(Entry::new(cp_file_attr(self.head_file(), size))));
             }
             if name == OsStr::new("latest") {
                 // The merged view of the head checkpoint (delta over lower).
@@ -203,34 +207,37 @@ where
                     .head()
                     .map_err(history_error)?
                     .ok_or(VfsError::NotFound)?;
-                return self.snapshot_root_entry(head, true);
+                return self.snapshot_root_entry(head, true).map(Some);
             }
             return match self.resolve_time_name(name)? {
-                Some((event, relative)) => self.snapshot_root_entry(event, relative),
+                Some((event, relative)) => self.snapshot_root_entry(event, relative).map(Some),
                 None => Err(VfsError::NotFound),
             };
         }
         if parent == self.id_dir() {
             let text = name.to_str().ok_or(VfsError::NotFound)?;
             let event = EventId::from_str(text).map_err(|_| VfsError::NotFound)?;
-            return self.snapshot_root_entry(event, false);
+            return self.snapshot_root_entry(event, false).map(Some);
         }
-        // Snapshot-internal ids live in the portal's slice; the control
-        // plane never routes them here.
-        Err(VfsError::NotFound)
+        // Snapshot-internal ids live in the portal's slice; the control plane
+        // never routes them here.
+        Ok(None)
     }
 
-    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+    fn getattr_own(&self, inode_id: InodeId) -> VfsResult<Option<NodeAttr>> {
         if inode_id == self.slot.root_id() || inode_id == self.id_dir() {
-            return Ok(hist_dir_attr(inode_id));
+            return Ok(Some(hist_dir_attr(inode_id)));
         }
         if inode_id == self.head_file() {
-            return Ok(cp_file_attr(inode_id, self.render_head()?.len() as u64));
+            return Ok(Some(cp_file_attr(
+                inode_id,
+                self.render_head()?.len() as u64,
+            )));
         }
-        Err(VfsError::NotFound)
+        Ok(None)
     }
 
-    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+    fn readdir_own(&self, inode_id: InodeId) -> VfsResult<Option<Vec<DirEntry>>> {
         if inode_id == self.slot.root_id() {
             let mut entries = vec![
                 DirEntry::new(self.slot.root_id(), ".", NodeKind::Directory),
@@ -250,49 +257,70 @@ where
                     NodeKind::Directory,
                 ));
             }
-            return Ok(entries);
+            return Ok(Some(entries));
         }
         if inode_id == self.id_dir() {
             // Intentionally not listable: events are addressable by id only.
-            return Ok(vec![
+            return Ok(Some(vec![
                 DirEntry::new(self.id_dir(), ".", NodeKind::Directory),
                 DirEntry::new(self.slot.root_id(), "..", NodeKind::Directory),
-            ]);
+            ]));
         }
-        Err(VfsError::NotFound)
+        Ok(None)
     }
 
-    fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+    fn open_own(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>> {
         if request.inode_id == self.slot.root_id() || request.inode_id == self.id_dir() {
             return Err(VfsError::IsDirectory);
         }
         if request.inode_id == self.head_file() {
             // Content renders fresh per read; the handle carries no state.
-            return Ok(OpenedFile {
+            return Ok(Some(OpenedFile {
                 handle: FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed)),
                 direct_io: false,
                 keep_cache: false,
-            });
+            }));
         }
-        Err(VfsError::NotFound)
+        Ok(None)
+    }
+
+    fn read_own(&self, request: ReadRequest) -> VfsResult<Option<Vec<u8>>> {
+        if request.inode_id == self.head_file() {
+            let content = self.render_head()?;
+            return slice_bytes(&content, request.offset, request.size).map(Some);
+        }
+        Ok(None)
+    }
+}
+
+impl<Near, Far> ReadOnlyFeature for HistoryDir<Near, Far>
+where
+    Near: SyncByteBackend<CASHash> + Clone + 'static,
+    Far: SyncByteBackend<CASHash> + Clone + 'static,
+{
+    fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+        self.serve_lookup(parent, name)
+    }
+
+    fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        self.serve_getattr(inode_id)
+    }
+
+    fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        self.serve_readdir(inode_id)
+    }
+
+    fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+        self.serve_open(request)
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        if request.inode_id == self.head_file() {
-            let content = self.render_head()?;
-            return slice_bytes(&content, request.offset, request.size);
-        }
-        Err(VfsError::NotFound)
+        self.serve_read(request)
     }
 
-
-
-
-
-
-
-
-
+    fn release(&self, handle: FileHandle) -> VfsResult<()> {
+        self.serve_release(handle)
+    }
 }
 
 /// Attr for the fixed `.vfs/history` / `.vfs/history/id` directories.

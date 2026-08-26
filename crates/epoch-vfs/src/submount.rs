@@ -239,11 +239,6 @@ impl TreeMounts {
         }
     }
 
-    /// The underlying keyed sub-mount ops.
-    pub(crate) fn subs(&self) -> &SubMounts<TreeId> {
-        &self.subs
-    }
-
     /// Get-or-mount `root`, returning its remapped root [`Entry`].
     pub(crate) fn root_entry(&self, root: TreeId) -> VfsResult<Entry> {
         self.subs.mount(root, || (self.build)(root))?;
@@ -255,5 +250,134 @@ impl TreeMounts {
     pub(crate) fn root_id(&self, root: TreeId) -> VfsResult<InodeId> {
         self.subs.mount(root, || (self.build)(root))?;
         self.subs.synthetic_id(root, ROOT_INODE_ID)
+    }
+
+    /// `lookup` under a synthetic parent minted here, or `None` for a foreign
+    /// parent — so a feature's arm is one `if let` line. Same shape for the
+    /// other `try_*` ops below.
+    pub(crate) fn try_lookup(
+        &self,
+        parent: InodeId,
+        name: &OsStr,
+    ) -> VfsResult<Option<Entry>> {
+        match self.subs.local_of(parent)? {
+            Some((root, local)) => self.subs.lookup(root, local, name).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_getattr(&self, id: InodeId) -> VfsResult<Option<NodeAttr>> {
+        match self.subs.local_of(id)? {
+            Some((root, local)) => self.subs.getattr(root, local).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_readdir(&self, id: InodeId) -> VfsResult<Option<Vec<DirEntry>>> {
+        match self.subs.local_of(id)? {
+            Some((root, local)) => self.subs.readdir(root, local).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_open(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>> {
+        match self.subs.local_of(request.inode_id)? {
+            Some((root, local)) => self.subs.open(root, local, request).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_read(&self, request: ReadRequest) -> VfsResult<Option<Vec<u8>>> {
+        match self.subs.local_of(request.inode_id)? {
+            Some((root, local)) => self.subs.read(root, local, request).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Release a handle minted here (no-op for foreign handles).
+    pub(crate) fn release(&self, handle: FileHandle) -> VfsResult<()> {
+        self.subs.release(handle)
+    }
+}
+
+/// The narrow contract shared by the two **tree-browsing** features
+/// ([`CasObjectDir`](crate::CasObjectDir) and
+/// [`HistoryDir`](crate::HistoryDir)): implement only what is
+/// feature-specific — the fixed nodes and the name resolution — as `*_own`
+/// hooks, and the provided `serve_*` combinators supply the common shape:
+/// **own nodes first, then the shared [`TreeMounts`] table, else absent.**
+///
+/// Hook semantics: `Ok(Some(_))` = the id/name is yours and handled;
+/// `Ok(None)` = not yours, fall through to the mounts; `Err` = yours and
+/// failed (e.g. an unknown name under your root).
+pub(crate) trait TreeBrowseFeature: Send + Sync {
+    /// The shared tree-mount table this feature resolves into.
+    fn mounts(&self) -> &TreeMounts;
+
+    /// Resolve a name under one of this feature's own directories.
+    fn lookup_own(&self, parent: InodeId, name: &OsStr) -> VfsResult<Option<Entry>>;
+    /// Attrs of one of this feature's own nodes.
+    fn getattr_own(&self, inode_id: InodeId) -> VfsResult<Option<NodeAttr>>;
+    /// Listing of one of this feature's own directories.
+    fn readdir_own(&self, inode_id: InodeId) -> VfsResult<Option<Vec<DirEntry>>>;
+    /// Open one of this feature's own files.
+    fn open_own(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>>;
+    /// Read one of this feature's own files.
+    fn read_own(&self, request: ReadRequest) -> VfsResult<Option<Vec<u8>>>;
+    /// Drop one of this feature's own handles; `false` = not yours.
+    fn release_own(&self, _handle: FileHandle) -> VfsResult<bool> {
+        Ok(false)
+    }
+
+    /// Own nodes first, then sub-mount lookup.
+    fn serve_lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+        if let Some(entry) = self.lookup_own(parent, name)? {
+            return Ok(entry);
+        }
+        self.mounts().try_lookup(parent, name)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own nodes first, then sub-mount getattr.
+    fn serve_getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        if let Some(attr) = self.getattr_own(inode_id)? {
+            return Ok(attr);
+        }
+        self.mounts().try_getattr(inode_id)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own directories first, then sub-mount readdir.
+    fn serve_readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        if let Some(entries) = self.readdir_own(inode_id)? {
+            return Ok(entries);
+        }
+        self.mounts().try_readdir(inode_id)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own files first, then sub-mount open.
+    fn serve_open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+        if let Some(opened) = self.open_own(request)? {
+            return Ok(opened);
+        }
+        self.mounts().try_open(request)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own files first, then sub-mount read.
+    fn serve_read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+        if let Some(data) = self.read_own(request)? {
+            return Ok(data);
+        }
+        self.mounts().try_read(request)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own handles first, then sub-mount release.
+    fn serve_release(&self, handle: FileHandle) -> VfsResult<()> {
+        if self.release_own(handle)? {
+            return Ok(());
+        }
+        self.mounts().release(handle)
     }
 }

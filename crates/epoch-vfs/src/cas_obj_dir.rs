@@ -46,7 +46,7 @@ use epoch_vfs_api::{
 
 use crate::cas_vfs::CasVfs;
 use crate::feature::{FeatureSlot, ReadOnlyFeature, control_dir_attr, cp_file_attr};
-use crate::submount::TreeMounts;
+use crate::submount::{TreeBrowseFeature, TreeMounts};
 
 /// The `.vfs/cas` typed object portal. See the [module docs](self).
 pub struct CasObjectDir<Bk> {
@@ -190,86 +190,101 @@ where
     }
 }
 
+impl<Bk> TreeBrowseFeature for CasObjectDir<Bk>
+where
+    Bk: SyncByteBackend<CASHash> + Clone + 'static,
+{
+    fn mounts(&self) -> &TreeMounts {
+        &self.mounts
+    }
+
+    fn lookup_own(&self, parent: InodeId, name: &OsStr) -> VfsResult<Option<Entry>> {
+        if parent == self.slot.root_id() {
+            return self.resolve_hash(name).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn getattr_own(&self, inode_id: InodeId) -> VfsResult<Option<NodeAttr>> {
+        if inode_id == self.slot.root_id() {
+            return Ok(Some(control_dir_attr(inode_id)));
+        }
+        match self.blob_of(inode_id)? {
+            Some(blob) => self.blob_attr(inode_id, blob).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn readdir_own(&self, inode_id: InodeId) -> VfsResult<Option<Vec<DirEntry>>> {
+        if inode_id == self.slot.root_id() {
+            // Intentionally not listable: objects are addressable by hash only.
+            return Ok(Some(vec![
+                DirEntry::new(inode_id, OsString::from("."), NodeKind::Directory),
+                DirEntry::new(self.slot.vfs_dir_id, OsString::from(".."), NodeKind::Directory),
+            ]));
+        }
+        if self.blob_of(inode_id)?.is_some() {
+            return Err(VfsError::NotDirectory);
+        }
+        Ok(None)
+    }
+
+    fn open_own(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>> {
+        if request.inode_id == self.slot.root_id() {
+            return Err(VfsError::IsDirectory);
+        }
+        let Some(blob) = self.blob_of(request.inode_id)? else {
+            return Ok(None);
+        };
+        let handle = FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed));
+        self.blob_state_mut()?.handles.insert(handle, blob);
+        Ok(Some(OpenedFile {
+            handle,
+            direct_io: false,
+            keep_cache: true,
+        }))
+    }
+
+    fn read_own(&self, request: ReadRequest) -> VfsResult<Option<Vec<u8>>> {
+        let Some(blob) = self.blob_of(request.inode_id)? else {
+            return Ok(None);
+        };
+        self.files
+            .read_at(&blob, request.offset, request.size)
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|_| VfsError::NotFound)
+    }
+
+    fn release_own(&self, handle: FileHandle) -> VfsResult<bool> {
+        Ok(self.blob_state_mut()?.handles.remove(&handle).is_some())
+    }
+}
+
 impl<Bk> ReadOnlyFeature for CasObjectDir<Bk>
 where
     Bk: SyncByteBackend<CASHash> + Clone + 'static,
 {
     fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
-        if parent == self.slot.root_id() {
-            return self.resolve_hash(name);
-        }
-        let (root, local) = self.mounts.subs().local_of(parent)?.ok_or(VfsError::NotFound)?;
-        self.mounts.subs().lookup(root, local, name)
+        self.serve_lookup(parent, name)
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
-        if inode_id == self.slot.root_id() {
-            return Ok(control_dir_attr(inode_id));
-        }
-        if let Some((root, local)) = self.mounts.subs().local_of(inode_id)? {
-            return self.mounts.subs().getattr(root, local);
-        }
-        let blob = self.blob_of(inode_id)?.ok_or(VfsError::NotFound)?;
-        self.blob_attr(inode_id, blob)
+        self.serve_getattr(inode_id)
     }
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
-        if inode_id == self.slot.root_id() {
-            // Intentionally not listable: objects are addressable by hash only.
-            return Ok(vec![
-                DirEntry::new(inode_id, OsString::from("."), NodeKind::Directory),
-                DirEntry::new(self.slot.vfs_dir_id, OsString::from(".."), NodeKind::Directory),
-            ]);
-        }
-        if let Some((root, local)) = self.mounts.subs().local_of(inode_id)? {
-            return self.mounts.subs().readdir(root, local);
-        }
-        if self.blob_of(inode_id)?.is_some() {
-            return Err(VfsError::NotDirectory);
-        }
-        Err(VfsError::NotFound)
+        self.serve_readdir(inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        if request.inode_id == self.slot.root_id() {
-            return Err(VfsError::IsDirectory);
-        }
-        if let Some((root, local)) = self.mounts.subs().local_of(request.inode_id)? {
-            return self.mounts.subs().open(root, local, request);
-        }
-        let blob = self.blob_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
-        let handle = FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.blob_state_mut()?.handles.insert(handle, blob);
-        Ok(OpenedFile {
-            handle,
-            direct_io: false,
-            keep_cache: true,
-        })
+        self.serve_open(request)
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        if let Some((root, local)) = self.mounts.subs().local_of(request.inode_id)? {
-            return self.mounts.subs().read(root, local, request);
-        }
-        let blob = self.blob_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
-        self.files
-            .read_at(&blob, request.offset, request.size)
-            .map(|bytes| bytes.to_vec())
-            .map_err(|_| VfsError::NotFound)
+        self.serve_read(request)
     }
 
-
-
-
-
-
-
-
-
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
-        if self.blob_state_mut()?.handles.remove(&handle).is_some() {
-            return Ok(());
-        }
-        self.mounts.subs().release(handle)
+        self.serve_release(handle)
     }
 }
