@@ -1,0 +1,9 @@
+[package]
+name = "epoch-timeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+epoch-tree = { path = "../epoch-tree" }
+thiserror = "2"
