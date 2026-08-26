@@ -27,6 +27,8 @@
 
 mod closure;
 mod error;
+mod history;
 
 pub use closure::pending_closure;
 pub use error::HistoryError;
+pub use history::History;
