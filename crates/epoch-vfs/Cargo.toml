@@ -9,6 +9,7 @@ epoch-worktree = { path = "../epoch-worktree" }
 epoch-cas = { path = "../epoch-cas" }
 epoch-history = { path = "../epoch-history" }
 epoch-timeline = { path = "../epoch-timeline" }
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

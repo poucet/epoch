@@ -1,4 +1,10 @@
-use std::{env, ffi::OsString, fs, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use epoch_cas::{CachingByteBackend, MemoryByteBackend, TieredByteBackend};
 use epoch_cas_moka::MokaByteBackend;
@@ -6,9 +12,10 @@ use epoch_cas_redb::RedbByteBackend;
 use epoch_fuse::fuser_adapter::mount_spike;
 use epoch_history::{CheckpointPolicy, History, Scheduler};
 use epoch_timeline_redb::RedbTimelineStore;
+use epoch_vfs::router::EPOCHIGNORE_FILE;
 use epoch_vfs::{
     overlay_probe, CasEchoDir, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugDir, DebugStats,
-    HistoryDir, PassthroughVfs, SignalVfs,
+    HistoryDir, PassthroughVfs, RouterVfs, SignalVfs,
 };
 use epoch_vfs_api::VfsService;
 
@@ -56,26 +63,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return mount_durable(mountpoint, state_dir, lower_dir, head, hard_fsync);
         }
 
-        let live: Arc<CasVfs<MemoryByteBackend>> = match lower_dir {
+        let (live, lower_path): (Arc<CasVfs<MemoryByteBackend>>, Option<PathBuf>) = match lower_dir
+        {
             Some(lower_dir) => {
                 let lower_dir = fs::canonicalize(lower_dir)?;
                 eprintln!(
                     "[epoch-fuse] mounting copy-on-write CAS overlay lower={lower_dir:?} mountpoint={mountpoint:?}"
                 );
-                let lower: Arc<dyn VfsService> = Arc::new(PassthroughVfs::new(lower_dir));
-                Arc::new(CasVfs::overlay(MemoryByteBackend::new(), lower))
+                let lower: Arc<dyn VfsService> = Arc::new(PassthroughVfs::new(lower_dir.clone()));
+                (
+                    Arc::new(CasVfs::overlay(MemoryByteBackend::new(), lower)),
+                    Some(lower_dir),
+                )
             }
             None => {
                 eprintln!(
                     "[epoch-fuse] mounting empty in-memory CAS filesystem mountpoint={mountpoint:?}"
                 );
-                Arc::new(CasVfs::in_memory())
+                (Arc::new(CasVfs::in_memory()), None)
             }
         };
         // Graft `.vfs` on so `.vfs/debug` serves the live tree's statistics.
         let debug: Arc<dyn DebugStats> = live.clone();
+        let overlay: Arc<dyn VfsService> = live.clone();
+        let inner = match &lower_path {
+            Some(lower_dir) => route_ignored(overlay, lower_dir)?,
+            None => overlay,
+        };
         let vfs = Arc::new(
-            ControlPlaneVfs::new(live)
+            ControlPlaneVfs::new(inner)
                 .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
                 .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
         );
@@ -117,10 +133,10 @@ fn mount_durable(
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&state_dir)?;
     let db_path = state_dir.join("epoch.redb");
-    let lower: Option<Arc<dyn VfsService>> = match lower_dir {
-        Some(dir) => Some(Arc::new(PassthroughVfs::new(fs::canonicalize(dir)?))),
-        None => None,
-    };
+    let lower_path: Option<PathBuf> = lower_dir.map(fs::canonicalize).transpose()?;
+    let lower: Option<Arc<dyn VfsService>> = lower_path
+        .as_ref()
+        .map(|dir| -> Arc<dyn VfsService> { Arc::new(PassthroughVfs::new(dir.clone())) });
     eprintln!(
         "[epoch-fuse] mounting durable CAS filesystem state={db_path:?} head={head} overlay={} hard_fsync={hard_fsync} mountpoint={mountpoint:?}",
         lower.is_some(),
@@ -173,8 +189,14 @@ fn mount_durable(
     let debug: Arc<dyn DebugStats> = live.clone();
     let signaled: Arc<dyn VfsService> =
         Arc::new(SignalVfs::new(live, scheduler.handle(), hard_fsync));
+    // The router wraps SignalVfs(CasVfs): routed traffic bypasses the overlay
+    // *and* never emits checkpoint trigger signals.
+    let inner = match &lower_path {
+        Some(lower_dir) => route_ignored(signaled, lower_dir)?,
+        None => signaled,
+    };
     let vfs = Arc::new(
-        ControlPlaneVfs::new(signaled)
+        ControlPlaneVfs::new(inner)
             .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
             .with_feature("history", move |slot| {
                 Arc::new(HistoryDir::new(history, slot, lower))
@@ -186,4 +208,25 @@ fn mount_durable(
     // Unmounted: dropping the scheduler runs a final checkpoint if needed.
     drop(scheduler);
     Ok(())
+}
+
+/// Wrap `overlay` in a [`RouterVfs`] when `<lower_dir>/.epochignore` exists:
+/// rule-matching subtrees then bypass the overlay entirely — reads and writes
+/// go straight to the lower host directory (via a writable
+/// [`PassthroughVfs`]) and are never captured into CAS/checkpoints. Without
+/// the file, the stack is returned unchanged.
+fn route_ignored(
+    overlay: Arc<dyn VfsService>,
+    lower_dir: &Path,
+) -> Result<Arc<dyn VfsService>, Box<dyn std::error::Error>> {
+    if !lower_dir.join(EPOCHIGNORE_FILE).is_file() {
+        return Ok(overlay);
+    }
+    let rules = RouterVfs::load_rules(lower_dir)?;
+    eprintln!(
+        "[epoch-fuse] {EPOCHIGNORE_FILE}: {} rule(s) route straight to the lower directory",
+        rules.num_ignores() + rules.num_whitelists()
+    );
+    let passthrough: Arc<dyn VfsService> = Arc::new(PassthroughVfs::writable(lower_dir));
+    Ok(Arc::new(RouterVfs::new(overlay, passthrough, rules)))
 }

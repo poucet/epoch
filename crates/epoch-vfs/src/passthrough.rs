@@ -6,15 +6,22 @@
 //! `open`, `read`) by stat-ing and reading the corresponding lower file. It does
 //! no logging and knows nothing about any synthetic control plane.
 //!
-//! It is intentionally read-only: every mutation (`write`, `create`, `mkdir`,
-//! `unlink`, `rmdir`) returns [`VfsError::ReadOnlyFilesystem`]. Those returns
-//! mark the seams where a future upper (writable CAS / session) layer will
-//! attach as another decorator above this one.
+//! By default it is read-only: every mutation (`write`, `create`, `mkdir`,
+//! `unlink`, `rmdir`, `truncate`) returns [`VfsError::ReadOnlyFilesystem`].
+//! Those returns mark the seams where an upper (writable CAS / session) layer
+//! attaches as another decorator above this one.
+//!
+//! [`PassthroughVfs::writable`] flips the service into direct-write mode: the
+//! same inode/handle bookkeeping, but mutations apply straight to the lower
+//! directory with `std::fs`. This is the "scratchpad" half of the
+//! [`RouterVfs`](crate::RouterVfs) pair — subtrees that bypass the overlay
+//! read *and write* the host directory directly.
 
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{self, Metadata},
+    io::{Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         RwLock,
@@ -33,9 +40,18 @@ use epoch_vfs_api::{
 #[derive(Debug)]
 pub struct PassthroughVfs {
     lower_root: PathBuf,
+    writable: bool,
     state: RwLock<PathState>,
     next_node_id: AtomicU64,
     next_handle: AtomicU64,
+}
+
+/// Per-handle open state: which lower path the handle addresses and whether it
+/// was opened in append mode (append writes ignore the request offset).
+#[derive(Debug, Clone)]
+struct OpenState {
+    path: PathBuf,
+    append: bool,
 }
 
 /// Bidirectional [`InodeId`]/[`FileHandle`] ↔ relative-path bookkeeping.
@@ -43,7 +59,7 @@ pub struct PassthroughVfs {
 struct PathState {
     path_by_id: HashMap<InodeId, PathBuf>,
     id_by_path: HashMap<PathBuf, InodeId>,
-    path_by_handle: HashMap<FileHandle, PathBuf>,
+    handles: HashMap<FileHandle, OpenState>,
 }
 
 impl PassthroughVfs {
@@ -55,13 +71,33 @@ impl PassthroughVfs {
         let root = PathBuf::new();
         Self {
             lower_root: lower_root.into(),
+            writable: false,
             state: RwLock::new(PathState {
                 path_by_id: HashMap::from([(ROOT_INODE_ID, root.clone())]),
                 id_by_path: HashMap::from([(root, ROOT_INODE_ID)]),
-                path_by_handle: HashMap::new(),
+                handles: HashMap::new(),
             }),
             next_node_id: AtomicU64::new(ROOT_INODE_ID.0 + 1),
             next_handle: AtomicU64::new(1),
+        }
+    }
+
+    /// Like [`new`](Self::new), but mutations (`create`, `write`, `mkdir`,
+    /// `unlink`, `rmdir`, `truncate`, and writable/truncating/appending
+    /// `open`s) apply directly to the lower directory instead of returning
+    /// [`VfsError::ReadOnlyFilesystem`].
+    pub fn writable(lower_root: impl Into<PathBuf>) -> Self {
+        Self {
+            writable: true,
+            ..Self::new(lower_root)
+        }
+    }
+
+    fn require_writable(&self) -> VfsResult<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(VfsError::ReadOnlyFilesystem)
         }
     }
 
@@ -104,15 +140,83 @@ impl PassthroughVfs {
         ))
     }
 
-    fn open_handle(&self, relative: PathBuf) -> VfsResult<OpenedFile> {
+    fn open_handle(&self, relative: PathBuf, append: bool) -> VfsResult<OpenedFile> {
         let mut state = self.write_state()?;
         let handle = FileHandle(self.next_handle.fetch_add(1, Ordering::Relaxed));
-        state.path_by_handle.insert(handle, relative);
+        state.handles.insert(
+            handle,
+            OpenState {
+                path: relative,
+                append,
+            },
+        );
         Ok(OpenedFile {
             handle,
             direct_io: false,
             keep_cache: false,
         })
+    }
+
+    /// Resolve the lower path a request addresses: the handle's recorded path
+    /// when known, the inode's otherwise. The bool is the handle's append flag.
+    fn path_for_request(&self, inode_id: InodeId, handle: FileHandle) -> VfsResult<(PathBuf, bool)> {
+        let state = self.read_state()?;
+        if let Some(open) = state.handles.get(&handle) {
+            return Ok((open.path.clone(), open.append));
+        }
+        state
+            .path_by_id
+            .get(&inode_id)
+            .cloned()
+            .map(|path| (path, false))
+            .ok_or(VfsError::NotFound)
+    }
+
+    /// Forget the id ↔ path mapping of a deleted node so a later node reusing
+    /// the name mints a fresh identity.
+    fn drop_path(&self, relative: &Path) -> VfsResult<()> {
+        let mut state = self.write_state()?;
+        if let Some(inode_id) = state.id_by_path.remove(relative) {
+            state.path_by_id.remove(&inode_id);
+        }
+        Ok(())
+    }
+
+    /// Apply `mode`'s permission bits to the freshly-created `lower` node.
+    fn apply_mode(lower: &Path, mode: u32) -> VfsResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(lower, fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(map_io_error)?;
+        }
+        #[cfg(not(unix))]
+        let _ = (lower, mode);
+        Ok(())
+    }
+
+    /// Shared mutation path of `create`/`mkdir`: make the node on the host,
+    /// apply the mode, and return its entry.
+    fn create_node(&self, request: &CreateRequest) -> VfsResult<(PathBuf, Entry)> {
+        self.require_writable()?;
+        let parent_path = self.path_for_node(request.parent)?;
+        let child = child_path(&parent_path, &request.name)?;
+        let lower = self.lower_path(&child);
+        match request.kind {
+            NodeKind::RegularFile => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lower)
+                    .map_err(map_io_error)?;
+            }
+            NodeKind::Directory => fs::create_dir(&lower).map_err(map_io_error)?,
+            NodeKind::Symlink => return Err(VfsError::Unsupported("create symlink")),
+        }
+        Self::apply_mode(&lower, request.mode)?;
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
+        let attr = attr_from_metadata(self.id_for_path(&child)?, &metadata);
+        Ok((child, Entry::new(attr)))
     }
 
     /// Build the leading `.`/`..` entries shared by every directory listing.
@@ -167,69 +271,123 @@ impl VfsService for PassthroughVfs {
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
-        if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
+        if !self.writable && (request.mode != OpenMode::ReadOnly || request.truncate || request.append)
+        {
             return Err(VfsError::ReadOnlyFilesystem);
         }
 
         let path = self.path_for_node(request.inode_id)?;
-        let metadata = fs::symlink_metadata(self.lower_path(&path)).map_err(map_io_error)?;
+        let lower = self.lower_path(&path);
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
         if metadata.is_dir() {
             return Err(VfsError::IsDirectory);
         }
 
-        self.open_handle(path)
+        if request.truncate {
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&lower)
+                .map_err(map_io_error)?;
+        }
+
+        self.open_handle(path, request.append)
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        let path = {
-            let state = self.read_state()?;
-            state
-                .path_by_handle
-                .get(&request.handle)
-                .cloned()
-                .or_else(|| state.path_by_id.get(&request.inode_id).cloned())
-                .ok_or(VfsError::NotFound)?
-        };
+        let (path, _) = self.path_for_request(request.inode_id, request.handle)?;
         let data = fs::read(self.lower_path(&path)).map_err(map_io_error)?;
         slice_bytes(&data, request.offset, request.size)
     }
 
-    fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn write(&self, request: WriteRequest<'_>) -> VfsResult<u32> {
+        self.require_writable()?;
+        let (path, append) = self.path_for_request(request.inode_id, request.handle)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true);
+        if append {
+            options.append(true);
+        }
+        let mut file = options.open(self.lower_path(&path)).map_err(map_io_error)?;
+        if !append {
+            file.seek(SeekFrom::Start(request.offset)).map_err(map_io_error)?;
+        }
+        file.write_all(request.data).map_err(map_io_error)?;
+        u32::try_from(request.data.len())
+            .map_err(|_| VfsError::InvalidInput("write larger than u32".to_owned()))
     }
 
-    fn create(&self, _request: CreateRequest) -> VfsResult<CreatedNode> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn create(&self, request: CreateRequest) -> VfsResult<CreatedNode> {
+        let (child, entry) = self.create_node(&request)?;
+        let opened = match request.kind {
+            NodeKind::RegularFile => Some(self.open_handle(child, false)?),
+            _ => None,
+        };
+        Ok(CreatedNode { entry, opened })
     }
 
-    fn mkdir(&self, _request: CreateRequest) -> VfsResult<Entry> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry> {
+        if request.kind != NodeKind::Directory {
+            return Err(VfsError::InvalidInput("mkdir of a non-directory".to_owned()));
+        }
+        Ok(self.create_node(&request)?.1)
     }
 
-    fn unlink(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
+        self.require_writable()?;
+        let parent_path = self.path_for_node(parent)?;
+        let child = child_path(&parent_path, name)?;
+        let lower = self.lower_path(&child);
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
+        if metadata.is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+        fs::remove_file(lower).map_err(map_io_error)?;
+        self.drop_path(&child)
     }
 
-    fn rmdir(&self, _parent: InodeId, _name: &OsStr) -> VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
+        self.require_writable()?;
+        let parent_path = self.path_for_node(parent)?;
+        let child = child_path(&parent_path, name)?;
+        fs::remove_dir(self.lower_path(&child)).map_err(map_io_error)?;
+        self.drop_path(&child)
     }
 
-    fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
-        Err(VfsError::ReadOnlyFilesystem)
+    fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
+        self.require_writable()?;
+        let path = self.path_for_node(inode_id)?;
+        let lower = self.lower_path(&path);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&lower)
+            .map_err(map_io_error)?;
+        file.set_len(size).map_err(map_io_error)?;
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
+        Ok(attr_from_metadata(inode_id, &metadata))
     }
 
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }
 
-    fn fsync(&self, _inode_id: InodeId, _handle: FileHandle, _datasync: bool) -> VfsResult<()> {
-        // Read-only view: nothing of ours to make durable.
-        Ok(())
+    fn fsync(&self, inode_id: InodeId, handle: FileHandle, datasync: bool) -> VfsResult<()> {
+        if !self.writable {
+            // Read-only view: nothing of ours to make durable.
+            return Ok(());
+        }
+        let (path, _) = self.path_for_request(inode_id, handle)?;
+        let file = fs::File::open(self.lower_path(&path)).map_err(map_io_error)?;
+        if datasync {
+            file.sync_data().map_err(map_io_error)
+        } else {
+            file.sync_all().map_err(map_io_error)
+        }
     }
 
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
         let mut state = self.write_state()?;
-        state.path_by_handle.remove(&handle);
+        state.handles.remove(&handle);
         Ok(())
     }
 }
@@ -346,6 +504,7 @@ fn map_io_error(error: std::io::Error) -> VfsError {
         std::io::ErrorKind::NotFound => VfsError::NotFound,
         std::io::ErrorKind::AlreadyExists => VfsError::AlreadyExists,
         std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied,
+        std::io::ErrorKind::DirectoryNotEmpty => VfsError::DirectoryNotEmpty,
         std::io::ErrorKind::InvalidInput => VfsError::InvalidInput(error.to_string()),
         _ => VfsError::Io(error.to_string()),
     }
@@ -407,6 +566,56 @@ mod tests {
         assert_eq!(data, b"hello world");
 
         vfs.release(opened.handle).expect("release");
+    }
+
+    #[test]
+    fn writable_mode_mutates_the_host_directory() {
+        let dir = TempDir::new("passthrough-rw");
+        let vfs = PassthroughVfs::writable(dir.path());
+
+        // mkdir + create + write land on the host.
+        vfs.mkdir(CreateRequest::directory(ROOT_INODE_ID, "sub", 0o755))
+            .expect("mkdir");
+        assert!(dir.path().join("sub").is_dir());
+
+        let created = vfs
+            .create(CreateRequest::file(ROOT_INODE_ID, "out.txt", 0o644))
+            .expect("create");
+        let node = created.entry.attr.inode_id;
+        let handle = created.opened.expect("created file opens").handle;
+        vfs.write(WriteRequest {
+            inode_id: node,
+            handle,
+            offset: 0,
+            data: b"hello",
+        })
+        .expect("write");
+        vfs.release(handle).expect("release");
+        assert_eq!(fs::read(dir.path().join("out.txt")).unwrap(), b"hello");
+
+        // truncate shrinks the host file.
+        let attr = vfs.truncate(node, 2).expect("truncate");
+        assert_eq!(attr.size, 2);
+        assert_eq!(fs::read(dir.path().join("out.txt")).unwrap(), b"he");
+
+        // open with truncate empties it.
+        let opened = vfs
+            .open(OpenRequest {
+                inode_id: node,
+                mode: OpenMode::ReadWrite,
+                truncate: true,
+                append: false,
+            })
+            .expect("open truncate");
+        vfs.release(opened.handle).expect("release");
+        assert_eq!(fs::read(dir.path().join("out.txt")).unwrap(), b"");
+
+        // unlink / rmdir remove host nodes and their id mappings.
+        vfs.unlink(ROOT_INODE_ID, OsStr::new("out.txt")).expect("unlink");
+        assert!(!dir.path().join("out.txt").exists());
+        assert_eq!(vfs.getattr(node), Err(VfsError::NotFound));
+        vfs.rmdir(ROOT_INODE_ID, OsStr::new("sub")).expect("rmdir");
+        assert!(!dir.path().join("sub").exists());
     }
 
     #[test]

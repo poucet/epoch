@@ -34,6 +34,7 @@ pub mod feature;
 pub mod history_dir;
 pub mod logging;
 pub mod passthrough;
+pub mod router;
 pub mod signal;
 
 #[cfg(test)]
@@ -47,6 +48,7 @@ pub use debug::{DebugSnapshot, DebugStats, NearCount};
 pub use debug_dir::DebugDir;
 pub use feature::{FEATURE_RANGE, FeatureSlot};
 pub use history_dir::HistoryDir;
+pub use router::RouterVfs;
 pub use signal::SignalVfs;
 pub use logging::LoggingVfs;
 pub use passthrough::PassthroughVfs;
