@@ -33,7 +33,27 @@ fn fixture() -> Fixture {
         "main",
     ));
     let vfs_dir_id = InodeId(CP_BASE);
-    let hist_dir = Arc::new(HistoryDir::new(Arc::clone(&history), vfs_dir_id));
+    let hist_dir = Arc::new(HistoryDir::new(Arc::clone(&history), vfs_dir_id, None));
+    let cp = ControlPlaneVfs::with_history(live.clone(), hist_dir);
+    Fixture { live, history, cp }
+}
+
+/// An overlay fixture: the live tree overlays `lower_dir` (a host directory
+/// served by `PassthroughVfs`), and snapshots rehydrate deltas over it.
+fn overlay_fixture(lower_dir: &std::path::Path) -> Fixture {
+    let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
+    let lower: Arc<dyn VfsService> = Arc::new(epoch_vfs::PassthroughVfs::new(lower_dir));
+    let live = Arc::new(CasVfs::overlay(tier.clone(), Arc::clone(&lower)));
+    let history = Arc::new(History::new(
+        tier,
+        Arc::new(MemoryTimelineStore::new()),
+        "main",
+    ));
+    let hist_dir = Arc::new(HistoryDir::new(
+        Arc::clone(&history),
+        InodeId(CP_BASE),
+        Some(lower),
+    ));
     let cp = ControlPlaneVfs::with_history(live.clone(), hist_dir);
     Fixture { live, history, cp }
 }
@@ -246,6 +266,45 @@ fn snapshots_are_read_only_and_ids_never_collide() {
     for entry in f.cp.readdir(s1).unwrap() {
         assert!(entry.inode_id.0 >= CP_BASE, "no leaked local id: {entry:?}");
     }
+}
+
+#[test]
+fn overlay_checkpoints_record_deltas_and_snapshots_rehydrate_over_lower() {
+    let lower = tempfile::tempdir().unwrap();
+    std::fs::write(lower.path().join("base.txt"), b"from lower").unwrap();
+    std::fs::write(lower.path().join("doomed.txt"), b"soon gone").unwrap();
+    let f = overlay_fixture(lower.path());
+
+    // Checkpoint 1: copy up one new file. Checkpoint 2: delete a lower file
+    // (a tombstone in the delta).
+    write_and_checkpoint(&f, "ours.txt", b"overlay v1", 1_000);
+    f.live.unlink(ROOT_INODE_ID, OsStr::new("doomed.txt")).unwrap();
+    let root = f.live.seal().unwrap();
+    f.history.commit_root_at(root, 2_000, None).unwrap().unwrap();
+
+    let hist = history_dir_id(&f.cp);
+    let s1 = f.cp.lookup(hist, OsStr::new("1000")).unwrap().attr.inode_id;
+    let s2 = f.cp.lookup(hist, OsStr::new("2000")).unwrap().attr.inode_id;
+
+    // Snapshot 1: overlay content + lower fall-through, doomed still visible.
+    assert_eq!(read_all(&f.cp, s1, "ours.txt").unwrap(), b"overlay v1");
+    assert_eq!(read_all(&f.cp, s1, "base.txt").unwrap(), b"from lower");
+    assert_eq!(read_all(&f.cp, s1, "doomed.txt").unwrap(), b"soon gone");
+
+    // Snapshot 2: the tombstone hides the lower file.
+    assert!(matches!(
+        f.cp.lookup(s2, OsStr::new("doomed.txt")),
+        Err(VfsError::NotFound)
+    ));
+    assert_eq!(read_all(&f.cp, s2, "base.txt").unwrap(), b"from lower");
+
+    // The delta closure is fully CAS-owned: lower content was never promoted.
+    // (base.txt reads through the snapshot come from the lower service.)
+    // Snapshots stay read-only even for fall-through names.
+    assert!(matches!(
+        f.cp.unlink(s1, OsStr::new("base.txt")),
+        Err(VfsError::ReadOnlyFilesystem)
+    ));
 }
 
 #[test]

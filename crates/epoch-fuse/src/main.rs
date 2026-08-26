@@ -16,8 +16,9 @@ const USAGE: &str = "usage:
   epoch-fuse <lower-dir> <mountpoint>         read-through overlay probe
   epoch-fuse cas <mountpoint> [<lower-dir>]   copy-on-write CAS filesystem
                                               (empty in-memory, or overlaying <lower-dir>)
-  epoch-fuse cas <mountpoint> --state <dir>   durable, checkpointed CAS filesystem
-        [--head <name>] [--hard-fsync]        (resumes from <name>'s last checkpoint;
+  epoch-fuse cas <mountpoint> --state <dir>   durable, checkpointed CAS filesystem,
+        [<lower-dir>] [--head <name>]         standalone or overlaying <lower-dir>
+        [--hard-fsync]                        (resumes from <name>'s last checkpoint;
                                               time-travel under .vfs/history)";
 
 /// The moka read-cache in front of redb (bytes).
@@ -52,12 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lower_dir = positional.next();
 
         if let Some(state_dir) = state_dir {
-            // Checkpointing is CAS-native only (no OpaqueTree yet), so a lower
-            // overlay cannot be made durable — refuse the combination.
-            if lower_dir.is_some() {
-                return Err("--state cannot be combined with a <lower-dir>".into());
-            }
-            return mount_durable(mountpoint, state_dir, head, hard_fsync);
+            return mount_durable(mountpoint, state_dir, lower_dir, head, hard_fsync);
         }
 
         let vfs: Arc<dyn VfsService> = match lower_dir {
@@ -98,16 +94,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///                               Caching< Moka LRU, Redb > >  ← one epoch.redb
 ///                                                              (objects + timeline)
 /// ```
+///
+/// With a `lower`, the live tree is a copy-on-write overlay and every
+/// checkpoint records the **sparse delta** (copied-up content and tombstones —
+/// fully CAS-owned). Time-travel snapshots rehydrate a checkpoint's delta over
+/// the *current* lower: exact for everything the overlay touched, but
+/// untouched fall-through paths track lower drift until `OpaqueTree` ingestion
+/// makes checkpoints fully self-contained.
 fn mount_durable(
     mountpoint: OsString,
     state_dir: PathBuf,
+    lower_dir: Option<OsString>,
     head: String,
     hard_fsync: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&state_dir)?;
     let db_path = state_dir.join("epoch.redb");
+    let lower: Option<Arc<dyn VfsService>> = match lower_dir {
+        Some(dir) => Some(Arc::new(PassthroughVfs::new(fs::canonicalize(dir)?))),
+        None => None,
+    };
     eprintln!(
-        "[epoch-fuse] mounting durable CAS filesystem state={db_path:?} head={head} hard_fsync={hard_fsync} mountpoint={mountpoint:?}"
+        "[epoch-fuse] mounting durable CAS filesystem state={db_path:?} head={head} overlay={} hard_fsync={hard_fsync} mountpoint={mountpoint:?}",
+        lower.is_some(),
     );
 
     // One shared database hosts the object table and the timeline tables.
@@ -119,7 +128,8 @@ fn mount_durable(
 
     let history = Arc::new(History::new(tier.clone(), timeline, head));
 
-    // Resume from the head's last checkpoint, or start empty.
+    // Resume from the head's last checkpoint, or start fresh. An overlay mount
+    // resumes its sparse delta over the lower; a standalone one its full root.
     let live = match history.head()? {
         Some(id) => {
             let event = history
@@ -129,9 +139,19 @@ fn mount_durable(
                 "[epoch-fuse] resuming from checkpoint {id} (t={}ms)",
                 event.timestamp_ms
             );
-            Arc::new(CasVfs::from_root(tier.clone(), event.root)?)
+            match &lower {
+                Some(lower) => Arc::new(CasVfs::from_overlay(
+                    tier.clone(),
+                    Arc::clone(lower),
+                    event.root,
+                )?),
+                None => Arc::new(CasVfs::from_root(tier.clone(), event.root)?),
+            }
         }
-        None => Arc::new(CasVfs::new(tier.clone())),
+        None => match &lower {
+            Some(lower) => Arc::new(CasVfs::overlay(tier.clone(), Arc::clone(lower))),
+            None => Arc::new(CasVfs::new(tier.clone())),
+        },
     };
 
     let checkpointed = CheckpointedFs::new(Arc::clone(&live), Arc::clone(&history));
@@ -144,7 +164,7 @@ fn mount_durable(
     // `.vfs/*` reads never feed the trigger).
     let signaled: Arc<dyn VfsService> =
         Arc::new(SignalVfs::new(live, scheduler.handle(), hard_fsync));
-    let history_dir = Arc::new(HistoryDir::new(history, InodeId(CP_BASE)));
+    let history_dir = Arc::new(HistoryDir::new(history, InodeId(CP_BASE), lower));
     let vfs = Arc::new(ControlPlaneVfs::with_history(signaled, history_dir));
 
     mount_spike(mountpoint, vfs)?;

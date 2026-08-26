@@ -83,6 +83,13 @@ pub struct HistoryDir<Near, Far> {
     history: Arc<History<Near, Far>>,
     /// The inode id `..` of `.vfs/history` reports (the `.vfs` dir).
     parent_id: InodeId,
+    /// The overlay's lower filesystem, when the mount is an overlay. Each
+    /// snapshot rehydrates its checkpointed **delta** over this lower, so a
+    /// historical view is "the overlay state as of the checkpoint, over the
+    /// lower as it is *now*" — faithful for the CAS-owned delta, but subject
+    /// to lower drift until `OpaqueTree` ingestion makes checkpoints fully
+    /// self-contained.
+    lower: Option<Arc<dyn VfsService>>,
     state: RwLock<HistState<Far>>,
     next_id: AtomicU64,
 }
@@ -115,10 +122,17 @@ where
     Far: SyncByteBackend<CASHash> + Clone + 'static,
 {
     /// Build over the mount's [`History`], reporting `parent_id` as `..`.
-    pub fn new(history: Arc<History<Near, Far>>, parent_id: InodeId) -> Self {
+    /// Pass the overlay's `lower` when the mount overlays one — checkpointed
+    /// roots are then sparse deltas and snapshots rehydrate over it.
+    pub fn new(
+        history: Arc<History<Near, Far>>,
+        parent_id: InodeId,
+        lower: Option<Arc<dyn VfsService>>,
+    ) -> Self {
         Self {
             history,
             parent_id,
+            lower,
             state: RwLock::new(HistState::default()),
             next_id: AtomicU64::new(FIRST_DYNAMIC),
         }
@@ -168,10 +182,15 @@ where
             .event(&event)
             .map_err(history_error)?
             .ok_or(VfsError::NotFound)?;
-        let vfs = Arc::new(
-            CasVfs::from_root(self.history.far().clone(), record.root)
-                .map_err(|_| VfsError::Other("snapshot root unreadable".to_owned()))?,
-        );
+        let far = self.history.far().clone();
+        let vfs = match &self.lower {
+            // Overlay mount: the checkpointed root is a sparse delta —
+            // rehydrate it over the (shared) lower.
+            Some(lower) => CasVfs::from_overlay(far, Arc::clone(lower), record.root),
+            None => CasVfs::from_root(far, record.root),
+        }
+        .map(Arc::new)
+        .map_err(|_| VfsError::Other("snapshot root unreadable".to_owned()))?;
         let mut state = self.write_state()?;
         // Another thread may have raced us here; keep whichever landed first
         // so every caller shares one instance.
