@@ -34,6 +34,7 @@ use std::{
     },
 };
 
+use epoch_tree::TreeId;
 use epoch_vfs_api::{
     DirEntry, Entry, FileHandle, InodeId, NodeAttr, OpenMode, OpenRequest, OpenedFile,
     ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
@@ -206,5 +207,53 @@ where
             Some((key, local_handle)) => self.mounted(key)?.release(local_handle),
             None => Ok(()),
         }
+    }
+}
+
+/// The **shared tree-mount table**: read-only filesystems keyed by root
+/// [`TreeId`], one instance per root no matter who asked.
+///
+/// Both `.vfs/cas/<tree-hash>` and every `.vfs/history` snapshot are the same
+/// thing — the main [`CasVfs`](crate::CasVfs) machinery hydrated from a root
+/// `TreeId` (over the mount's lower, when it has one). This table makes them
+/// literally share: the history feature *resolves* a time/event name to a
+/// root and hands out entries from here, so browsing a checkpoint through
+/// history and through the portal yields the same instance and the same
+/// synthetic inode ids (minted in the owning feature's slice, which is where
+/// the control plane routes every operation on them).
+pub struct TreeMounts {
+    /// Builds the filesystem for a root (captures backend + optional lower).
+    build: Box<dyn Fn(TreeId) -> VfsResult<Arc<dyn VfsService>> + Send + Sync>,
+    subs: SubMounts<TreeId>,
+}
+
+impl TreeMounts {
+    /// Build over the owning feature's allocator and a per-root constructor.
+    pub(crate) fn new(
+        next_id: Arc<AtomicU64>,
+        build: impl Fn(TreeId) -> VfsResult<Arc<dyn VfsService>> + Send + Sync + 'static,
+    ) -> TreeMounts {
+        TreeMounts {
+            build: Box::new(build),
+            subs: SubMounts::new(next_id),
+        }
+    }
+
+    /// The underlying keyed sub-mount ops.
+    pub(crate) fn subs(&self) -> &SubMounts<TreeId> {
+        &self.subs
+    }
+
+    /// Get-or-mount `root`, returning its remapped root [`Entry`].
+    pub(crate) fn root_entry(&self, root: TreeId) -> VfsResult<Entry> {
+        self.subs.mount(root, || (self.build)(root))?;
+        self.subs.root_entry(root)
+    }
+
+    /// Get-or-mount `root`, returning the stable synthetic id of its root
+    /// directory (for `readdir` listings).
+    pub(crate) fn root_id(&self, root: TreeId) -> VfsResult<InodeId> {
+        self.subs.mount(root, || (self.build)(root))?;
+        self.subs.synthetic_id(root, ROOT_INODE_ID)
     }
 }

@@ -23,8 +23,9 @@
 //!   enumerable). Listing `.vfs/history` shows the newest checkpoints (up to
 //!   [`LIST_LIMIT`]) by their millisecond names.
 //!
-//! Each resolved checkpoint lazily instantiates a [`CasVfs`] over the **far
-//! (durable) tier only** — snapshots never see staged, un-checkpointed state.
+//! Each resolved checkpoint resolves to its root `TreeId` in the **shared**
+//! [`TreeMounts`] table owned by the `.vfs/cas` portal — the same instance and
+//! id space whether a tree is reached by time, by event id, or by hash.
 //!
 //! ## Id remapping (the correctness crux)
 //!
@@ -58,9 +59,8 @@ use epoch_vfs_api::{
     OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
 };
 
-use crate::cas_vfs::CasVfs;
 use crate::feature::{FeatureSlot, cp_file_attr, slice_bytes};
-use crate::submount::SubMounts;
+use crate::submount::TreeMounts;
 
 /// How many checkpoints a `readdir` of `.vfs/history` lists (newest first).
 /// Older checkpoints stay reachable by lookup — listing is a courtesy, not the
@@ -75,17 +75,14 @@ pub struct HistoryDir<Near, Far> {
     /// subdirectory, `slot.base + 2` the `head` file, and dynamic snapshot
     /// ids/handles are minted from `slot.base + 3` upward.
     slot: FeatureSlot,
-    /// The overlay's lower filesystem, when the mount is an overlay. Each
-    /// snapshot rehydrates its checkpointed **delta** over this lower, so a
-    /// historical view is "the overlay state as of the checkpoint, over the
-    /// lower as it is *now*" — faithful for the CAS-owned delta, but subject
-    /// to lower drift until `OpaqueTree` ingestion makes checkpoints fully
-    /// self-contained.
-    lower: Option<Arc<dyn VfsService>>,
-    /// The per-checkpoint read-only snapshot mounts, remapped into this
-    /// feature's slice (see [`SubMounts`]).
-    subs: SubMounts<EventId>,
-    /// Shared id/handle allocator (also used by `subs`).
+    /// The **shared** tree-mount table (owned by the `.vfs/cas` portal
+    /// feature): this feature only *resolves* time/event names to root
+    /// [`TreeId`]s and hands out entries from there, so a checkpoint browsed
+    /// through history and through the portal is one filesystem with one id
+    /// space. Every id under a snapshot lives in the portal's slice and is
+    /// routed there by the control plane — this feature never serves them.
+    mounts: Arc<TreeMounts>,
+    /// Allocator for this feature's own (stateless) `head`-file handles.
     next_id: Arc<AtomicU64>,
 }
 
@@ -94,21 +91,19 @@ where
     Near: SyncByteBackend<CASHash> + Clone + 'static,
     Far: SyncByteBackend<CASHash> + Clone + 'static,
 {
-    /// Build over the mount's [`History`] in the given feature `slot`. Pass
-    /// the overlay's `lower` when the mount overlays one — checkpointed roots
-    /// are then sparse deltas and snapshots rehydrate over it.
+    /// Build over the mount's [`History`] in the given feature `slot`,
+    /// resolving into the `.vfs/cas` portal's shared [`TreeMounts`] table
+    /// (which already knows the mount's lower, if any).
     pub fn new(
         history: Arc<History<Near, Far>>,
         slot: FeatureSlot,
-        lower: Option<Arc<dyn VfsService>>,
+        mounts: Arc<TreeMounts>,
     ) -> Self {
-        let next_id = Arc::new(AtomicU64::new(slot.base + 3));
         Self {
             history,
             slot,
-            lower,
-            subs: SubMounts::new(Arc::clone(&next_id)),
-            next_id,
+            mounts,
+            next_id: Arc::new(AtomicU64::new(slot.base + 3)),
         }
     }
 
@@ -163,35 +158,19 @@ where
         Ok(resolved)
     }
 
-    /// Get-or-mount the read-only snapshot filesystem for `event`.
-    fn snapshot(&self, event: EventId) -> VfsResult<Arc<dyn VfsService>> {
-        self.subs.mount(event, || {
-            let record = self
-                .history
-                .event(&event)
-                .map_err(history_error)?
-                .ok_or(VfsError::NotFound)?;
-            let far = self.history.far().clone();
-            let vfs: Arc<dyn VfsService> = match &self.lower {
-                // Overlay mount: the checkpointed root is a sparse delta —
-                // rehydrate it over the (shared) lower.
-                Some(lower) => Arc::new(
-                    CasVfs::from_overlay(far, Arc::clone(lower), record.root)
-                        .map_err(|_| VfsError::Other("snapshot root unreadable".to_owned()))?,
-                ),
-                None => Arc::new(
-                    CasVfs::from_root(far, record.root)
-                        .map_err(|_| VfsError::Other("snapshot root unreadable".to_owned()))?,
-                ),
-            };
-            Ok(vfs)
-        })
+    /// The checkpointed root [`TreeId`] of `event`.
+    fn root_of(&self, event: EventId) -> VfsResult<epoch_tree::TreeId> {
+        Ok(self
+            .history
+            .event(&event)
+            .map_err(history_error)?
+            .ok_or(VfsError::NotFound)?
+            .root)
     }
 
     /// The root entry of `event`'s snapshot, as seen from `.vfs/history`.
     fn snapshot_root_entry(&self, event: EventId, relative: bool) -> VfsResult<Entry> {
-        self.snapshot(event)?;
-        let mut entry = self.subs.root_entry(event)?;
+        let mut entry = self.mounts.root_entry(self.root_of(event)?)?;
         if relative {
             // "5s-ago" names a different checkpoint five seconds from now —
             // forbid the kernel from caching the resolution.
@@ -236,8 +215,9 @@ where
             let event = EventId::from_str(text).map_err(|_| VfsError::NotFound)?;
             return self.snapshot_root_entry(event, false);
         }
-        let (event, local_parent) = self.subs.local_of(parent)?.ok_or(VfsError::NotFound)?;
-        self.subs.lookup(event, local_parent, name)
+        // Snapshot-internal ids live in the portal's slice; the control
+        // plane never routes them here.
+        Err(VfsError::NotFound)
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
@@ -247,8 +227,7 @@ where
         if inode_id == self.head_file() {
             return Ok(cp_file_attr(inode_id, self.render_head()?.len() as u64));
         }
-        let (event, local) = self.subs.local_of(inode_id)?.ok_or(VfsError::NotFound)?;
-        self.subs.getattr(event, local)
+        Err(VfsError::NotFound)
     }
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
@@ -260,11 +239,11 @@ where
                 DirEntry::new(self.head_file(), "head", NodeKind::RegularFile),
             ];
             if let Some(head) = self.history.head().map_err(history_error)? {
-                let id = self.subs.synthetic_id(head, epoch_vfs_api::ROOT_INODE_ID)?;
+                let id = self.mounts.root_id(self.root_of(head)?)?;
                 entries.push(DirEntry::new(id, "latest", NodeKind::Directory));
             }
-            for (event, record) in self.history.log(LIST_LIMIT).map_err(history_error)? {
-                let id = self.subs.synthetic_id(event, epoch_vfs_api::ROOT_INODE_ID)?;
+            for (_event, record) in self.history.log(LIST_LIMIT).map_err(history_error)? {
+                let id = self.mounts.root_id(record.root)?;
                 entries.push(DirEntry::new(
                     id,
                     record.timestamp_ms.to_string(),
@@ -280,8 +259,7 @@ where
                 DirEntry::new(self.slot.root_id(), "..", NodeKind::Directory),
             ]);
         }
-        let (event, local) = self.subs.local_of(inode_id)?.ok_or(VfsError::NotFound)?;
-        self.subs.readdir(event, local)
+        Err(VfsError::NotFound)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
@@ -299,8 +277,7 @@ where
                 keep_cache: false,
             });
         }
-        let (event, local) = self.subs.local_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
-        self.subs.open(event, local, request)
+        Err(VfsError::NotFound)
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
@@ -308,8 +285,7 @@ where
             let content = self.render_head()?;
             return slice_bytes(&content, request.offset, request.size);
         }
-        let (event, local) = self.subs.local_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
-        self.subs.read(event, local, request)
+        Err(VfsError::NotFound)
     }
 
     fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
@@ -345,7 +321,9 @@ where
     }
 
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
-        self.subs.release(handle)
+        // Only (stateless) head-file handles are minted here.
+        let _ = handle;
+        Ok(())
     }
 }
 

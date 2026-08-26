@@ -46,22 +46,20 @@ use epoch_vfs_api::{
 
 use crate::cas_vfs::CasVfs;
 use crate::feature::{FeatureSlot, control_dir_attr, cp_file_attr};
-use crate::submount::SubMounts;
+use crate::submount::TreeMounts;
 
 /// The `.vfs/cas` typed object portal. See the [module docs](self).
 pub struct CasObjectDir<Bk> {
     slot: FeatureSlot,
     files: FileCas<Bk>,
     backend: Bk,
-    /// The overlay's lower filesystem, when the mount is an overlay: browsed
-    /// trees rehydrate over it (see the [module docs](self)).
-    lower: Option<Arc<dyn VfsService>>,
     /// Shared id/handle allocator: tree sub-mounts and blob nodes mint from
     /// the same slice-based counter.
     next_id: Arc<AtomicU64>,
-    /// Browsed tree objects, mounted read-only via the main [`CasVfs`]
-    /// machinery and remapped into this feature's slice.
-    trees: SubMounts<TreeId>,
+    /// The shared tree-mount table (see [`TreeMounts`]): the same instances
+    /// serve `.vfs/history` snapshots, so a checkpoint browsed by time and by
+    /// hash is one filesystem with one id space.
+    mounts: Arc<TreeMounts>,
     blobs: RwLock<BlobState>,
 }
 
@@ -88,15 +86,31 @@ where
         lower: Option<Arc<dyn VfsService>>,
     ) -> CasObjectDir<Bk> {
         let next_id = Arc::new(AtomicU64::new(slot.base + 1));
+        let build_backend = backend.clone();
+        let mounts = Arc::new(TreeMounts::new(Arc::clone(&next_id), move |root| {
+            match &lower {
+                // Overlay mount: show the merged view, like the live tree.
+                Some(lower) => {
+                    CasVfs::from_overlay(build_backend.clone(), Arc::clone(lower), root)
+                }
+                None => CasVfs::from_root(build_backend.clone(), root),
+            }
+            .map(|vfs| -> Arc<dyn VfsService> { Arc::new(vfs) })
+            .map_err(|_| VfsError::NotFound)
+        }));
         CasObjectDir {
             slot,
             files: FileCas::new(backend.clone()),
             backend,
-            lower,
-            trees: SubMounts::new(Arc::clone(&next_id)),
+            mounts,
             next_id,
             blobs: RwLock::new(BlobState::default()),
         }
+    }
+
+    /// The shared tree-mount table, for the history feature to resolve into.
+    pub fn tree_mounts(&self) -> Arc<TreeMounts> {
+        Arc::clone(&self.mounts)
     }
 
     fn read_blobs(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, BlobState>> {
@@ -154,22 +168,9 @@ where
             .ok_or(VfsError::NotFound)?;
 
         match self.kind_of(&hash)? {
-            Some(object_kind::TREE) => {
-                let root = TreeId::from_cas_hash(hash);
-                let backend = self.backend.clone();
-                let lower = self.lower.clone();
-                self.trees.mount(root, || {
-                    match lower {
-                        // Overlay mount: show the merged view, like the live
-                        // tree and history snapshots do.
-                        Some(lower) => CasVfs::from_overlay(backend, lower, root),
-                        None => CasVfs::from_root(backend, root),
-                    }
-                    .map(|vfs| -> Arc<dyn VfsService> { Arc::new(vfs) })
-                    .map_err(|_| VfsError::NotFound)
-                })?;
-                self.trees.root_entry(root)
-            }
+            Some(object_kind::TREE) => self
+                .mounts
+                .root_entry(TreeId::from_cas_hash(hash)),
             Some(object_kind::FILE) => {
                 let blob = BlobId::from_cas_hash(hash);
                 let id = self.blob_node(blob)?;
@@ -193,16 +194,16 @@ where
         if parent == self.slot.root_id() {
             return self.resolve_hash(name);
         }
-        let (root, local) = self.trees.local_of(parent)?.ok_or(VfsError::NotFound)?;
-        self.trees.lookup(root, local, name)
+        let (root, local) = self.mounts.subs().local_of(parent)?.ok_or(VfsError::NotFound)?;
+        self.mounts.subs().lookup(root, local, name)
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
         if inode_id == self.slot.root_id() {
             return Ok(control_dir_attr(inode_id));
         }
-        if let Some((root, local)) = self.trees.local_of(inode_id)? {
-            return self.trees.getattr(root, local);
+        if let Some((root, local)) = self.mounts.subs().local_of(inode_id)? {
+            return self.mounts.subs().getattr(root, local);
         }
         let blob = self.blob_of(inode_id)?.ok_or(VfsError::NotFound)?;
         self.blob_attr(inode_id, blob)
@@ -216,8 +217,8 @@ where
                 DirEntry::new(self.slot.vfs_dir_id, OsString::from(".."), NodeKind::Directory),
             ]);
         }
-        if let Some((root, local)) = self.trees.local_of(inode_id)? {
-            return self.trees.readdir(root, local);
+        if let Some((root, local)) = self.mounts.subs().local_of(inode_id)? {
+            return self.mounts.subs().readdir(root, local);
         }
         if self.blob_of(inode_id)?.is_some() {
             return Err(VfsError::NotDirectory);
@@ -232,8 +233,8 @@ where
         if request.inode_id == self.slot.root_id() {
             return Err(VfsError::IsDirectory);
         }
-        if let Some((root, local)) = self.trees.local_of(request.inode_id)? {
-            return self.trees.open(root, local, request);
+        if let Some((root, local)) = self.mounts.subs().local_of(request.inode_id)? {
+            return self.mounts.subs().open(root, local, request);
         }
         let blob = self.blob_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
         let handle = FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -246,8 +247,8 @@ where
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        if let Some((root, local)) = self.trees.local_of(request.inode_id)? {
-            return self.trees.read(root, local, request);
+        if let Some((root, local)) = self.mounts.subs().local_of(request.inode_id)? {
+            return self.mounts.subs().read(root, local, request);
         }
         let blob = self.blob_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
         self.files
@@ -292,6 +293,6 @@ where
         if self.write_blobs()?.handles.remove(&handle).is_some() {
             return Ok(());
         }
-        self.trees.release(handle)
+        self.mounts.subs().release(handle)
     }
 }

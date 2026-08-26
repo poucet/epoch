@@ -37,7 +37,7 @@ pub mod logging;
 pub mod passthrough;
 pub mod router;
 pub mod signal;
-pub(crate) mod submount;
+pub mod submount;
 
 #[cfg(test)]
 mod test_support;
@@ -53,6 +53,7 @@ pub use feature::{FEATURE_RANGE, FeatureSlot};
 pub use history_dir::HistoryDir;
 pub use router::RouterVfs;
 pub use signal::SignalVfs;
+pub use submount::TreeMounts;
 pub use logging::LoggingVfs;
 pub use passthrough::PassthroughVfs;
 

@@ -203,15 +203,26 @@ fn mount_durable(
         Some(lower_dir) => route_ignored(signaled, lower_dir)?,
         None => signaled,
     };
+    // The cas portal owns the shared tree-mount table; the history feature
+    // resolves into it, so time- and hash-addressed views are one filesystem.
     let portal_tier = tier.clone();
     let portal_lower = lower.clone();
+    let tree_mounts: Arc<std::sync::OnceLock<Arc<epoch_vfs::TreeMounts>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let mounts_out = Arc::clone(&tree_mounts);
     let vfs = Arc::new(
         ControlPlaneVfs::new(inner)
             .with_feature("cas", move |slot| {
-                Arc::new(CasObjectDir::new(slot, portal_tier, portal_lower))
+                let portal = Arc::new(CasObjectDir::new(slot, portal_tier, portal_lower));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
             })
             .with_feature("history", move |slot| {
-                Arc::new(HistoryDir::new(history, slot, lower))
+                let mounts = tree_mounts
+                    .get()
+                    .expect("cas feature registers before history")
+                    .clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
             })
             .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
     );

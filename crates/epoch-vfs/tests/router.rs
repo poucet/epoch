@@ -24,6 +24,7 @@ type Tiered = TieredByteBackend<MemoryByteBackend, MemoryByteBackend>;
 struct Fixture {
     live: Arc<CasVfs<Tiered>>,
     history: Arc<History<MemoryByteBackend, MemoryByteBackend>>,
+    tier: Tiered,
     router: Arc<RouterVfs>,
     /// The read-only lower service the overlay falls through to (shared with
     /// history snapshots).
@@ -37,7 +38,7 @@ fn fixture(lower_dir: &Path) -> Fixture {
     let lower: Arc<dyn VfsService> = Arc::new(PassthroughVfs::new(lower_dir));
     let live = Arc::new(CasVfs::overlay(tier.clone(), Arc::clone(&lower)));
     let history = Arc::new(History::new(
-        tier,
+        tier.clone(),
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
@@ -48,6 +49,7 @@ fn fixture(lower_dir: &Path) -> Fixture {
     Fixture {
         live,
         history,
+        tier,
         router,
         lower,
     }
@@ -272,11 +274,27 @@ fn checkpoints_capture_a_delta_that_excludes_routed_content() {
         .expect("the overlay delta changed, so a checkpoint lands");
 
     // View the checkpoint through `.vfs/history` (over the shared lower).
-    let cp = ControlPlaneVfs::new(f.router.clone()).with_feature("history", {
-        let history = Arc::clone(&f.history);
-        let lower = Arc::clone(&f.lower);
-        move |slot| Arc::new(HistoryDir::new(history, slot, Some(lower)))
-    });
+    let tree_mounts: Arc<std::sync::OnceLock<Arc<epoch_vfs::TreeMounts>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let mounts_out = Arc::clone(&tree_mounts);
+    let cp = ControlPlaneVfs::new(f.router.clone())
+        .with_feature("cas", {
+            let tier = f.tier.clone();
+            let lower = Arc::clone(&f.lower);
+            move |slot| {
+                let portal =
+                    Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, Some(lower)));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
+            }
+        })
+        .with_feature("history", {
+            let history = Arc::clone(&f.history);
+            move |slot| {
+                let mounts = tree_mounts.get().unwrap().clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
+            }
+        });
     let vfs_dir = cp.lookup(ROOT_INODE_ID, OsStr::new(".vfs")).unwrap();
     let hist = cp
         .lookup(vfs_dir.attr.inode_id, OsStr::new("history"))

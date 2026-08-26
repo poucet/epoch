@@ -28,14 +28,29 @@ fn fixture() -> Fixture {
     let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
     let live = Arc::new(CasVfs::new(tier.clone()));
     let history = Arc::new(History::new(
-        tier,
+        tier.clone(),
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
-    let cp = ControlPlaneVfs::new(live.clone()).with_feature("history", {
-        let history = Arc::clone(&history);
-        move |slot| Arc::new(HistoryDir::new(history, slot, None))
-    });
+    let tree_mounts: Arc<std::sync::OnceLock<Arc<epoch_vfs::TreeMounts>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let mounts_out = Arc::clone(&tree_mounts);
+    let cp = ControlPlaneVfs::new(live.clone())
+        .with_feature("cas", {
+            let tier = tier.clone();
+            move |slot| {
+                let portal = Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, None));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
+            }
+        })
+        .with_feature("history", {
+            let history = Arc::clone(&history);
+            move |slot| {
+                let mounts = tree_mounts.get().unwrap().clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
+            }
+        });
     Fixture { live, history, cp }
 }
 
@@ -46,14 +61,29 @@ fn overlay_fixture(lower_dir: &std::path::Path) -> Fixture {
     let lower: Arc<dyn VfsService> = Arc::new(epoch_vfs::PassthroughVfs::new(lower_dir));
     let live = Arc::new(CasVfs::overlay(tier.clone(), Arc::clone(&lower)));
     let history = Arc::new(History::new(
-        tier,
+        tier.clone(),
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
-    let cp = ControlPlaneVfs::new(live.clone()).with_feature("history", {
-        let history = Arc::clone(&history);
-        move |slot| Arc::new(HistoryDir::new(history, slot, Some(lower)))
-    });
+    let tree_mounts: Arc<std::sync::OnceLock<Arc<epoch_vfs::TreeMounts>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let mounts_out = Arc::clone(&tree_mounts);
+    let cp = ControlPlaneVfs::new(live.clone())
+        .with_feature("cas", {
+            let tier = tier.clone();
+            move |slot| {
+                let portal = Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, Some(Arc::clone(&lower))));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
+            }
+        })
+        .with_feature("history", {
+            let history = Arc::clone(&history);
+            move |slot| {
+                let mounts = tree_mounts.get().unwrap().clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
+            }
+        });
     Fixture { live, history, cp }
 }
 
@@ -317,14 +347,24 @@ fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
+    let tree_mounts: Arc<std::sync::OnceLock<Arc<epoch_vfs::TreeMounts>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let mounts_out = Arc::clone(&tree_mounts);
     let cp = ControlPlaneVfs::new(live.clone())
         .with_feature("cas", {
             let tier = tier.clone();
-            move |slot| Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, None))
+            move |slot| {
+                let portal = Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, None));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
+            }
         })
         .with_feature("history", {
             let history = Arc::clone(&history);
-            move |slot| Arc::new(HistoryDir::new(history, slot, None))
+            move |slot| {
+                let mounts = tree_mounts.get().unwrap().clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
+            }
         });
     let f = Fixture { live, history, cp };
     let hist = history_dir_id(&f.cp);
