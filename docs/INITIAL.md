@@ -2,7 +2,7 @@ Here is the complete, consolidated design document. It is stripped of conversati
 # System Design Document: Temporal Virtual Filesystem for AI Agents
 **Authors:** Chris & Solasta
 **Date:** June 18, 2026
-**Status:** Architecture Draft
+**Status:** Historical — the founding design, retained for reference. The as-built architecture is `docs/ARCHITECTURE.md`; checkpointing/timeline specifics are `docs/TIMELINE.md`.
 ## 1. Overview & Objectives
 A high-performance, time-traveling Virtual Filesystem (VFS) designed for autonomous AI agents and developer workflows. It decouples immutable file state (Content-Addressable Storage) from temporal lineage (Directed Acyclic Graph). By intercepting filesystem operations via FUSE, it provides consequence-free state scrubbing, zero-cost recursive forking, and strict blast-radius isolation without altering the underlying physical project.
 ## 2. Core Requirements

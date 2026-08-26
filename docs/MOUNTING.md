@@ -58,9 +58,15 @@ macFUSE is installed, but Apple requires you to authorize its kext once. Two par
 # or: EPOCH_LOWER=… EPOCH_MOUNT=… ./mount-mac.sh
 ```
 
-Builds `epoch-fuse` with `--features fuser-mount`, mounts the overlay, and
-unmounts on `Ctrl-C` or exit. The overlay (`OverlayProbeVfs`) is read-only: it
-reads through to the lower dir and returns `EROFS` on any write.
+Builds `epoch-fuse`, mounts, and unmounts on `Ctrl-C` or exit. Two modes:
+
+- **Default** — the read-only overlay probe: reads through to the lower dir,
+  `EROFS` on any write.
+- **`EPOCH_STATE=<dir>`** — the durable, checkpointed copy-on-write overlay:
+  writes/deletes are captured, checkpointed (debounced), persisted in
+  `<dir>/epoch.redb`, resumed on remount, and time-travelable under
+  `<mount>/.vfs/history/`. Also `EPOCH_HEAD`, `EPOCH_HARD_FSYNC=1`. See
+  `docs/TIMELINE.md`.
 
 If you see `Operation not permitted`, the kext approval above isn't complete.
 
