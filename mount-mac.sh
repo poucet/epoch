@@ -12,14 +12,15 @@
 # (FUSE-T, the kext-less alternative, does not work here: fuser 0.17 hard-codes
 # the macFUSE wire protocol and can't talk to FUSE-T — cberner/fuser#273.)
 #
-# Two modes, picked by whether EPOCH_STATE is set:
+# Two modes:
 #
-#   (default)      read-only overlay probe (OverlayProbeVfs): reads through to
-#                  the lower dir, EROFS on any write — the lower is never touched.
-#   EPOCH_STATE=…  durable, checkpointed copy-on-write overlay: writes/deletes
+#   (default)      durable, checkpointed copy-on-write overlay: writes/deletes
 #                  land in the CAS, are checkpointed on flush/close (debounced),
-#                  persist in $EPOCH_STATE/epoch.redb, and resume on remount.
-#                  Time travel: ls <mount>/.vfs/history/
+#                  persist in $EPOCH_STATE/epoch.redb (default ~/.epoch), and
+#                  resume on remount. Time travel: ls <mount>/.vfs/history/
+#   EPOCH_PROBE=1  legacy read-only overlay probe: reads through to the lower
+#                  dir, EROFS on any write — no CAS, no checkpoints, and .vfs
+#                  holds only the cas stub (no history/ or debug/).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -27,13 +28,15 @@ cd "$(dirname "$0")"
 # LOWER  pristine tree the overlay reads through / copies up from (defaults to
 #        this repo, like docker-run.sh's `-v $PWD:/work:ro`).
 # MOUNT  where it appears (~/epoch).
-# EPOCH_STATE       state dir for the durable mode (holds epoch.redb).
+# EPOCH_STATE       state dir for the durable mode (default: ~/.epoch).
 # EPOCH_HEAD        timeline head this mount advances (default: main).
 # EPOCH_HARD_FSYNC  set to 1 to make fsync(2) a synchronous checkpoint barrier.
+# EPOCH_PROBE       set to 1 for the legacy read-only probe (no state dir used).
 LOWER="${EPOCH_LOWER:-${1:-$PWD}}"
 MOUNT="${EPOCH_MOUNT:-${2:-$HOME/epoch}}"
-STATE="${EPOCH_STATE:-}"
+STATE="${EPOCH_STATE:-$HOME/.epoch}"
 HEAD="${EPOCH_HEAD:-main}"
+[[ "${EPOCH_PROBE:-0}" == 1 ]] && STATE=""
 
 # ── preflight ────────────────────────────────────────────────────────────────
 if [[ ! -d /Library/Filesystems/macfuse.fs ]]; then
