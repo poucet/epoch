@@ -1,8 +1,9 @@
 //! `.vfs/history` — the time-travel directory: read-only snapshots of the
 //! filesystem at any checkpoint.
 //!
-//! [`HistoryDir`] is a [`VfsService`] sub-tree grafted under the control plane
-//! (see [`ControlPlaneVfs::with_history`](crate::ControlPlaneVfs::with_history)).
+//! [`HistoryDir`] is a control-plane **feature** (see [`crate::feature`]),
+//! mounted via
+//! [`ControlPlaneVfs::with_feature`](crate::ControlPlaneVfs::with_feature).
 //! Names under `.vfs/history/` resolve to checkpoints on the mount's timeline
 //! head:
 //!
@@ -24,8 +25,8 @@
 //!
 //! Every snapshot's `WorkingTree` mints its own session-scoped [`InodeId`]s
 //! starting at 1 — they collide across snapshots and with the live tree. So
-//! this decorator owns the id range at/above [`HIST_BASE`] and never leaks a
-//! snapshot-local id: each `(event, local id)` pair gets a stable synthetic id,
+//! this feature never leaks a snapshot-local id out of its slot's id slice:
+//! each `(event, local id)` pair gets a stable synthetic id,
 //! and every id in every result (entry attrs, readdir rows, handles) is
 //! rewritten into that space. Mutating ops answer
 //! [`VfsError::ReadOnlyFilesystem`] outright, so the (technically writable)
@@ -54,35 +55,21 @@ use epoch_vfs_api::{
 };
 
 use crate::cas_vfs::CasVfs;
-
-/// First [`InodeId`]/[`FileHandle`] value owned by the history directory.
-///
-/// Sits above the control plane's [`CP_BASE`](crate::control_plane::CP_BASE),
-/// so routing checks `is_hist` before `is_cp`.
-pub const HIST_BASE: u64 = 0xC000_0000_0000_0000;
-
-/// Reserved node id of the `.vfs/history` directory itself.
-pub(crate) const HIST_ROOT_ID: InodeId = InodeId(HIST_BASE);
-/// Reserved node id of the `.vfs/history/id` directory.
-const ID_DIR_ID: InodeId = InodeId(HIST_BASE + 1);
-/// First mintable id for snapshot nodes and synthetic file handles.
-const FIRST_DYNAMIC: u64 = HIST_BASE + 2;
+use crate::feature::FeatureSlot;
 
 /// How many checkpoints a `readdir` of `.vfs/history` lists (newest first).
 /// Older checkpoints stay reachable by lookup — listing is a courtesy, not the
 /// index.
 pub const LIST_LIMIT: usize = 64;
 
-/// Returns `true` if `id` belongs to the history directory's range.
-pub(crate) fn is_hist(id: u64) -> bool {
-    id >= HIST_BASE
-}
-
 /// The `.vfs/history` sub-service. See the [module docs](self).
 pub struct HistoryDir<Near, Far> {
     history: Arc<History<Near, Far>>,
-    /// The inode id `..` of `.vfs/history` reports (the `.vfs` dir).
-    parent_id: InodeId,
+    /// The feature's id slice and `.vfs` parent (see [`crate::feature`]):
+    /// `slot.root_id()` is `.vfs/history` itself, `slot.base + 1` the `id/`
+    /// subdirectory, and dynamic snapshot ids/handles are minted from
+    /// `slot.base + 2` upward.
+    slot: FeatureSlot,
     /// The overlay's lower filesystem, when the mount is an overlay. Each
     /// snapshot rehydrates its checkpointed **delta** over this lower, so a
     /// historical view is "the overlay state as of the checkpoint, over the
@@ -121,21 +108,26 @@ where
     Near: SyncByteBackend<CASHash> + Clone + 'static,
     Far: SyncByteBackend<CASHash> + Clone + 'static,
 {
-    /// Build over the mount's [`History`], reporting `parent_id` as `..`.
-    /// Pass the overlay's `lower` when the mount overlays one — checkpointed
-    /// roots are then sparse deltas and snapshots rehydrate over it.
+    /// Build over the mount's [`History`] in the given feature `slot`. Pass
+    /// the overlay's `lower` when the mount overlays one — checkpointed roots
+    /// are then sparse deltas and snapshots rehydrate over it.
     pub fn new(
         history: Arc<History<Near, Far>>,
-        parent_id: InodeId,
+        slot: FeatureSlot,
         lower: Option<Arc<dyn VfsService>>,
     ) -> Self {
         Self {
             history,
-            parent_id,
+            slot,
             lower,
             state: RwLock::new(HistState::default()),
-            next_id: AtomicU64::new(FIRST_DYNAMIC),
+            next_id: AtomicU64::new(slot.base + 2),
         }
+    }
+
+    /// The `.vfs/history/id` directory node.
+    fn id_dir(&self) -> InodeId {
+        InodeId(self.slot.base + 1)
     }
 
     fn read_state(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, HistState<Far>>> {
@@ -251,16 +243,16 @@ where
     Far: SyncByteBackend<CASHash> + Clone + 'static,
 {
     fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
-        if parent == HIST_ROOT_ID {
+        if parent == self.slot.root_id() {
             if name == OsStr::new("id") {
-                return Ok(Entry::new(hist_dir_attr(ID_DIR_ID)));
+                return Ok(Entry::new(hist_dir_attr(self.id_dir())));
             }
             return match self.resolve_time_name(name)? {
                 Some((event, relative)) => self.snapshot_root_entry(event, relative),
                 None => Err(VfsError::NotFound),
             };
         }
-        if parent == ID_DIR_ID {
+        if parent == self.id_dir() {
             let text = name.to_str().ok_or(VfsError::NotFound)?;
             let event = EventId::from_str(text).map_err(|_| VfsError::NotFound)?;
             return self.snapshot_root_entry(event, false);
@@ -274,7 +266,7 @@ where
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
-        if inode_id == HIST_ROOT_ID || inode_id == ID_DIR_ID {
+        if inode_id == self.slot.root_id() || inode_id == self.id_dir() {
             return Ok(hist_dir_attr(inode_id));
         }
         let (event, local) = self.local_of(inode_id)?;
@@ -283,11 +275,11 @@ where
     }
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
-        if inode_id == HIST_ROOT_ID {
+        if inode_id == self.slot.root_id() {
             let mut entries = vec![
-                DirEntry::new(HIST_ROOT_ID, ".", NodeKind::Directory),
-                DirEntry::new(self.parent_id, "..", NodeKind::Directory),
-                DirEntry::new(ID_DIR_ID, "id", NodeKind::Directory),
+                DirEntry::new(self.slot.root_id(), ".", NodeKind::Directory),
+                DirEntry::new(self.slot.vfs_dir_id, "..", NodeKind::Directory),
+                DirEntry::new(self.id_dir(), "id", NodeKind::Directory),
             ];
             for (event, record) in self.history.log(LIST_LIMIT).map_err(history_error)? {
                 let id = self.synthetic_id(event, epoch_vfs_api::ROOT_INODE_ID)?;
@@ -299,11 +291,11 @@ where
             }
             return Ok(entries);
         }
-        if inode_id == ID_DIR_ID {
+        if inode_id == self.id_dir() {
             // Intentionally not listable: events are addressable by id only.
             return Ok(vec![
-                DirEntry::new(ID_DIR_ID, ".", NodeKind::Directory),
-                DirEntry::new(HIST_ROOT_ID, "..", NodeKind::Directory),
+                DirEntry::new(self.id_dir(), ".", NodeKind::Directory),
+                DirEntry::new(self.slot.root_id(), "..", NodeKind::Directory),
             ]);
         }
         let (event, local) = self.local_of(inode_id)?;
@@ -318,7 +310,7 @@ where
         if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        if request.inode_id == HIST_ROOT_ID || request.inode_id == ID_DIR_ID {
+        if request.inode_id == self.slot.root_id() || request.inode_id == self.id_dir() {
             return Err(VfsError::IsDirectory);
         }
         let (event, local) = self.local_of(request.inode_id)?;

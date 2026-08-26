@@ -6,12 +6,11 @@ use epoch_cas_redb::RedbByteBackend;
 use epoch_fuse::fuser_adapter::mount_spike;
 use epoch_history::{CheckpointPolicy, History, Scheduler};
 use epoch_timeline_redb::RedbTimelineStore;
-use epoch_vfs::control_plane::CP_BASE;
 use epoch_vfs::{
-    overlay_probe, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugStats, HistoryDir, PassthroughVfs,
-    SignalVfs,
+    overlay_probe, CasEchoDir, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugDir, DebugStats,
+    HistoryDir, PassthroughVfs, SignalVfs,
 };
-use epoch_vfs_api::{InodeId, VfsService};
+use epoch_vfs_api::VfsService;
 
 const USAGE: &str = "usage:
   epoch-fuse <lower-dir> <mountpoint>         read-through overlay probe
@@ -75,7 +74,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // Graft `.vfs` on so `.vfs/debug` serves the live tree's statistics.
         let debug: Arc<dyn DebugStats> = live.clone();
-        let vfs = Arc::new(ControlPlaneVfs::new(live).with_debug(debug));
+        let vfs = Arc::new(
+            ControlPlaneVfs::new(live)
+                .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
+                .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
+        );
         mount_spike(mountpoint, vfs)?;
         return Ok(());
     }
@@ -170,8 +173,14 @@ fn mount_durable(
     let debug: Arc<dyn DebugStats> = live.clone();
     let signaled: Arc<dyn VfsService> =
         Arc::new(SignalVfs::new(live, scheduler.handle(), hard_fsync));
-    let history_dir = Arc::new(HistoryDir::new(history, InodeId(CP_BASE), lower));
-    let vfs = Arc::new(ControlPlaneVfs::with_history(signaled, history_dir).with_debug(debug));
+    let vfs = Arc::new(
+        ControlPlaneVfs::new(signaled)
+            .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
+            .with_feature("history", move |slot| {
+                Arc::new(HistoryDir::new(history, slot, lower))
+            })
+            .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
+    );
 
     mount_spike(mountpoint, vfs)?;
     // Unmounted: dropping the scheduler runs a final checkpoint if needed.

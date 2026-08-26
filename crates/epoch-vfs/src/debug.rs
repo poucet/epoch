@@ -3,7 +3,7 @@
 //! [`DebugStats`] is the provider seam: the live filesystem (in practice
 //! [`CasVfs`](crate::CasVfs)) renders a point-in-time [`DebugSnapshot`], and
 //! [`ControlPlaneVfs`](crate::ControlPlaneVfs) — handed the provider via
-//! [`with_debug`](crate::ControlPlaneVfs::with_debug) — serves it as three
+//! [`DebugDir`](crate::DebugDir) feature — serves it as three
 //! read-only virtual files:
 //!
 //! - `.vfs/debug/near-objects` — objects staged in the near tier,
@@ -39,7 +39,7 @@ pub struct DebugSnapshot {
 /// A live filesystem that can report a [`DebugSnapshot`] of its internals.
 ///
 /// Implemented by [`CasVfs`](crate::CasVfs); consumed by
-/// [`ControlPlaneVfs::with_debug`](crate::ControlPlaneVfs::with_debug).
+/// the [`DebugDir`](crate::DebugDir) control-plane feature.
 pub trait DebugStats: Send + Sync {
     /// Render a fresh point-in-time snapshot.
     fn debug_snapshot(&self) -> DebugSnapshot;

@@ -1,6 +1,6 @@
 //! End-to-end tests for the `.vfs/debug` statistics directory: a live
 //! `CasVfs` over a tiered backend exposed as the `DebugStats` provider through
-//! `ControlPlaneVfs::with_debug`.
+//! the control plane `debug` feature.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -25,7 +25,10 @@ struct Fixture {
 fn fixture() -> Fixture {
     let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
     let live = Arc::new(CasVfs::new(tier.clone()));
-    let cp = ControlPlaneVfs::new(live.clone()).with_debug(live.clone());
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("debug", {
+        let live = live.clone();
+        move |slot| Arc::new(epoch_vfs::DebugDir::new(slot, live))
+    });
     Fixture { live, tier, cp }
 }
 
@@ -35,7 +38,10 @@ fn overlay_fixture(lower_dir: &std::path::Path) -> Fixture {
     let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
     let lower: Arc<dyn VfsService> = Arc::new(epoch_vfs::PassthroughVfs::new(lower_dir));
     let live = Arc::new(CasVfs::overlay(tier.clone(), lower));
-    let cp = ControlPlaneVfs::new(live.clone()).with_debug(live.clone());
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("debug", {
+        let live = live.clone();
+        move |slot| Arc::new(epoch_vfs::DebugDir::new(slot, live))
+    });
     Fixture { live, tier, cp }
 }
 
@@ -229,7 +235,10 @@ fn overlay_reports_sealed_subtrees_without_hydrating_them() {
     let root = builder.seal().unwrap();
 
     let live = Arc::new(CasVfs::from_root(tier.clone(), root).unwrap());
-    let cp = ControlPlaneVfs::new(live.clone()).with_debug(live.clone());
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("debug", {
+        let live = live.clone();
+        move |slot| Arc::new(epoch_vfs::DebugDir::new(slot, live))
+    });
     let f = Fixture { live, tier, cp };
 
     // Nothing faulted in yet: the root itself is one sealed subtree.

@@ -1,6 +1,6 @@
 //! End-to-end tests for the `.vfs/history` time-travel directory: a live
 //! `CasVfs` over a tiered backend, checkpointed into a timeline, exposed
-//! read-only through `ControlPlaneVfs::with_history`.
+//! read-only through the control plane `history` feature.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -32,9 +32,10 @@ fn fixture() -> Fixture {
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
-    let vfs_dir_id = InodeId(CP_BASE);
-    let hist_dir = Arc::new(HistoryDir::new(Arc::clone(&history), vfs_dir_id, None));
-    let cp = ControlPlaneVfs::with_history(live.clone(), hist_dir);
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("history", {
+        let history = Arc::clone(&history);
+        move |slot| Arc::new(HistoryDir::new(history, slot, None))
+    });
     Fixture { live, history, cp }
 }
 
@@ -49,12 +50,10 @@ fn overlay_fixture(lower_dir: &std::path::Path) -> Fixture {
         Arc::new(MemoryTimelineStore::new()),
         "main",
     ));
-    let hist_dir = Arc::new(HistoryDir::new(
-        Arc::clone(&history),
-        InodeId(CP_BASE),
-        Some(lower),
-    ));
-    let cp = ControlPlaneVfs::with_history(live.clone(), hist_dir);
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("history", {
+        let history = Arc::clone(&history);
+        move |slot| Arc::new(HistoryDir::new(history, slot, Some(lower)))
+    });
     Fixture { live, history, cp }
 }
 

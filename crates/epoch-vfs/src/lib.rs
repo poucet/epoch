@@ -24,10 +24,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use epoch_vfs_api::VfsService;
 
+pub mod cas_dir;
 pub mod cas_vfs;
 pub mod checkpointing;
 pub mod control_plane;
 pub mod debug;
+pub mod debug_dir;
+pub mod feature;
 pub mod history_dir;
 pub mod logging;
 pub mod passthrough;
@@ -36,10 +39,13 @@ pub mod signal;
 #[cfg(test)]
 mod test_support;
 
+pub use cas_dir::CasEchoDir;
 pub use cas_vfs::CasVfs;
 pub use checkpointing::CheckpointedFs;
 pub use control_plane::ControlPlaneVfs;
 pub use debug::{DebugSnapshot, DebugStats, NearCount};
+pub use debug_dir::DebugDir;
+pub use feature::{FEATURE_RANGE, FeatureSlot};
 pub use history_dir::HistoryDir;
 pub use signal::SignalVfs;
 pub use logging::LoggingVfs;
@@ -53,7 +59,10 @@ pub use passthrough::PassthroughVfs;
 /// `LoggingVfs(ControlPlaneVfs(PassthroughVfs(lower)))`.
 pub fn overlay_probe(lower: PathBuf) -> Arc<dyn VfsService> {
     let passthrough = Arc::new(PassthroughVfs::new(lower));
-    let control_plane = Arc::new(ControlPlaneVfs::new(passthrough));
+    let control_plane = Arc::new(
+        ControlPlaneVfs::new(passthrough)
+            .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot))),
+    );
     Arc::new(LoggingVfs::new(control_plane))
 }
 
