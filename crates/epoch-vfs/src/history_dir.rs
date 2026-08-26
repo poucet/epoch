@@ -15,6 +15,9 @@
 //!   the kernel re-resolves it every time.
 //! - `.vfs/history/head` — exactly the head checkpoint's **root tree hash**
 //!   (empty before the first checkpoint): `ls .vfs/cas/$(cat .vfs/history/head)`.
+//!   Note the raw object is the sparse *delta*; for the merged view use:
+//! - `.vfs/history/latest` — the head checkpoint's **merged** snapshot (delta
+//!   rehydrated over the lower), i.e. the filesystem as of the last checkpoint.
 //! - `.vfs/history/id/<64-hex event id>` — any event, on this head's chain or
 //!   not. `id/` itself is intentionally not listable (ids are addressable, not
 //!   enumerable). Listing `.vfs/history` shows the newest checkpoints (up to
@@ -212,6 +215,17 @@ where
                 let size = self.render_head()?.len() as u64;
                 return Ok(Entry::new(cp_file_attr(self.head_file(), size)));
             }
+            if name == OsStr::new("latest") {
+                // The merged view of the head checkpoint (delta over lower).
+                // TTL 0: "latest" names a different snapshot after the next
+                // checkpoint, so the kernel must re-resolve it.
+                let head = self
+                    .history
+                    .head()
+                    .map_err(history_error)?
+                    .ok_or(VfsError::NotFound)?;
+                return self.snapshot_root_entry(head, true);
+            }
             return match self.resolve_time_name(name)? {
                 Some((event, relative)) => self.snapshot_root_entry(event, relative),
                 None => Err(VfsError::NotFound),
@@ -245,6 +259,10 @@ where
                 DirEntry::new(self.id_dir(), "id", NodeKind::Directory),
                 DirEntry::new(self.head_file(), "head", NodeKind::RegularFile),
             ];
+            if let Some(head) = self.history.head().map_err(history_error)? {
+                let id = self.subs.synthetic_id(head, epoch_vfs_api::ROOT_INODE_ID)?;
+                entries.push(DirEntry::new(id, "latest", NodeKind::Directory));
+            }
             for (event, record) in self.history.log(LIST_LIMIT).map_err(history_error)? {
                 let id = self.subs.synthetic_id(event, epoch_vfs_api::ROOT_INODE_ID)?;
                 entries.push(DirEntry::new(

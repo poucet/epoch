@@ -26,6 +26,7 @@ Inside the mount, `.vfs/` is the control plane (a registry of pluggable features
 | `.vfs/history/<unix-millis>` | read-only snapshot at the newest checkpoint ≤ that time |
 | `.vfs/history/<N><unit>-ago` | relative form (`500ms-ago`, `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago`) |
 | `.vfs/history/head` | the head checkpoint's **root tree hash** (empty before the first) |
+| `.vfs/history/latest/…` | the head checkpoint's **merged** snapshot (delta over lower) |
 | `.vfs/history/id/<event-hex>` | any event by id (dir itself unlistable) |
 | `.vfs/cas/<hash>` | typed object portal: tree hash ⇒ browsable read-only dir, file hash ⇒ `cat`-able file, chunks hidden (dir unlistable) |
 | `.vfs/debug/{near-objects,dirty-files,overlay}` | live stats: staging object count, un-sealed writers, overlay delta listing |

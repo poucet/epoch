@@ -27,7 +27,7 @@ fn fixture() -> Fixture {
     let live = Arc::new(CasVfs::new(tier.clone()));
     let cp = ControlPlaneVfs::new(live.clone()).with_feature("cas", {
         let tier = tier.clone();
-        move |slot| Arc::new(CasObjectDir::new(slot, tier))
+        move |slot| Arc::new(CasObjectDir::new(slot, tier, None))
     });
     Fixture { live, tier, cp }
 }
@@ -149,6 +149,58 @@ fn tree_hashes_browse_as_readonly_directories() {
         f.cp.truncate(file, 0),
         Err(VfsError::ReadOnlyFilesystem)
     ));
+}
+
+/// On an overlay mount the portal shows the merged view: a checkpointed
+/// delta's root hash lists overlay content AND lower fall-through, exactly
+/// like the live filesystem does.
+#[test]
+fn overlay_tree_hashes_show_the_merged_view() {
+    let lower_dir = tempfile::tempdir().unwrap();
+    std::fs::write(lower_dir.path().join("base.txt"), b"from lower").unwrap();
+
+    let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
+    let lower: Arc<dyn VfsService> =
+        Arc::new(epoch_vfs::PassthroughVfs::new(lower_dir.path()));
+    let live = Arc::new(CasVfs::overlay(tier.clone(), Arc::clone(&lower)));
+    let cp = ControlPlaneVfs::new(live.clone()).with_feature("cas", {
+        let tier = tier.clone();
+        let lower = Arc::clone(&lower);
+        move |slot| Arc::new(CasObjectDir::new(slot, tier, Some(lower)))
+    });
+
+    let created = live
+        .create(CreateRequest::file(ROOT_INODE_ID, "foo", 0o644))
+        .unwrap();
+    let handle = created.opened.unwrap().handle;
+    live.write(WriteRequest {
+        inode_id: created.entry.attr.inode_id,
+        handle,
+        offset: 0,
+        data: b"captured",
+    })
+    .unwrap();
+    live.release(handle).unwrap();
+    let root_hex = live.seal().unwrap().to_hex();
+
+    let cas = cas_dir_id(&cp);
+    let tree = cp.lookup(cas, OsStr::new(&root_hex)).unwrap();
+    let names: Vec<String> = cp
+        .readdir(tree.attr.inode_id)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"foo".to_string()), "delta content: {names:?}");
+    assert!(
+        names.contains(&"base.txt".to_string()),
+        "lower fall-through: {names:?}"
+    );
+    assert_eq!(read_all(&cp, tree.attr.inode_id, "foo").unwrap(), b"captured");
+    assert_eq!(
+        read_all(&cp, tree.attr.inode_id, "base.txt").unwrap(),
+        b"from lower"
+    );
 }
 
 #[test]

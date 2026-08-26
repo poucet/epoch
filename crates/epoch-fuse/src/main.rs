@@ -64,7 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let backend = MemoryByteBackend::new();
-        let (live, lower_path): (Arc<CasVfs<MemoryByteBackend>>, Option<PathBuf>) = match lower_dir
+        #[allow(clippy::type_complexity)]
+        let (live, lower_path): (
+            Arc<CasVfs<MemoryByteBackend>>,
+            Option<(PathBuf, Arc<dyn VfsService>)>,
+        ) = match lower_dir
         {
             Some(lower_dir) => {
                 let lower_dir = fs::canonicalize(lower_dir)?;
@@ -73,8 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let lower: Arc<dyn VfsService> = Arc::new(PassthroughVfs::new(lower_dir.clone()));
                 (
-                    Arc::new(CasVfs::overlay(backend.clone(), lower)),
-                    Some(lower_dir),
+                    Arc::new(CasVfs::overlay(backend.clone(), Arc::clone(&lower))),
+                    Some((lower_dir, lower)),
                 )
             }
             None => {
@@ -88,12 +92,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let debug: Arc<dyn DebugStats> = live.clone();
         let overlay: Arc<dyn VfsService> = live.clone();
         let inner = match &lower_path {
-            Some(lower_dir) => route_ignored(overlay, lower_dir)?,
+            Some((lower_dir, _)) => route_ignored(overlay, lower_dir)?,
             None => overlay,
         };
+        let portal_lower = lower_path.as_ref().map(|(_, lower)| Arc::clone(lower));
         let vfs = Arc::new(
             ControlPlaneVfs::new(inner)
-                .with_feature("cas", move |slot| Arc::new(CasObjectDir::new(slot, backend)))
+                .with_feature("cas", move |slot| {
+                    Arc::new(CasObjectDir::new(slot, backend, portal_lower))
+                })
                 .with_feature("debug", move |slot| Arc::new(DebugDir::new(slot, debug))),
         );
         mount_spike(mountpoint, vfs)?;
@@ -197,10 +204,11 @@ fn mount_durable(
         None => signaled,
     };
     let portal_tier = tier.clone();
+    let portal_lower = lower.clone();
     let vfs = Arc::new(
         ControlPlaneVfs::new(inner)
             .with_feature("cas", move |slot| {
-                Arc::new(CasObjectDir::new(slot, portal_tier))
+                Arc::new(CasObjectDir::new(slot, portal_tier, portal_lower))
             })
             .with_feature("history", move |slot| {
                 Arc::new(HistoryDir::new(history, slot, lower))

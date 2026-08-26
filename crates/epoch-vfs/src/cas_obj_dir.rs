@@ -19,9 +19,12 @@
 //! intentionally **not listable** — content-addressed objects are addressable,
 //! not enumerable — and the whole subtree is strictly read-only.
 //!
-//! Caveat: a *sparse overlay delta* tree browsed here is shown standalone —
-//! tombstones and fall-through are meaningless without the lower, so only the
-//! delta's own content appears.
+//! On an overlay mount, tree objects are rehydrated **over the lower** (like
+//! `.vfs/history` snapshots), so browsing a checkpoint's root hash shows the
+//! merged filesystem, tombstones and fall-through included. Quirk: a hash of
+//! an interior *subtree* also merges against the lower's root — a harmless
+//! (read-only) oddity of overlay semantics. Without a lower, objects are
+//! shown standalone (delta content only).
 
 use std::{
     collections::HashMap,
@@ -50,6 +53,9 @@ pub struct CasObjectDir<Bk> {
     slot: FeatureSlot,
     files: FileCas<Bk>,
     backend: Bk,
+    /// The overlay's lower filesystem, when the mount is an overlay: browsed
+    /// trees rehydrate over it (see the [module docs](self)).
+    lower: Option<Arc<dyn VfsService>>,
     /// Shared id/handle allocator: tree sub-mounts and blob nodes mint from
     /// the same slice-based counter.
     next_id: Arc<AtomicU64>,
@@ -73,13 +79,20 @@ where
     Bk: SyncByteBackend<CASHash> + Clone + 'static,
 {
     /// Build the portal in `slot` over the mount's shared `backend` (a clone
-    /// of the same tier the live tree writes into).
-    pub fn new(slot: FeatureSlot, backend: Bk) -> CasObjectDir<Bk> {
+    /// of the same tier the live tree writes into). Pass the overlay's
+    /// `lower` when the mount overlays one, so browsed trees show the merged
+    /// view.
+    pub fn new(
+        slot: FeatureSlot,
+        backend: Bk,
+        lower: Option<Arc<dyn VfsService>>,
+    ) -> CasObjectDir<Bk> {
         let next_id = Arc::new(AtomicU64::new(slot.base + 1));
         CasObjectDir {
             slot,
             files: FileCas::new(backend.clone()),
             backend,
+            lower,
             trees: SubMounts::new(Arc::clone(&next_id)),
             next_id,
             blobs: RwLock::new(BlobState::default()),
@@ -144,10 +157,16 @@ where
             Some(object_kind::TREE) => {
                 let root = TreeId::from_cas_hash(hash);
                 let backend = self.backend.clone();
+                let lower = self.lower.clone();
                 self.trees.mount(root, || {
-                    CasVfs::from_root(backend, root)
-                        .map(|vfs| -> Arc<dyn VfsService> { Arc::new(vfs) })
-                        .map_err(|_| VfsError::NotFound)
+                    match lower {
+                        // Overlay mount: show the merged view, like the live
+                        // tree and history snapshots do.
+                        Some(lower) => CasVfs::from_overlay(backend, lower, root),
+                        None => CasVfs::from_root(backend, root),
+                    }
+                    .map(|vfs| -> Arc<dyn VfsService> { Arc::new(vfs) })
+                    .map_err(|_| VfsError::NotFound)
                 })?;
                 self.trees.root_entry(root)
             }

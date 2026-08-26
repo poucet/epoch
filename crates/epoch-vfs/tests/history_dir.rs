@@ -320,7 +320,7 @@ fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
     let cp = ControlPlaneVfs::new(live.clone())
         .with_feature("cas", {
             let tier = tier.clone();
-            move |slot| Arc::new(epoch_vfs::CasObjectDir::new(slot, tier))
+            move |slot| Arc::new(epoch_vfs::CasObjectDir::new(slot, tier, None))
         })
         .with_feature("history", {
             let history = Arc::clone(&history);
@@ -363,6 +363,47 @@ fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
         b"v2",
         "the head root shows the newest checkpointed content"
     );
+}
+
+/// `.vfs/history/latest` is the merged head snapshot: overlay delta over the
+/// (current) lower — unlike the raw delta object behind `.vfs/history/head`.
+#[test]
+fn latest_shows_the_merged_head_snapshot() {
+    let lower = tempfile::tempdir().unwrap();
+    std::fs::write(lower.path().join("base.txt"), b"from lower").unwrap();
+    let f = overlay_fixture(lower.path());
+    let hist = history_dir_id(&f.cp);
+
+    // No checkpoints yet: latest doesn't resolve.
+    assert!(matches!(
+        f.cp.lookup(hist, OsStr::new("latest")),
+        Err(VfsError::NotFound)
+    ));
+
+    write_and_checkpoint(&f, "foo", b"captured", 1_000);
+
+    let latest = f.cp.lookup(hist, OsStr::new("latest")).unwrap();
+    assert_eq!(latest.ttl, Duration::ZERO, "latest must never dentry-cache");
+    let names: Vec<String> = f
+        .cp
+        .readdir(latest.attr.inode_id)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"foo".to_string()), "delta content: {names:?}");
+    assert!(names.contains(&"base.txt".to_string()), "lower fall-through: {names:?}");
+    assert_eq!(read_all(&f.cp, latest.attr.inode_id, "base.txt").unwrap(), b"from lower");
+
+    // And the history root lists it.
+    let listed: Vec<String> = f
+        .cp
+        .readdir(hist)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(listed.contains(&"latest".to_string()));
 }
 
 #[test]
