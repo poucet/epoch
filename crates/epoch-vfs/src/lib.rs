@@ -24,7 +24,6 @@ use std::{path::PathBuf, sync::Arc};
 
 use epoch_vfs_api::VfsService;
 
-pub mod cas_dir;
 pub mod cas_obj_dir;
 pub mod cas_vfs;
 pub mod checkpointing;
@@ -42,7 +41,6 @@ pub mod submount;
 #[cfg(test)]
 mod test_support;
 
-pub use cas_dir::CasEchoDir;
 pub use cas_obj_dir::CasObjectDir;
 pub use cas_vfs::CasVfs;
 pub use checkpointing::CheckpointedFs;
@@ -65,10 +63,8 @@ pub use passthrough::PassthroughVfs;
 /// `LoggingVfs(ControlPlaneVfs(PassthroughVfs(lower)))`.
 pub fn overlay_probe(lower: PathBuf) -> Arc<dyn VfsService> {
     let passthrough = Arc::new(PassthroughVfs::new(lower));
-    let control_plane = Arc::new(
-        ControlPlaneVfs::new(passthrough)
-            .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot))),
-    );
+    // The probe has no CAS or timeline, so its `.vfs` registers no features.
+    let control_plane = Arc::new(ControlPlaneVfs::new(passthrough));
     Arc::new(LoggingVfs::new(control_plane))
 }
 
@@ -123,33 +119,10 @@ mod tests {
         assert!(root_names.contains(&OsString::from("doc.txt")));
         assert!(root_names.contains(&OsString::from(".vfs")));
 
-        // `.vfs/cas/<id>` is served synthetically and echoes the id.
+        // The probe registers no features: `.vfs` exists but is bare, and
+        // nothing resolves inside it.
         let vfs_dir = vfs.lookup(ROOT_INODE_ID, OsStr::new(".vfs")).expect(".vfs");
-        let cas_dir = vfs
-            .lookup(vfs_dir.attr.inode_id, OsStr::new("cas"))
-            .expect(".vfs/cas");
-        let cas_entry = vfs
-            .lookup(cas_dir.attr.inode_id, OsStr::new("deadbeef"))
-            .expect(".vfs/cas/deadbeef");
-        assert_eq!(cas_entry.attr.kind, NodeKind::RegularFile);
-
-        let cas_opened = vfs
-            .open(OpenRequest {
-                inode_id: cas_entry.attr.inode_id,
-                mode: OpenMode::ReadOnly,
-                truncate: false,
-                append: false,
-            })
-            .expect("cas open");
-        let cas_data = vfs
-            .read(ReadRequest {
-                inode_id: cas_entry.attr.inode_id,
-                handle: cas_opened.handle,
-                offset: 0,
-                size: 64,
-            })
-            .expect("cas read");
-        assert_eq!(cas_data, b"deadbeef\n");
-        vfs.release(cas_opened.handle).expect("cas release");
+        assert_eq!(vfs.readdir(vfs_dir.attr.inode_id).expect(".vfs readdir").len(), 2);
+        assert!(vfs.lookup(vfs_dir.attr.inode_id, OsStr::new("cas")).is_err());
     }
 }

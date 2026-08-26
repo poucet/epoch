@@ -5,7 +5,7 @@
 //! pluggable **feature** (see [`crate::feature`]): an ordinary [`VfsService`]
 //! subtree registered by name via [`with_feature`](ControlPlaneVfs::with_feature)
 //! and owning a dedicated [`FEATURE_RANGE`]-sized slice of the id space. The
-//! standard mount registers [`CasEchoDir`](crate::CasEchoDir) (`.vfs/cas`),
+//! standard mount registers [`CasObjectDir`](crate::CasObjectDir) (`.vfs/cas`),
 //! [`HistoryDir`](crate::HistoryDir) (`.vfs/history`), and
 //! [`DebugDir`](crate::DebugDir) (`.vfs/debug`), but the control plane itself
 //! knows nothing about any of them.
@@ -309,13 +309,97 @@ impl VfsService for ControlPlaneVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cas_dir::CasEchoDir;
+    use crate::feature::{ReadOnlyFeature, control_dir_attr, cp_file_attr, slice_bytes};
+    use epoch_vfs_api::{NodeAttr, OpenedFile};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A minimal read-only feature for registry tests: `lookup` of any name
+    /// under its root yields a stable file node echoing that name.
+    struct EchoFeature {
+        slot: crate::feature::FeatureSlot,
+        next_id: AtomicU64,
+        state: Mutex<(HashMap<String, InodeId>, HashMap<InodeId, String>)>,
+    }
+
+    impl EchoFeature {
+        fn new(slot: crate::feature::FeatureSlot) -> Self {
+            Self {
+                slot,
+                next_id: AtomicU64::new(slot.base + 1),
+                state: Mutex::new((HashMap::new(), HashMap::new())),
+            }
+        }
+
+        fn node_for(&self, name: &str) -> InodeId {
+            let mut state = self.state.lock().unwrap();
+            if let Some(id) = state.0.get(name) {
+                return *id;
+            }
+            let id = InodeId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            state.0.insert(name.to_owned(), id);
+            state.1.insert(id, name.to_owned());
+            id
+        }
+
+        fn content(&self, id: InodeId) -> VfsResult<Vec<u8>> {
+            let state = self.state.lock().unwrap();
+            let name = state.1.get(&id).ok_or(VfsError::NotFound)?;
+            Ok(format!("{name}\n").into_bytes())
+        }
+    }
+
+    impl ReadOnlyFeature for EchoFeature {
+        fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+            if parent != self.slot.root_id() {
+                return Err(VfsError::NotFound);
+            }
+            let text = name.to_string_lossy().into_owned();
+            let id = self.node_for(&text);
+            Ok(Entry::new(cp_file_attr(id, text.len() as u64 + 1)))
+        }
+
+        fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+            if inode_id == self.slot.root_id() {
+                return Ok(control_dir_attr(inode_id));
+            }
+            Ok(cp_file_attr(inode_id, self.content(inode_id)?.len() as u64))
+        }
+
+        fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+            if inode_id == self.slot.root_id() {
+                return Ok(vec![
+                    DirEntry::new(inode_id, ".", NodeKind::Directory),
+                    DirEntry::new(self.slot.vfs_dir_id, "..", NodeKind::Directory),
+                ]);
+            }
+            Err(VfsError::NotDirectory)
+        }
+
+        fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
+            if request.inode_id == self.slot.root_id() {
+                return Err(VfsError::IsDirectory);
+            }
+            self.content(request.inode_id)?;
+            Ok(OpenedFile {
+                handle: FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed)),
+                direct_io: false,
+                keep_cache: false,
+            })
+        }
+
+        fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+            let content = self.content(request.inode_id)?;
+            slice_bytes(&content, request.offset, request.size)
+        }
+    }
     use crate::test_support::StubVfs;
     use epoch_vfs_api::{OpenMode, ReadRequest};
 
     /// The standard test composition: a control plane with the cas feature.
     fn with_cas(inner: Arc<dyn VfsService>) -> ControlPlaneVfs {
-        ControlPlaneVfs::new(inner).with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
+        ControlPlaneVfs::new(inner).with_feature("cas", |slot| Arc::new(EchoFeature::new(slot)))
     }
 
     fn lookup_id(vfs: &ControlPlaneVfs, parent: InodeId, name: &str) -> InodeId {
@@ -427,8 +511,8 @@ mod tests {
     fn features_get_disjoint_slices_and_ids_do_not_collide() {
         let stub = Arc::new(StubVfs::with_root_entries(&[("a", b"a")]));
         let cp = ControlPlaneVfs::new(stub)
-            .with_feature("cas", |slot| Arc::new(CasEchoDir::new(slot)))
-            .with_feature("cas2", |slot| Arc::new(CasEchoDir::new(slot)));
+            .with_feature("cas", |slot| Arc::new(EchoFeature::new(slot)))
+            .with_feature("cas2", |slot| Arc::new(EchoFeature::new(slot)));
 
         let inner_a = lookup_id(&cp, ROOT_INODE_ID, "a");
         let cas = lookup_id(&cp, VFS_NODE_ID, "cas");
