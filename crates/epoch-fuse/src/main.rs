@@ -8,7 +8,8 @@ use epoch_history::{CheckpointPolicy, History, Scheduler};
 use epoch_timeline_redb::RedbTimelineStore;
 use epoch_vfs::control_plane::CP_BASE;
 use epoch_vfs::{
-    overlay_probe, CasVfs, CheckpointedFs, ControlPlaneVfs, HistoryDir, PassthroughVfs, SignalVfs,
+    overlay_probe, CasVfs, CheckpointedFs, ControlPlaneVfs, DebugStats, HistoryDir, PassthroughVfs,
+    SignalVfs,
 };
 use epoch_vfs_api::{InodeId, VfsService};
 
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return mount_durable(mountpoint, state_dir, lower_dir, head, hard_fsync);
         }
 
-        let vfs: Arc<dyn VfsService> = match lower_dir {
+        let live: Arc<CasVfs<MemoryByteBackend>> = match lower_dir {
             Some(lower_dir) => {
                 let lower_dir = fs::canonicalize(lower_dir)?;
                 eprintln!(
@@ -72,6 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(CasVfs::in_memory())
             }
         };
+        // Graft `.vfs` on so `.vfs/debug` serves the live tree's statistics.
+        let debug: Arc<dyn DebugStats> = live.clone();
+        let vfs = Arc::new(ControlPlaneVfs::new(live).with_debug(debug));
         mount_spike(mountpoint, vfs)?;
         return Ok(());
     }
@@ -161,11 +165,13 @@ fn mount_durable(
     );
 
     // Signal only real filesystem activity (inside the control plane, so
-    // `.vfs/*` reads never feed the trigger).
+    // `.vfs/*` reads never feed the trigger). The debug provider is the CasVfs
+    // itself (not the SignalVfs wrapper), so `.vfs/debug` reads bypass it too.
+    let debug: Arc<dyn DebugStats> = live.clone();
     let signaled: Arc<dyn VfsService> =
         Arc::new(SignalVfs::new(live, scheduler.handle(), hard_fsync));
     let history_dir = Arc::new(HistoryDir::new(history, InodeId(CP_BASE), lower));
-    let vfs = Arc::new(ControlPlaneVfs::with_history(signaled, history_dir));
+    let vfs = Arc::new(ControlPlaneVfs::with_history(signaled, history_dir).with_debug(debug));
 
     mount_spike(mountpoint, vfs)?;
     // Unmounted: dropping the scheduler runs a final checkpoint if needed.

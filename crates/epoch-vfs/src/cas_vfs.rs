@@ -31,42 +31,54 @@ use epoch_vfs_api::{
 };
 use epoch_worktree::{TreeId, WorkingTree};
 
+use crate::debug::{DebugSnapshot, DebugStats, NearCount};
+
 /// A [`VfsService`] backed by a copy-on-write [`WorkingTree`] over the
 /// content-addressed object store. See the [module docs](self) for the two
 /// shapes (pure vs overlay) and the handle model.
 pub struct CasVfs<Bk> {
     tree: Mutex<WorkingTree<Bk>>,
+    /// The byte backend the tree stores into (backends are cheap `Arc`-backed
+    /// clones), kept so [`DebugStats`] can ask it for a near-tier count.
+    backend: Bk,
     /// Monotonic source of opaque file-handle tokens.
     next_handle: AtomicU64,
 }
 
 impl<Bk: SyncByteBackend + Clone> CasVfs<Bk> {
-    fn wrap(tree: WorkingTree<Bk>) -> Self {
+    fn wrap(backend: Bk, tree: WorkingTree<Bk>) -> Self {
         Self {
             tree: Mutex::new(tree),
+            backend,
             next_handle: AtomicU64::new(1),
         }
     }
 
     /// An empty **pure-mode** filesystem (a single root directory), no lower.
     pub fn new(backend: Bk) -> Self {
-        Self::wrap(WorkingTree::new(backend))
+        Self::wrap(backend.clone(), WorkingTree::new(backend))
     }
 
     /// A **pure-mode** filesystem hydrated from a sealed root [`TreeId`].
     pub fn from_root(backend: Bk, root: TreeId) -> VfsResult<Self> {
-        Ok(Self::wrap(WorkingTree::from_root(backend, root)?))
+        Ok(Self::wrap(
+            backend.clone(),
+            WorkingTree::from_root(backend, root)?,
+        ))
     }
 
     /// An empty copy-on-write **overlay** over `lower`: untouched names fall
     /// through to it; writes/deletes materialize into the CAS.
     pub fn overlay(backend: Bk, lower: Arc<dyn VfsService>) -> Self {
-        Self::wrap(WorkingTree::overlay(backend, lower))
+        Self::wrap(backend.clone(), WorkingTree::overlay(backend, lower))
     }
 
     /// An **overlay** rehydrated from a persisted sparse `delta` on top of `lower`.
     pub fn from_overlay(backend: Bk, lower: Arc<dyn VfsService>, delta: TreeId) -> VfsResult<Self> {
-        Ok(Self::wrap(WorkingTree::from_overlay(backend, lower, delta)?))
+        Ok(Self::wrap(
+            backend.clone(),
+            WorkingTree::from_overlay(backend, lower, delta)?,
+        ))
     }
 
     /// Seal the current state into immutable objects, returning the new root
@@ -92,6 +104,24 @@ impl CasVfs<MemoryByteBackend> {
     /// throwaway mount (`CasVfs::new(MemoryByteBackend::new())`).
     pub fn in_memory() -> Self {
         Self::new(MemoryByteBackend::new())
+    }
+}
+
+/// The `.vfs/debug` provider: a fresh point-in-time snapshot of the working
+/// tree under its lock, plus the backend's near-tier count where the backend
+/// shape supports one (see [`NearCount`]).
+impl<Bk: SyncByteBackend + Clone + NearCount> DebugStats for CasVfs<Bk> {
+    fn debug_snapshot(&self) -> DebugSnapshot {
+        let tree = self.lock();
+        DebugSnapshot {
+            near_objects: self.backend.near_count(),
+            dirty_files: tree.dirty_file_count(),
+            overlay_paths: tree
+                .overlay_entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
     }
 }
 

@@ -181,6 +181,50 @@ impl DirChildren {
     }
 }
 
+/// One materialized overlay node, as reported by
+/// [`overlay_entries`](WorkingTree::overlay_entries): the node's absolute
+/// `path` (from the working tree's root, `/`-separated) and what `kind` of
+/// delta it is.
+///
+/// The [`Display`](std::fmt::Display) rendering is the human-readable one-line
+/// form used by debug listings: a plain path for a file, a trailing `/` for a
+/// directory, and ` (tombstone)` / ` (sealed subtree)` annotations for the
+/// non-plain kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayEntry {
+    /// Absolute path from the working tree's root (leading `/`, no trailing
+    /// slash — [`Display`](std::fmt::Display) adds one for directories). Names
+    /// are rendered lossily where they are not valid UTF-8.
+    pub path: String,
+    /// What kind of materialized node the path is.
+    pub kind: OverlayEntryKind,
+}
+
+/// The kind of a materialized overlay node (see [`OverlayEntry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayEntryKind {
+    /// An upper-materialized regular file (created or copied up; clean or dirty).
+    File,
+    /// A directory created in the upper (no lower counterpart).
+    Dir,
+    /// A whiteout hiding the lower entry of this name.
+    Tombstone,
+    /// A still-[`Sealed`](DirChildren::Sealed) directory: part of the delta but
+    /// never faulted in this session, reported **without** decoding its subtree.
+    SealedDir,
+}
+
+impl std::fmt::Display for OverlayEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            OverlayEntryKind::File => write!(f, "{}", self.path),
+            OverlayEntryKind::Dir => write!(f, "{}/", self.path),
+            OverlayEntryKind::Tombstone => write!(f, "{} (tombstone)", self.path),
+            OverlayEntryKind::SealedDir => write!(f, "{}/ (sealed subtree)", self.path),
+        }
+    }
+}
+
 /// The link sealed and hydrated for every tree: a populated entry (blob or
 /// subtree) or a [`Tombstone`](Overlay::Tombstone) whiteout. With an empty lower
 /// no tombstone is ever produced, so the tree is byte-identical to a complete
@@ -946,6 +990,81 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
 
         let size = self.files.size(&blob).map_err(io)?.unwrap_or(0);
         Ok((blob, size))
+    }
+
+    // --- debug introspection --------------------------------------------------
+
+    /// The number of files with a live, un-sealed [`FileWriter`] (inodes whose
+    /// body is [`Dirty`](FileBody::Dirty)) — i.e. content written since the last
+    /// [`seal`](Self::seal) (which commits every writer and flips it clean).
+    /// Read-only: never faults anything in.
+    pub fn dirty_file_count(&self) -> usize {
+        self.inodes
+            .values()
+            .filter(|inode| matches!(inode.body, Body::File(FileBody::Dirty(_))))
+            .count()
+    }
+
+    /// List every node materialized in the overlay — the delta vs the lower:
+    /// upper files (created or copied up), upper-created directories,
+    /// tombstones, and still-sealed subtrees.
+    ///
+    /// Read-only and **hydration-free**: it walks only the
+    /// already-[`Open`](DirChildren::Open) upper spine. A directory still
+    /// [`Sealed`](DirChildren::Sealed) is reported as a single
+    /// [`SealedDir`](OverlayEntryKind::SealedDir) entry without loading its tree
+    /// object. Cached fall-through nodes ([`LowerFile`](Body::LowerFile) and
+    /// hydrated fall-through dirs) are *not* delta and are not listed — a
+    /// fall-through dir is only descended into. Entries come back in
+    /// depth-first, name-sorted order.
+    pub fn overlay_entries(&self) -> Vec<OverlayEntry> {
+        let mut out = Vec::new();
+        // A root never faulted in this session is itself a sealed subtree.
+        if let Some(Inode { body: Body::Dir { children: DirChildren::Sealed(_), .. }, .. }) =
+            self.inodes.get(&ROOT_INODE_ID)
+        {
+            out.push(OverlayEntry { path: String::new(), kind: OverlayEntryKind::SealedDir });
+            return out;
+        }
+        self.collect_overlay(ROOT_INODE_ID, "", &mut out);
+        out
+    }
+
+    /// Depth-first walk behind [`overlay_entries`](Self::overlay_entries):
+    /// append `dir`'s materialized children (prefixed with `prefix`) to `out`.
+    fn collect_overlay(&self, dir: InodeId, prefix: &str, out: &mut Vec<OverlayEntry>) {
+        let children = match self.inodes.get(&dir).map(|inode| &inode.body) {
+            Some(Body::Dir { children: DirChildren::Open(map), .. }) => map,
+            _ => return,
+        };
+        for (name, child) in children {
+            let path = format!("{prefix}/{}", name.to_string_lossy());
+            match self.inodes.get(child).map(|inode| &inode.body) {
+                Some(Body::File(_)) => {
+                    out.push(OverlayEntry { path, kind: OverlayEntryKind::File });
+                }
+                Some(Body::Tombstone) => {
+                    out.push(OverlayEntry { path, kind: OverlayEntryKind::Tombstone });
+                }
+                Some(Body::Dir { children: DirChildren::Sealed(_), .. }) => {
+                    out.push(OverlayEntry { path, kind: OverlayEntryKind::SealedDir });
+                }
+                Some(Body::Dir { children: DirChildren::Open(_), lower }) => {
+                    // An upper-created dir is delta; a hydrated fall-through dir
+                    // is only a route to deeper delta.
+                    if lower.is_none() {
+                        out.push(OverlayEntry {
+                            path: path.clone(),
+                            kind: OverlayEntryKind::Dir,
+                        });
+                    }
+                    self.collect_overlay(*child, &path, out);
+                }
+                // Cached fall-throughs are not delta; a dangling id is a bug we
+                // do not surface from a debug listing.
+                Some(Body::LowerFile(_)) | None => {}
+            }
+        }
     }
 
     // --- small helpers -------------------------------------------------------

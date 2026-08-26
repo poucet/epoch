@@ -7,6 +7,10 @@
 //! - `.vfs/cas` — a read-only directory that is intentionally **not listable**:
 //!   content-addressed entries are addressable by id, not enumerable.
 //! - `.vfs/cas/<id>` — a synthetic read-only file whose contents are `<id>\n`.
+//! - `.vfs/debug` — when configured via [`with_debug`](ControlPlaneVfs::with_debug),
+//!   a listable read-only directory of live statistics
+//!   (`near-objects`, `dirty-files`, `overlay`), each rendered fresh from the
+//!   provider's [`DebugSnapshot`](crate::debug::DebugSnapshot) on every access.
 //!
 //! Everything outside `.vfs` is delegated unchanged to `inner`.
 //!
@@ -37,6 +41,7 @@ use epoch_vfs_api::{
     WriteRequest,
 };
 
+use crate::debug::DebugStats;
 use crate::history_dir::{HIST_ROOT_ID, is_hist};
 
 /// Name of the synthetic control-plane directory at the mount root.
@@ -45,6 +50,8 @@ const CONTROL_DIR: &str = ".vfs";
 const CAS_DIR: &str = "cas";
 /// Name of the time-travel directory inside the control plane.
 const HISTORY_DIR: &str = "history";
+/// Name of the live-statistics directory inside the control plane.
+const DEBUG_DIR: &str = "debug";
 
 /// First [`InodeId`]/[`FileHandle`] value owned by the control plane.
 ///
@@ -56,8 +63,29 @@ pub const CP_BASE: u64 = 0x8000_0000_0000_0000;
 pub(crate) const VFS_NODE_ID: InodeId = InodeId(CP_BASE);
 /// Reserved node id of the `.vfs/cas` directory.
 const CAS_NODE_ID: InodeId = InodeId(CP_BASE + 1);
+/// Reserved node id of the `.vfs/debug` directory.
+const DEBUG_NODE_ID: InodeId = InodeId(CP_BASE + 2);
+/// Reserved node id of the `.vfs/debug/near-objects` file.
+const DEBUG_NEAR_ID: InodeId = InodeId(CP_BASE + 3);
+/// Reserved node id of the `.vfs/debug/dirty-files` file.
+const DEBUG_DIRTY_ID: InodeId = InodeId(CP_BASE + 4);
+/// Reserved node id of the `.vfs/debug/overlay` file.
+const DEBUG_OVERLAY_ID: InodeId = InodeId(CP_BASE + 5);
 /// First mintable id for `.vfs/cas/<id>` entries and synthetic file handles.
-const FIRST_DYNAMIC: u64 = CP_BASE + 2;
+const FIRST_DYNAMIC: u64 = CP_BASE + 6;
+
+/// The three `.vfs/debug` files, as `(name, reserved node id)` pairs — the
+/// single source for lookup, readdir, and content routing.
+const DEBUG_FILES: [(&str, InodeId); 3] = [
+    ("near-objects", DEBUG_NEAR_ID),
+    ("dirty-files", DEBUG_DIRTY_ID),
+    ("overlay", DEBUG_OVERLAY_ID),
+];
+
+/// Returns `true` if `id` is one of the reserved `.vfs/debug/<file>` nodes.
+fn is_debug_file(id: InodeId) -> bool {
+    DEBUG_FILES.iter().any(|&(_, file_id)| file_id == id)
+}
 
 /// Returns `true` if `id` belongs to the control plane's reserved high range.
 fn is_cp(id: u64) -> bool {
@@ -74,6 +102,11 @@ pub struct ControlPlaneVfs {
     /// [`HIST_BASE`](crate::history_dir::HIST_BASE) — a sub-range of the
     /// control plane's — so routing checks `is_hist` before `is_cp`.
     history: Option<Arc<dyn VfsService>>,
+    /// The `.vfs/debug` statistics provider (in practice the live
+    /// [`CasVfs`](crate::CasVfs)), when configured via
+    /// [`with_debug`](Self::with_debug). Without one, `.vfs/debug` does not
+    /// exist.
+    debug: Option<Arc<dyn DebugStats>>,
 }
 
 impl std::fmt::Debug for ControlPlaneVfs {
@@ -102,6 +135,7 @@ impl ControlPlaneVfs {
             state: RwLock::new(CasState::default()),
             next_id: AtomicU64::new(FIRST_DYNAMIC),
             history: None,
+            debug: None,
         }
     }
 
@@ -111,6 +145,15 @@ impl ControlPlaneVfs {
         Self {
             history: Some(history),
             ..Self::new(inner)
+        }
+    }
+
+    /// Additionally serve `.vfs/debug` from `debug`'s live statistics
+    /// (consuming builder, orthogonal to [`with_history`](Self::with_history)).
+    pub fn with_debug(self, debug: Arc<dyn DebugStats>) -> Self {
+        Self {
+            debug: Some(debug),
+            ..self
         }
     }
 
@@ -158,6 +201,36 @@ impl ControlPlaneVfs {
     fn cp_handle(&self) -> FileHandle {
         FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// The debug provider, or `NotFound` where a caller reached a debug id
+    /// without one configured (impossible in practice: without a provider the
+    /// debug nodes are never handed out).
+    fn debug(&self) -> VfsResult<&Arc<dyn DebugStats>> {
+        self.debug.as_ref().ok_or(VfsError::NotFound)
+    }
+
+    /// Render the current contents of the `.vfs/debug` file `inode_id` — a
+    /// fresh snapshot per call, so `getattr` sizes and `read` bytes both track
+    /// the live state (procfs-style; a read racing a mutation may see a size
+    /// from a slightly older snapshot).
+    fn debug_content(&self, inode_id: InodeId) -> VfsResult<Vec<u8>> {
+        let snapshot = self.debug()?.debug_snapshot();
+        let text = match inode_id {
+            DEBUG_NEAR_ID => match snapshot.near_objects {
+                Some(count) => format!("{count}\n"),
+                // The backend cannot count its staging tier cheaply.
+                None => "unknown\n".to_owned(),
+            },
+            DEBUG_DIRTY_ID => format!("{}\n", snapshot.dirty_files),
+            DEBUG_OVERLAY_ID => snapshot
+                .overlay_paths
+                .iter()
+                .map(|path| format!("{path}\n"))
+                .collect(),
+            _ => return Err(VfsError::NotFound),
+        };
+        Ok(text.into_bytes())
+    }
 }
 
 impl VfsService for ControlPlaneVfs {
@@ -182,13 +255,24 @@ impl VfsService for ControlPlaneVfs {
                 if self.history.is_some() && name == OsStr::new(HISTORY_DIR) {
                     return self.history()?.getattr(HIST_ROOT_ID).map(Entry::new);
                 }
+                if self.debug.is_some() && name == OsStr::new(DEBUG_DIR) {
+                    return Ok(Entry::new(control_dir_attr(DEBUG_NODE_ID)));
+                }
                 // `.vfs/<other>` is not a defined control entry yet.
                 return Err(VfsError::NotFound);
+            }
+            if parent == DEBUG_NODE_ID {
+                let (_, inode_id) = DEBUG_FILES
+                    .iter()
+                    .find(|(file_name, _)| name == OsStr::new(file_name))
+                    .ok_or(VfsError::NotFound)?;
+                let size = self.debug_content(*inode_id)?.len() as u64;
+                return Ok(Entry::new(cp_file_attr(*inode_id, size)));
             }
             if parent == CAS_NODE_ID {
                 let inode_id = self.cas_node_id(name)?;
                 let size = cas_content(name).len() as u64;
-                return Ok(Entry::new(cas_entry_attr(inode_id, size)));
+                return Ok(Entry::new(cp_file_attr(inode_id, size)));
             }
             // cas ids and any other control node have no children.
             return Err(VfsError::NotFound);
@@ -198,15 +282,21 @@ impl VfsService for ControlPlaneVfs {
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
-        if inode_id == VFS_NODE_ID || inode_id == CAS_NODE_ID {
+        if inode_id == VFS_NODE_ID || inode_id == CAS_NODE_ID || inode_id == DEBUG_NODE_ID {
             return Ok(control_dir_attr(inode_id));
         }
         if is_hist(inode_id.0) {
             return self.history()?.getattr(inode_id);
         }
+        if is_debug_file(inode_id) {
+            return Ok(cp_file_attr(
+                inode_id,
+                self.debug_content(inode_id)?.len() as u64,
+            ));
+        }
         if is_cp(inode_id.0) {
             let name = self.cas_name(inode_id)?.ok_or(VfsError::NotFound)?;
-            return Ok(cas_entry_attr(inode_id, cas_content(&name).len() as u64));
+            return Ok(cp_file_attr(inode_id, cas_content(&name).len() as u64));
         }
         self.inner.getattr(inode_id)
     }
@@ -239,11 +329,31 @@ impl VfsService for ControlPlaneVfs {
                     NodeKind::Directory,
                 ));
             }
+            if self.debug.is_some() {
+                entries.push(DirEntry::new(
+                    DEBUG_NODE_ID,
+                    OsString::from(DEBUG_DIR),
+                    NodeKind::Directory,
+                ));
+            }
             return Ok(entries);
         }
 
         if is_hist(inode_id.0) {
             return self.history()?.readdir(inode_id);
+        }
+
+        if inode_id == DEBUG_NODE_ID {
+            // Unlike `.vfs/cas`, the debug files are a fixed set: list them.
+            self.debug()?;
+            let mut entries = vec![
+                DirEntry::new(DEBUG_NODE_ID, OsString::from("."), NodeKind::Directory),
+                DirEntry::new(VFS_NODE_ID, OsString::from(".."), NodeKind::Directory),
+            ];
+            entries.extend(DEBUG_FILES.iter().map(|&(name, file_id)| {
+                DirEntry::new(file_id, OsString::from(name), NodeKind::RegularFile)
+            }));
+            return Ok(entries);
         }
 
         if inode_id == CAS_NODE_ID {
@@ -270,11 +380,20 @@ impl VfsService for ControlPlaneVfs {
             if request.mode != OpenMode::ReadOnly || request.truncate || request.append {
                 return Err(VfsError::ReadOnlyFilesystem);
             }
-            if request.inode_id == VFS_NODE_ID || request.inode_id == CAS_NODE_ID {
+            if request.inode_id == VFS_NODE_ID
+                || request.inode_id == CAS_NODE_ID
+                || request.inode_id == DEBUG_NODE_ID
+            {
                 return Err(VfsError::IsDirectory);
             }
-            // A synthetic cas entry: register a synthetic read-only handle.
-            self.cas_name(request.inode_id)?.ok_or(VfsError::NotFound)?;
+            if is_debug_file(request.inode_id) {
+                // A debug file: verify the provider exists, then hand out a
+                // synthetic read-only handle (content renders fresh per read).
+                self.debug()?;
+            } else {
+                // A synthetic cas entry: register a synthetic read-only handle.
+                self.cas_name(request.inode_id)?.ok_or(VfsError::NotFound)?;
+            }
             return Ok(OpenedFile {
                 handle: self.cp_handle(),
                 direct_io: false,
@@ -289,8 +408,15 @@ impl VfsService for ControlPlaneVfs {
             return self.history()?.read(request);
         }
         if is_cp(request.inode_id.0) {
-            if request.inode_id == VFS_NODE_ID || request.inode_id == CAS_NODE_ID {
+            if request.inode_id == VFS_NODE_ID
+                || request.inode_id == CAS_NODE_ID
+                || request.inode_id == DEBUG_NODE_ID
+            {
                 return Err(VfsError::IsDirectory);
+            }
+            if is_debug_file(request.inode_id) {
+                let content = self.debug_content(request.inode_id)?;
+                return slice_bytes(&content, request.offset, request.size);
             }
             let name = self.cas_name(request.inode_id)?.ok_or(VfsError::NotFound)?;
             return slice_bytes(&cas_content(&name), request.offset, request.size);
@@ -379,7 +505,9 @@ fn control_dir_attr(inode_id: InodeId) -> NodeAttr {
     attr
 }
 
-fn cas_entry_attr(inode_id: InodeId, size: u64) -> NodeAttr {
+/// Attrs of a synthetic read-only control-plane file (`.vfs/cas/<id>` and the
+/// `.vfs/debug` files).
+fn cp_file_attr(inode_id: InodeId, size: u64) -> NodeAttr {
     let mut attr = NodeAttr::regular_file(inode_id, size, SystemTime::now());
     attr.perm = 0o444;
     attr

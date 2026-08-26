@@ -555,6 +555,55 @@ mod overlay {
             "lower=None and overlay-over-empty must seal to the identical TreeId"
         );
     }
+
+    /// `overlay_entries` reports exactly the delta vs the lower: created files
+    /// and dirs, copied-up files, and tombstones — while cached fall-throughs
+    /// (a lower file merely read, a hydrated fall-through dir) stay invisible.
+    #[test]
+    fn overlay_entries_report_the_delta_not_fall_throughs() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "keep.txt", b"untouched");
+        b.file(ROOT_INODE_ID, "doomed.txt", b"soon gone");
+        let sub = b.dir(ROOT_INODE_ID, "sub");
+        b.file(sub, "change.txt", b"old");
+        let lower = b.build();
+
+        let mut wt = Wt::overlay(MemoryByteBackend::new(), lower);
+        let root = wt.root();
+
+        // Nothing mutated yet: reading a lower file caches a fall-through, which
+        // must not appear as delta.
+        let keep = wt.lookup(root, OsStr::new("keep.txt")).unwrap();
+        assert_eq!(wt.read_at(keep, 0, 64).unwrap(), b"untouched");
+        assert!(wt.overlay_entries().is_empty(), "fall-throughs are not delta");
+
+        // Mutate: create a file and a dir, copy up a nested file, tombstone a
+        // lower name.
+        let created = wt.create(root, OsStr::new("new.txt"), 0o100644).unwrap();
+        wt.write_at(created, 0, b"fresh").unwrap();
+        wt.mkdir(root, OsStr::new("made"), 0o040755).unwrap();
+        let sub_id = wt.lookup(root, OsStr::new("sub")).unwrap();
+        let ch = wt.lookup(sub_id, OsStr::new("change.txt")).unwrap();
+        wt.write_at(ch, 0, b"new").unwrap();
+        wt.unlink(root, OsStr::new("doomed.txt")).unwrap();
+
+        let entries = wt.overlay_entries();
+        let rendered: Vec<String> = entries.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "/doomed.txt (tombstone)".to_string(),
+                "/made/".to_string(),
+                "/new.txt".to_string(),
+                "/sub/change.txt".to_string(),
+            ]
+        );
+        // The hydrated fall-through dir `sub` itself is a route, not delta.
+        assert!(
+            !entries.iter().any(|e| e.path == "/sub"),
+            "a fall-through dir must not be listed itself"
+        );
+    }
 }
 
 /// Trees and blobs can live in independent backends; rehydrating with both
@@ -591,6 +640,27 @@ fn unlink_and_rmdir_remove_entries() {
     let _ = dir;
 
     assert!(wt.readdir(root).unwrap().is_empty());
+}
+
+/// `dirty_file_count` tracks exactly the files with an un-sealed live writer:
+/// it rises on create/write, drops to zero on `seal` (which commits every
+/// writer), and rises again when a sealed file is re-edited.
+#[test]
+fn dirty_file_count_tracks_unsealed_writers() {
+    let mut wt = Wt::new(MemoryByteBackend::new());
+    let root = wt.root();
+    assert_eq!(wt.dirty_file_count(), 0);
+
+    write_file(&mut wt, root, "a", b"alpha");
+    write_file(&mut wt, root, "b", b"beta");
+    assert_eq!(wt.dirty_file_count(), 2, "created-but-unsealed files are dirty");
+
+    wt.seal().unwrap();
+    assert_eq!(wt.dirty_file_count(), 0, "seal commits every writer");
+
+    let a = wt.lookup(root, OsStr::new("a")).unwrap();
+    wt.write_at(a, 0, b"edited").unwrap();
+    assert_eq!(wt.dirty_file_count(), 1, "re-editing a sealed file dirties it again");
 }
 
 /// Hydration is lazy: a sealed tree faults in one spine level per access, and an
@@ -699,5 +769,41 @@ mod lazy_hydration {
         let resealed = wt.seal().unwrap();
         assert_eq!(resealed, sealed, "an untouched tree reseals to the identical root id");
         assert_eq!(backend.gets(), 0, "sealing an untouched tree walks no objects");
+    }
+
+    /// `overlay_entries` reports a still-sealed directory as a single
+    /// `(sealed subtree)` line without decoding it — zero object reads.
+    #[test]
+    fn overlay_entries_report_sealed_subtrees_without_hydration() {
+        use epoch_worktree::OverlayEntryKind;
+
+        let backend = CountingBackend::new();
+        let sealed = seal_sample(&backend);
+
+        // A freshly hydrated root is itself one sealed subtree — and listing it
+        // must not read anything.
+        backend.reset();
+        let mut wt = Wt::from_root(backend.clone(), sealed).unwrap();
+        let entries = wt.overlay_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, OverlayEntryKind::SealedDir);
+        assert_eq!(entries[0].to_string(), "/ (sealed subtree)");
+        assert_eq!(backend.gets(), 0, "listing must not hydrate the root");
+
+        // Open the root spine one level (a single lookup): `a` and `b` are now
+        // inodes but still Sealed. Listing names them without loading them.
+        let root = wt.root();
+        wt.lookup(root, OsStr::new("a")).unwrap();
+        backend.reset();
+        let rendered: Vec<String> =
+            wt.overlay_entries().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "/a/ (sealed subtree)".to_string(),
+                "/b/ (sealed subtree)".to_string(),
+            ]
+        );
+        assert_eq!(backend.gets(), 0, "sealed subtrees are listed without decoding");
     }
 }
