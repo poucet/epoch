@@ -1,37 +1,49 @@
 # epoch — Tasks & Handoff
 
 **Status:** Working notes / handoff (for review)
-**As of:** 2026-08-26
-**Scope:** Where the storage + checkpointing + timeline work stands, and what to pick up next. Architecture: `docs/ARCHITECTURE.md` (as-built); checkpoint/timeline design: `docs/TIMELINE.md`.
+**As of:** 2026-08-26 (evening)
+**Scope:** Current state and what to pick up next. Architecture: `docs/ARCHITECTURE.md` (as-built); checkpoint/timeline design: `docs/TIMELINE.md`.
 
 ---
 
 ## 0. TL;DR
 
-The full vertical is **built and green**: CoW overlay runtime → tiered storage → checkpoint layer (closure walk, batched promotion, debounced trigger) → engine-agnostic timeline with lineage/forking → `.vfs/history` time travel → durable FUSE mount (`epoch-fuse cas <mnt> --state <dir> [<lower>]`, resumes from the head's last checkpoint). Overlay mounts checkpoint their sparse delta. What remains is the **multi-agent daemon** (both cuts), **GC**, and **OpaqueTree** ingestion.
+The single-machine filesystem is **feature-complete for daily use**: durable checkpointed CoW overlay, time travel, typed object browsing, configurable pass-through subtrees, live debug stats — mounted natively on macOS (TCC issue fixed) and resumable across remounts. `.vfs` is a plugin registry. What remains is the multi-agent daemon (both cuts), GC, and OpaqueTree.
 
-## 1. Current trunk
-
-Linear line ending at bookmark `main`:
-
-`… → cas-typed-id → … → epoch-cas-redb` (previous handoff) `→ filecas-manifest → cas-put-many → tiered-promote-many → timeline-api → timeline-redb → history-closure → history-commit → vfs-fsync → history-vfs → checkpoint-trigger → mount-durable → overlay-checkpoint → macos-helper-mount → main (mount-mac.sh mode switch)`
-
-All green (workspace tests + clippy) at `main`.
-
-## 2. Running it
+## 1. Running it
 
 ```sh
 EPOCH_STATE=~/.epoch ./mount-mac.sh ~/some/project    # durable checkpointed overlay at ~/epoch
-./mount-mac.sh                                        # old read-only probe (unchanged)
+./mount-mac.sh                                        # legacy read-only probe (unchanged)
 ```
 
-Knobs: `EPOCH_HEAD` (timeline head, default `main`), `EPOCH_HARD_FSYNC=1`
-(synchronous fsync barrier), `EPOCH_MOUNT`. Time travel:
-`ls <mount>/.vfs/history/`, `cat <mount>/.vfs/history/5s-ago/<file>`.
-Remount with the same state dir resumes from the last checkpoint.
+Knobs: `EPOCH_HEAD` (timeline head, default `main`), `EPOCH_HARD_FSYNC=1`, `EPOCH_MOUNT`.
 
-Known machine issue: after many mount attempts macFUSE can start denying all
-access (EPERM) until reboot — unrelated to the code.
+Inside the mount, `.vfs/` is the control plane (a registry of pluggable features):
+
+| Path | What |
+|---|---|
+| `.vfs/history/<unix-millis>` | read-only snapshot at the newest checkpoint ≤ that time |
+| `.vfs/history/<N><unit>-ago` | relative form (`500ms-ago`, `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago`) |
+| `.vfs/history/head` | current checkpoint: event id, **root tree hash**, timestamp |
+| `.vfs/history/id/<event-hex>` | any event by id (dir itself unlistable) |
+| `.vfs/cas/<hash>` | typed object portal: tree hash ⇒ browsable read-only dir, file hash ⇒ `cat`-able file, chunks hidden (dir unlistable) |
+| `.vfs/debug/{near-objects,dirty-files,overlay}` | live stats: staging object count, un-sealed writers, overlay delta listing |
+
+Explore by hand: `` ls .vfs/cas/$(grep '^root: ' .vfs/history/head | cut -d' ' -f2) ``
+
+A gitignore-syntax **`.epochignore`** in the lower directory routes matching
+subtrees (`node_modules/`, `.git/`, `.jj/`, caches, …) straight to the host —
+reads AND writes bypass the overlay and are never checkpointed.
+
+## 2. This session's additions (all on the linear trunk, `main` at the tip)
+
+`fuse-mount-fix → vfs-debug → vfs-plugins → route-ignore → cas-kind-tags → cas-object-portal → history-head`
+
+- **macOS mount fixed**: `local`/`nobrowse`/`noappledouble` mount options (TCC was silently EPERM-ing every open on the un-flagged volume); `VfsService::truncate` + fuser `setattr` (kernels deliver `O_TRUNC`/`truncate(2)` as `setattr(size)` — was ENOSYS).
+- **`.vfs` as a feature registry**: every entry is a plain `VfsService` registered via `ControlPlaneVfs::with_feature(name, |slot| …)` owning a `1<<56`-sized id slice; routing is arithmetic. `SubMounts<K>` is the shared "mount a read-only sub-filesystem, remap its ids" helper used by both history (per `EventId`) and the cas portal (per `TreeId`).
+- **Object-kind domain tags** (breaking: all hashes changed — wipe old `--state` dirs): canonical encodings start with a hashed kind byte, `'T'` tree / `'F'` file manifest / `'C'` chunk. Type confusion structurally impossible; portal type-sniffs one byte.
+- **`.epochignore` routing**: writable `PassthroughVfs` + `RouterVfs` (ids in `[0x4000…, 0x8000…)`); routed traffic emits no checkpoint signals.
 
 ## 3. What's next (ordered)
 
@@ -39,30 +51,33 @@ access (EPERM) until reboot — unrelated to the code.
    cache, scheduler, timeline; each `epoch-fuse` mount becomes a
    FUSE ↔ `VfsService`-over-UDS shim. Enables N concurrent mounts sharing one
    state (redb is single-writer-per-process). Fork = daemon control verb.
-   Single-process mode remains the no-daemon composition. (TIMELINE.md §3.)
+   (TIMELINE.md §3.)
 2. **Remote byte/timeline cut** — network `ByteBackend` + `TimelineStore`
-   clients for a cloud far tier. Prereq trait extensions: batched `has_many`,
-   compare-and-swap `set_head_if(old, new)`.
-3. **`OpaqueTree` / compaction** — flatten overlay+lower into a standalone
-   tree at checkpoint, making history immune to lower drift.
+   clients for a cloud far tier. Prereqs: batched `has_many`, compare-and-swap
+   `set_head_if(old, new)`.
+3. **`OpaqueTree` / compaction** — flatten overlay+lower at checkpoint, making
+   history immune to lower drift (also fixes the `.vfs/history` /
+   `.epochignore` fall-through caveats).
 4. **GC by retention** (`epoch-gc`) — mark from heads (+ live volatile roots),
-   sweep unreachable CAS objects and timeline events; also cleans checkpoint
-   crash orphans.
-5. **VfsService gaps** — `rename`, `symlink`, `setattr`; seal-on-close in
-   `release` (needs the inode id in the release signature).
+   sweep unreachable objects/events; cleans checkpoint crash orphans.
+5. **VfsService gaps** — `rename`, `symlink`, full `setattr` persistence
+   (mode/times are currently accepted-and-ignored); seal-on-close in `release`.
 
 ## 4. Deferred (agreed, not started)
 
-- Evictable / persistent inodes (FUSE-`forget` refcounting; ids stable across
-  remount) and `.vfs/history` snapshot-cache eviction — same problem class.
+- Evictable / persistent inodes (FUSE-`forget`; ids stable across remount) and
+  sub-mount/minted-id cache eviction — same problem class.
 - Spill staging tier for working sets larger than RAM.
-- `.gitignore` scratchpad routing (`VfsRouter`).
-- Control plane (REST/gRPC) + `epoch-cli`; non-FUSE adapters.
-- Merge events (the event format already carries multiple parents).
+- `.epochignore` live reload (rules load once at mount).
+- Control plane (REST/gRPC) + `epoch-cli`; non-FUSE adapters; merge events.
+- Housekeeping: spent `.worktrees/{vfs-debug,route-ignore}` workspaces can be
+  `jj workspace forget` + removed.
 
 ## 5. Resuming
 
-- Trunk is linear; new work stacks on `main`.
-- `docs/TIMELINE.md` holds the checkpoint/timeline contracts and the accepted
-  trade-offs (ordering-not-atomicity, overlay lower-drift caveat, trigger
-  defaults). `docs/ARCHITECTURE.md` is the as-built crate map and layering.
+- Trunk is linear; new work stacks on `main`. Each feature above also has its
+  own bookmark for review.
+- `docs/TIMELINE.md` holds the checkpoint/timeline contracts and accepted
+  trade-offs; `docs/ARCHITECTURE.md` the as-built crate map (note: its `.vfs`
+  section predates the feature-registry refactor and the typed portal —
+  refresh alongside the daemon work).
