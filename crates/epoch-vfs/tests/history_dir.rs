@@ -307,6 +307,68 @@ fn overlay_checkpoints_record_deltas_and_snapshots_rehydrate_over_lower() {
 }
 
 #[test]
+fn head_file_names_the_checkpoint_and_feeds_the_cas_portal() {
+    // A control plane with BOTH history and the typed cas portal, so the
+    // root hash printed by `.vfs/history/head` can be browsed immediately.
+    let tier = Tiered::new(MemoryByteBackend::new(), MemoryByteBackend::new());
+    let live = Arc::new(CasVfs::new(tier.clone()));
+    let history = Arc::new(History::new(
+        tier.clone(),
+        Arc::new(MemoryTimelineStore::new()),
+        "main",
+    ));
+    let cp = ControlPlaneVfs::new(live.clone())
+        .with_feature("cas", {
+            let tier = tier.clone();
+            move |slot| Arc::new(epoch_vfs::CasObjectDir::new(slot, tier))
+        })
+        .with_feature("history", {
+            let history = Arc::clone(&history);
+            move |slot| Arc::new(HistoryDir::new(history, slot, None))
+        });
+    let f = Fixture { live, history, cp };
+    let hist = history_dir_id(&f.cp);
+
+    // Before any checkpoint the file exists and says so.
+    assert_eq!(read_all(&f.cp, hist, "head").unwrap(), b"no checkpoints yet\n");
+
+    write_and_checkpoint(&f, "log.txt", b"v1", 1_000);
+    write_and_checkpoint(&f, "log.txt", b"v2", 2_000);
+
+    // `head` names the newest checkpoint; readdir lists it.
+    let head = String::from_utf8(read_all(&f.cp, hist, "head").unwrap()).unwrap();
+    assert!(head.contains("timestamp_ms: 2000"), "head:\n{head}");
+    let names: Vec<String> = f
+        .cp
+        .readdir(hist)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"head".to_string()));
+
+    // The printed root hash browses through the cas portal.
+    let root_hex = head
+        .lines()
+        .find_map(|line| line.strip_prefix("root: "))
+        .expect("head names the root");
+    let vfs_dir = f.cp.lookup(ROOT_INODE_ID, OsStr::new(".vfs")).unwrap();
+    let cas = f
+        .cp
+        .lookup(vfs_dir.attr.inode_id, OsStr::new("cas"))
+        .unwrap()
+        .attr
+        .inode_id;
+    let tree = f.cp.lookup(cas, OsStr::new(root_hex)).unwrap();
+    assert_eq!(tree.attr.kind, NodeKind::Directory);
+    assert_eq!(
+        read_all(&f.cp, tree.attr.inode_id, "log.txt").unwrap(),
+        b"v2",
+        "the head root shows the newest checkpointed content"
+    );
+}
+
+#[test]
 fn snapshots_read_from_durable_tier_only() {
     let f = fixture();
     write_and_checkpoint(&f, "durable.txt", b"safe", 1_000);

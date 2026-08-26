@@ -13,6 +13,9 @@
 //! - `.vfs/history/<N><unit>-ago` — relative form of the same (`500ms-ago`,
 //!   `30s-ago`, `5m-ago`, `2h-ago`, `1d-ago`). Served with a zero entry TTL so
 //!   the kernel re-resolves it every time.
+//! - `.vfs/history/head` — a small text file naming the current checkpoint:
+//!   its event id, its **root tree hash** (feed it to `.vfs/cas/<hash>` to
+//!   browse), and its timestamp.
 //! - `.vfs/history/id/<64-hex event id>` — any event, on this head's chain or
 //!   not. `id/` itself is intentionally not listable (ids are addressable, not
 //!   enumerable). Listing `.vfs/history` shows the newest checkpoints (up to
@@ -38,7 +41,10 @@
 use std::{
     ffi::OsStr,
     str::FromStr,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -51,7 +57,7 @@ use epoch_vfs_api::{
 };
 
 use crate::cas_vfs::CasVfs;
-use crate::feature::FeatureSlot;
+use crate::feature::{FeatureSlot, cp_file_attr, slice_bytes};
 use crate::submount::SubMounts;
 
 /// How many checkpoints a `readdir` of `.vfs/history` lists (newest first).
@@ -64,8 +70,8 @@ pub struct HistoryDir<Near, Far> {
     history: Arc<History<Near, Far>>,
     /// The feature's id slice and `.vfs` parent (see [`crate::feature`]):
     /// `slot.root_id()` is `.vfs/history` itself, `slot.base + 1` the `id/`
-    /// subdirectory, and dynamic snapshot ids/handles are minted from
-    /// `slot.base + 2` upward.
+    /// subdirectory, `slot.base + 2` the `head` file, and dynamic snapshot
+    /// ids/handles are minted from `slot.base + 3` upward.
     slot: FeatureSlot,
     /// The overlay's lower filesystem, when the mount is an overlay. Each
     /// snapshot rehydrates its checkpointed **delta** over this lower, so a
@@ -77,6 +83,8 @@ pub struct HistoryDir<Near, Far> {
     /// The per-checkpoint read-only snapshot mounts, remapped into this
     /// feature's slice (see [`SubMounts`]).
     subs: SubMounts<EventId>,
+    /// Shared id/handle allocator (also used by `subs`).
+    next_id: Arc<AtomicU64>,
 }
 
 impl<Near, Far> HistoryDir<Near, Far>
@@ -92,17 +100,46 @@ where
         slot: FeatureSlot,
         lower: Option<Arc<dyn VfsService>>,
     ) -> Self {
+        let next_id = Arc::new(AtomicU64::new(slot.base + 3));
         Self {
             history,
             slot,
             lower,
-            subs: SubMounts::new(Arc::new(AtomicU64::new(slot.base + 2))),
+            subs: SubMounts::new(Arc::clone(&next_id)),
+            next_id,
         }
     }
 
     /// The `.vfs/history/id` directory node.
     fn id_dir(&self) -> InodeId {
         InodeId(self.slot.base + 1)
+    }
+
+    /// The `.vfs/history/head` file node.
+    fn head_file(&self) -> InodeId {
+        InodeId(self.slot.base + 2)
+    }
+
+    /// Render `.vfs/history/head`: the current checkpoint's identity, giving
+    /// shell users a root tree hash to feed straight into `.vfs/cas/`.
+    fn render_head(&self) -> VfsResult<Vec<u8>> {
+        let text = match self.history.head().map_err(history_error)? {
+            None => "no checkpoints yet\n".to_owned(),
+            Some(id) => {
+                let event = self
+                    .history
+                    .event(&id)
+                    .map_err(history_error)?
+                    .ok_or(VfsError::NotFound)?;
+                format!(
+                    "event: {}\nroot: {}\ntimestamp_ms: {}\n",
+                    id.to_hex(),
+                    event.root.to_hex(),
+                    event.timestamp_ms
+                )
+            }
+        };
+        Ok(text.into_bytes())
     }
 
     /// Resolve a `.vfs/history/<name>` to an event id, or `None` if the name
@@ -175,6 +212,10 @@ where
             if name == OsStr::new("id") {
                 return Ok(Entry::new(hist_dir_attr(self.id_dir())));
             }
+            if name == OsStr::new("head") {
+                let size = self.render_head()?.len() as u64;
+                return Ok(Entry::new(cp_file_attr(self.head_file(), size)));
+            }
             return match self.resolve_time_name(name)? {
                 Some((event, relative)) => self.snapshot_root_entry(event, relative),
                 None => Err(VfsError::NotFound),
@@ -193,6 +234,9 @@ where
         if inode_id == self.slot.root_id() || inode_id == self.id_dir() {
             return Ok(hist_dir_attr(inode_id));
         }
+        if inode_id == self.head_file() {
+            return Ok(cp_file_attr(inode_id, self.render_head()?.len() as u64));
+        }
         let (event, local) = self.subs.local_of(inode_id)?.ok_or(VfsError::NotFound)?;
         self.subs.getattr(event, local)
     }
@@ -203,6 +247,7 @@ where
                 DirEntry::new(self.slot.root_id(), ".", NodeKind::Directory),
                 DirEntry::new(self.slot.vfs_dir_id, "..", NodeKind::Directory),
                 DirEntry::new(self.id_dir(), "id", NodeKind::Directory),
+                DirEntry::new(self.head_file(), "head", NodeKind::RegularFile),
             ];
             for (event, record) in self.history.log(LIST_LIMIT).map_err(history_error)? {
                 let id = self.subs.synthetic_id(event, epoch_vfs_api::ROOT_INODE_ID)?;
@@ -232,11 +277,23 @@ where
         if request.inode_id == self.slot.root_id() || request.inode_id == self.id_dir() {
             return Err(VfsError::IsDirectory);
         }
+        if request.inode_id == self.head_file() {
+            // Content renders fresh per read; the handle carries no state.
+            return Ok(OpenedFile {
+                handle: FileHandle(self.next_id.fetch_add(1, Ordering::Relaxed)),
+                direct_io: false,
+                keep_cache: false,
+            });
+        }
         let (event, local) = self.subs.local_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
         self.subs.open(event, local, request)
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
+        if request.inode_id == self.head_file() {
+            let content = self.render_head()?;
+            return slice_bytes(&content, request.offset, request.size);
+        }
         let (event, local) = self.subs.local_of(request.inode_id)?.ok_or(VfsError::NotFound)?;
         self.subs.read(event, local, request)
     }
