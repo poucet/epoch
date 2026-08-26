@@ -78,6 +78,49 @@ impl<Near, Far> TieredByteBackend<Near, Far> {
         }
         Ok(())
     }
+
+    /// Promote a batch of keys near → far in one `far` write
+    /// ([`put_many`](SyncByteBackend::put_many) — one durable commit on a
+    /// transactional far tier), optionally draining the promoted copies from
+    /// `near`.
+    ///
+    /// Like [`promote`](Self::promote), keys already in `far` and keys absent
+    /// from `near` are skipped. With `drain`, every key that is durable in `far`
+    /// after the batch (just promoted or already there) is deleted from `near` —
+    /// and **only** those, so un-promoted staged data is never dropped. Draining
+    /// is safe: reads fall through to `far`, and content addressing makes a
+    /// concurrent identical re-put lossless. Callers promoting a closure should
+    /// drain, or the staging tier grows without bound.
+    pub fn promote_many<K>(&self, keys: &[K], drain: bool) -> Result<(), CASError>
+    where
+        Near: SyncByteBackend<K>,
+        Far: SyncByteBackend<K>,
+        K: Clone,
+    {
+        let mut batch = Vec::new();
+        // Keys that will be durable in far once the batch lands: those already
+        // there (which may still have a stale staged duplicate in near) and
+        // those we are about to promote. Only these are safe to drain.
+        let mut drainable = Vec::new();
+        for key in keys {
+            if !self.far.has(key)? {
+                match self.near.get(key)? {
+                    Some(bytes) => batch.push((key.clone(), bytes)),
+                    // Absent everywhere: nothing to promote or drain.
+                    None => continue,
+                }
+            }
+            drainable.push(key);
+        }
+        self.far.put_many(&batch)?;
+        if drain {
+            // Only after the batch landed durably.
+            for key in drainable {
+                self.near.delete(key)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<Near, Far, K> SyncByteBackend<K> for TieredByteBackend<Near, Far>
@@ -196,6 +239,48 @@ mod tests {
         // Promoting a key absent from both tiers is a harmless no-op.
         tiered.promote(&key(6)).unwrap();
         assert!(!far.has(&key(6)).unwrap());
+    }
+
+    #[test]
+    fn promote_many_batches_prunes_and_drains() {
+        let near = MemoryByteBackend::new();
+        let far = MemoryByteBackend::new();
+        // key(1): staged, to promote. key(2): already durable AND staged (stale
+        // duplicate). key(3): staged but NOT in the promotion set. key(4): in the
+        // set but absent everywhere.
+        near.put(&key(1), Bytes::from_static(b"one")).unwrap();
+        far.put(&key(2), Bytes::from_static(b"two")).unwrap();
+        near.put(&key(2), Bytes::from_static(b"two")).unwrap();
+        near.put(&key(3), Bytes::from_static(b"three")).unwrap();
+        let tiered = Tiered::new(near.clone(), far.clone());
+
+        tiered
+            .promote_many(&[key(1), key(2), key(4)], true)
+            .unwrap();
+
+        assert_eq!(far.get(&key(1)).unwrap(), Some(Bytes::from_static(b"one")));
+        assert!(!near.has(&key(1)).unwrap(), "promoted copy drained from near");
+        assert!(!near.has(&key(2)).unwrap(), "already-durable duplicate drained");
+        assert!(far.has(&key(2)).unwrap());
+        assert!(
+            near.has(&key(3)).unwrap(),
+            "drain must never touch keys outside the promotion set"
+        );
+        assert!(!far.has(&key(4)).unwrap(), "absent key is a harmless no-op");
+        // Everything promoted still reads through the tier.
+        assert_eq!(tiered.get(&key(1)).unwrap(), Some(Bytes::from_static(b"one")));
+    }
+
+    #[test]
+    fn promote_many_without_drain_keeps_staging() {
+        let near = MemoryByteBackend::new();
+        let far = MemoryByteBackend::new();
+        near.put(&key(8), Bytes::from_static(b"v")).unwrap();
+        let tiered = Tiered::new(near.clone(), far.clone());
+
+        tiered.promote_many(&[key(8)], false).unwrap();
+        assert!(far.has(&key(8)).unwrap());
+        assert!(near.has(&key(8)).unwrap(), "no drain requested");
     }
 
     #[test]
