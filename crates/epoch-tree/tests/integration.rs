@@ -124,7 +124,8 @@ fn codec_roundtrips_empty_and_multi_entry() {
     // Empty tree.
     let empty = Tree::<L>::empty();
     let enc = TreeCodec::<L>::encode(&empty);
-    assert_eq!(enc[0], TREE_FORMAT_VERSION);
+    assert_eq!(enc[0], epoch_cas::object_kind::TREE);
+    assert_eq!(enc[1], TREE_FORMAT_VERSION);
     assert_eq!(TreeCodec::<L>::decode(&enc).unwrap(), empty);
 
     // Mixed blob + tree entries, a non-UTF8 name, and a huge size.

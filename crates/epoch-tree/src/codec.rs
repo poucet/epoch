@@ -9,6 +9,7 @@
 //! ## Byte layout (all integers little-endian, fixed width)
 //!
 //! ```text
+//! [u8]        object kind     (== object_kind::TREE, i.e. b'T' — hashed domain tag)
 //! [u8]        format version  (== TREE_FORMAT_VERSION, currently 1)
 //! [u32 LE]    entry count
 //! repeated, in canonical name-ascending order, one of:
@@ -56,7 +57,7 @@
 
 use core::marker::PhantomData;
 
-use epoch_cas::{Bytes, CASError, CASHash, Codec};
+use epoch_cas::{Bytes, CASError, CASHash, Codec, object_kind};
 
 use crate::entry::TreeEntry;
 use crate::id::{Link, LinkKind, TreeId};
@@ -101,9 +102,10 @@ impl<L: Link + 'static> Codec<Tree<L>> for TreeCodec<L> {
             .filter(|e| !matches!(e.id.kind(), LinkKind::Tombstone))
             .count()
             * blob_tree_extra;
-        let capacity = 1 + 4 + entries.len() * min_per_entry + fixed_extra + names_len;
+        let capacity = 2 + 4 + entries.len() * min_per_entry + fixed_extra + names_len;
 
         let mut buf = Vec::with_capacity(capacity);
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
@@ -134,6 +136,12 @@ impl<L: Link + 'static> Codec<Tree<L>> for TreeCodec<L> {
     fn decode(bytes: &[u8]) -> Result<Tree<L>, CASError> {
         let mut r = Reader::new(bytes);
 
+        let kind = r.u8()?;
+        if kind != object_kind::TREE {
+            return Err(codec_err(format!(
+                "not a tree object (kind tag {kind:#04x})"
+            )));
+        }
         let version = r.u8()?;
         if version != TREE_FORMAT_VERSION {
             return Err(codec_err(format!(
@@ -316,8 +324,8 @@ mod tests {
     fn empty_tree_roundtrips() {
         let t = Tree::<Complete>::empty();
         let enc = TreeCodec::<Complete>::encode(&t);
-        // version + count only.
-        assert_eq!(enc.len(), 1 + 4);
+        // kind + version + count only.
+        assert_eq!(enc.len(), 2 + 4);
         let dec = TreeCodec::<Complete>::decode(&enc).unwrap();
         assert_eq!(dec, t);
     }
@@ -385,7 +393,7 @@ mod tests {
             Tree::from_entries([tombstone_entry(b"a"), tombstone_entry(b"b")]).unwrap();
         let enc = TreeCodec::<Sparse>::encode(&t);
         // Each tombstone is the compact shape: tag(1) + name_len(4) + name(1).
-        assert_eq!(enc.len(), 1 + 4 + 2 * (1 + 4 + 1));
+        assert_eq!(enc.len(), 2 + 4 + 2 * (1 + 4 + 1));
         let dec = TreeCodec::<Sparse>::decode(&enc).unwrap();
         assert_eq!(dec, t);
         assert!(dec.iter().all(|e| e.id.is_tombstone()));
@@ -409,9 +417,19 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_bad_kind_tag() {
+        let mut enc = TreeCodec::<Complete>::encode(&Tree::empty()).to_vec();
+        enc[0] = b'X';
+        assert!(matches!(
+            TreeCodec::<Complete>::decode(&enc),
+            Err(CASError::Codec(_))
+        ));
+    }
+
+    #[test]
     fn decode_rejects_bad_version() {
         let mut enc = TreeCodec::<Complete>::encode(&Tree::empty()).to_vec();
-        enc[0] = 99;
+        enc[1] = 99;
         assert!(matches!(
             TreeCodec::<Complete>::decode(&enc),
             Err(CASError::Codec(_))
@@ -422,9 +440,9 @@ mod tests {
     fn decode_rejects_unknown_kind_tag() {
         let t: Tree<Complete> = Tree::from_entries([blob_entry(b"x", 1, 0o100644, 0)]).unwrap();
         let mut enc = TreeCodec::<Complete>::encode(&t).to_vec();
-        // The kind tag sits right after the 1-byte version + 4-byte count.
+        // The entry tag sits after the kind byte + 1-byte version + 4-byte count.
         // Tag 2 is Tombstone, so an *unknown* tag must be > 2.
-        enc[5] = 3;
+        enc[6] = 3;
         assert!(matches!(
             TreeCodec::<Complete>::decode(&enc),
             Err(CASError::Codec(_))
@@ -436,6 +454,7 @@ mod tests {
         // One compact tombstone record. It decodes fine as an overlay tree, but
         // a complete tree has no whiteout link, so it is rejected.
         let mut buf = Vec::new();
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.push(KIND_TOMBSTONE);
@@ -474,6 +493,7 @@ mod tests {
     fn decode_rejects_unsorted_entries() {
         // Hand-craft a buffer with two entries in descending name order.
         let mut buf = Vec::new();
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&2u32.to_le_bytes());
         for name in [b"b".as_slice(), b"a".as_slice()] {
@@ -493,6 +513,7 @@ mod tests {
     #[test]
     fn decode_rejects_duplicate_names() {
         let mut buf = Vec::new();
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&2u32.to_le_bytes());
         for _ in 0..2 {
@@ -516,6 +537,7 @@ mod tests {
         // in the strict-ascending invariant. Decoded as an overlay tree (a
         // complete tree would reject the tombstone tag first).
         let mut buf = Vec::new();
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&2u32.to_le_bytes());
         for name in [b"b".as_slice(), b"a".as_slice()] {
@@ -533,6 +555,7 @@ mod tests {
     fn decode_rejects_truncated_tombstone_name() {
         // A tombstone record claiming a 4-byte name but providing only 1.
         let mut buf = Vec::new();
+        buf.push(object_kind::TREE);
         buf.push(TREE_FORMAT_VERSION);
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.push(KIND_TOMBSTONE);

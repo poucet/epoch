@@ -12,7 +12,7 @@
 //! into the `BlobId`, so two files with identical content must encode to
 //! identical bytes (D4 convergence), and the decoder rejects anything malformed.
 
-use epoch_cas::{Bytes, CASError, CASHash, Codec};
+use epoch_cas::{Bytes, CASError, CASHash, Codec, object_kind};
 
 /// A pointer to one stored chunk of a chunked file: the chunk's own CAS id plus
 /// its logical (uncompressed) length.
@@ -91,6 +91,7 @@ impl Codec<FileObject> for FileObjectCodec {
         match value {
             FileObject::Inline(content) => {
                 let mut out = Vec::with_capacity(1 + 8 + content.len());
+                out.push(object_kind::FILE);
                 out.push(TAG_INLINE);
                 out.extend_from_slice(&(content.len() as u64).to_le_bytes());
                 out.extend_from_slice(content);
@@ -99,6 +100,7 @@ impl Codec<FileObject> for FileObjectCodec {
             FileObject::Chunked { chunks } => {
                 let mut out =
                     Vec::with_capacity(1 + 4 + chunks.len() * FileObjectCodec::CHUNK_ENCODED_LEN);
+                out.push(object_kind::FILE);
                 out.push(TAG_CHUNKED);
                 out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
                 for chunk in chunks {
@@ -112,6 +114,12 @@ impl Codec<FileObject> for FileObjectCodec {
 
     fn decode(bytes: &[u8]) -> Result<FileObject, CASError> {
         let mut reader = Reader::new(bytes);
+        let kind = reader.u8()?;
+        if kind != object_kind::FILE {
+            return Err(CASError::Codec(format!(
+                "not a file manifest (kind tag {kind:#04x})"
+            )));
+        }
         let tag = reader.u8()?;
         let object = match tag {
             TAG_INLINE => {

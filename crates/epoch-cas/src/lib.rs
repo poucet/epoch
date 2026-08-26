@@ -46,7 +46,7 @@ pub use batching::BatchingCAS;
 pub use caching::CachingByteBackend;
 pub use bridge::{Asyncify, Blocking};
 pub use cas::{AsyncCAS, SyncCAS};
-pub use codec::{Codec, IdentityCodec};
+pub use codec::{Codec, IdentityCodec, object_kind};
 pub use compress::{compress, decompress};
 pub use error::CASError;
 pub use generic::{AsyncGenericCAS, SyncGenericCAS};

@@ -3,7 +3,7 @@
 //!
 //! `FileCas` composes two generic kernel stores over one shared byte backend:
 //!
-//! - a **chunk store** ([`IdentityCodec`]): raw chunk bytes, keyed by their own
+//! - a **chunk store** ([`ChunkCodec`]): raw chunk bytes, keyed by their own
 //!   [`CASHash`]; this is where dedup happens, since identical chunks collapse
 //!   to one entry.
 //! - a **manifest store** ([`FileObjectCodec`]): the
@@ -16,8 +16,8 @@
 //! manifest's id wrapped as a `BlobId`. Reads load the manifest and reassemble.
 
 use epoch_cas::{
-    Bytes, CASError, CASHash, IdentityCodec, MemoryByteBackend, SyncByteBackend, SyncCAS,
-    SyncGenericCAS,
+    Bytes, CASError, CASHash, Codec, MemoryByteBackend, SyncByteBackend, SyncCAS, SyncGenericCAS,
+    object_kind,
 };
 
 use crate::id::BlobId;
@@ -44,16 +44,39 @@ const INLINE_MAX: usize = 64 * 1024;
 /// Kept at 1 MiB, comfortably within `u32`, so every [`ChunkRef::len`] fits.
 const CHUNK_SIZE: usize = 1024 * 1024;
 
+/// The chunk store's codec: raw content bytes behind the
+/// [`object_kind::CHUNK`] domain tag (hashed into the chunk id, so chunk ids
+/// can never collide with tree or manifest ids — see [`object_kind`]).
+pub struct ChunkCodec;
+
+impl Codec<Bytes> for ChunkCodec {
+    fn encode(value: &Bytes) -> Bytes {
+        let mut out = Vec::with_capacity(1 + value.len());
+        out.push(object_kind::CHUNK);
+        out.extend_from_slice(value);
+        Bytes::from(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Bytes, CASError> {
+        match bytes.split_first() {
+            Some((&object_kind::CHUNK, content)) => Ok(Bytes::copy_from_slice(content)),
+            Some((kind, _)) => Err(CASError::Codec(format!(
+                "not a chunk object (kind tag {kind:#04x})"
+            ))),
+            None => Err(CASError::Codec("empty chunk object".to_owned())),
+        }
+    }
+}
+
 /// Content-addressed storage for file content.
 ///
 /// Cheaply parameterized over any [`SyncByteBackend`] `B` (the in-memory
 /// [`MemoryByteBackend`] for tests, a persistent backend in production). The
-/// chunk and manifest stores share one cloned backend, so chunk and manifest
-/// entries live in the same keyspace (their keys are content hashes and never
-/// collide in practice).
+/// chunk and manifest stores share one cloned backend; the [`object_kind`]
+/// domain tags keep chunk, manifest, and tree ids in disjoint hash domains.
 pub struct FileCas<B> {
     /// Raw chunk bytes, content-addressed (dedup happens here).
-    chunks: SyncGenericCAS<B, IdentityCodec>,
+    chunks: SyncGenericCAS<B, ChunkCodec>,
     /// `FileObject` manifests; a [`BlobId`] addresses an entry here.
     manifests: SyncGenericCAS<B, FileObjectCodec>,
 }
