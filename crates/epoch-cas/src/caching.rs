@@ -85,6 +85,16 @@ where
         self.cache.put(key, bytes)
     }
 
+    fn put_many(&self, items: &[(K, Bytes)]) -> Result<(), CASError> {
+        // Write-through as one batch (inner may make it a single transaction),
+        // then warm the cache, mirroring `put`.
+        self.inner.put_many(items)?;
+        for (key, bytes) in items {
+            self.cache.put(key, bytes.clone())?;
+        }
+        Ok(())
+    }
+
     fn has(&self, key: &K) -> Result<bool, CASError> {
         Ok(self.cache.has(key)? || self.inner.has(key)?)
     }
@@ -167,6 +177,23 @@ mod tests {
         backend.delete(&key(5)).unwrap();
         assert!(!cache.has(&key(5)).unwrap(), "cache entry dropped");
         assert!(!inner.has(&key(5)).unwrap(), "durable entry dropped");
+    }
+
+    #[test]
+    fn put_many_writes_through_and_warms_cache() {
+        let cache = MemoryByteBackend::new();
+        let inner = MemoryByteBackend::new();
+        let backend = Caching::new(cache.clone(), inner.clone());
+
+        let items = vec![
+            (key(7), Bytes::from_static(b"a")),
+            (key(8), Bytes::from_static(b"b")),
+        ];
+        backend.put_many(&items).unwrap();
+        for (k, v) in &items {
+            assert_eq!(inner.get(k).unwrap(), Some(v.clone()), "write-through");
+            assert_eq!(cache.get(k).unwrap(), Some(v.clone()), "cache warmed");
+        }
     }
 
     /// The canonical stack: staging in front of a cached durable tier. A write

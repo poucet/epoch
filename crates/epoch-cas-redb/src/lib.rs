@@ -47,7 +47,7 @@ impl RedbByteBackend {
     /// Open (or create) a file-backed database at `path`.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, CASError> {
         let db = Database::create(path).map_err(CASError::backend)?;
-        Self::from_db(db)
+        Self::with_database(Arc::new(db))
     }
 
     /// A non-persistent, in-memory database — handy for tests and ephemeral use.
@@ -55,15 +55,21 @@ impl RedbByteBackend {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(CASError::backend)?;
-        Self::from_db(db)
+        Self::with_database(Arc::new(db))
     }
 
-    /// Ensure the objects table exists so a read before any write doesn't fault.
-    fn from_db(db: Database) -> Result<Self, CASError> {
+    /// Build over an already-open, possibly shared database.
+    ///
+    /// This is how one `.redb` file hosts more than the object store: the caller
+    /// opens the [`Database`] once and hands clones of the `Arc` to this backend
+    /// and to any sibling stores keeping their own tables (e.g. a timeline
+    /// store). Ensures the objects table exists so a read before any write
+    /// doesn't fault.
+    pub fn with_database(db: Arc<Database>) -> Result<Self, CASError> {
         let txn = db.begin_write().map_err(CASError::backend)?;
         txn.open_table(OBJECTS).map_err(CASError::backend)?;
         txn.commit().map_err(CASError::backend)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db })
     }
 }
 
@@ -109,6 +115,22 @@ impl SyncByteBackend<CASHash> for RedbByteBackend {
         txn.commit().map_err(CASError::backend)?;
         Ok(())
     }
+
+    fn put_many(&self, items: &[(CASHash, Bytes)]) -> Result<(), CASError> {
+        // The whole batch lands in one write transaction: one durable commit
+        // (one fsync) instead of one per object.
+        let txn = self.db.begin_write().map_err(CASError::backend)?;
+        {
+            let mut table = txn.open_table(OBJECTS).map_err(CASError::backend)?;
+            for (key, bytes) in items {
+                table
+                    .insert(key.as_bytes().as_slice(), bytes.as_ref())
+                    .map_err(CASError::backend)?;
+            }
+        }
+        txn.commit().map_err(CASError::backend)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +164,39 @@ mod tests {
         } // drop closes the database
         let b = RedbByteBackend::create(&path).unwrap();
         assert_eq!(b.get(&key(2)).unwrap(), Some(Bytes::from_static(b"persisted")));
+    }
+
+    #[test]
+    fn put_many_lands_the_whole_batch_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cas.redb");
+        {
+            let b = RedbByteBackend::create(&path).unwrap();
+            let items: Vec<_> = (10u8..14)
+                .map(|n| (key(n), Bytes::copy_from_slice(&[n])))
+                .collect();
+            b.put_many(&items).unwrap();
+        }
+        let reopened = RedbByteBackend::create(&path).unwrap();
+        for n in 10u8..14 {
+            assert_eq!(
+                reopened.get(&key(n)).unwrap(),
+                Some(Bytes::copy_from_slice(&[n]))
+            );
+        }
+    }
+
+    #[test]
+    fn with_database_shares_one_database_across_stores() {
+        let db = Arc::new(
+            Database::builder()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .unwrap(),
+        );
+        let a = RedbByteBackend::with_database(Arc::clone(&db)).unwrap();
+        let b = RedbByteBackend::with_database(db).unwrap();
+        a.put(&key(20), Bytes::from_static(b"shared")).unwrap();
+        assert_eq!(b.get(&key(20)).unwrap(), Some(Bytes::from_static(b"shared")));
     }
 
     /// The full mount-time stack: staging in front of a moka-cached, redb-durable

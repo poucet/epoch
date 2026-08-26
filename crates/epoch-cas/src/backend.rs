@@ -27,6 +27,19 @@ pub trait SyncByteBackend<K = CASHash>: Send + Sync + 'static {
     fn has(&self, key: &K) -> Result<bool, CASError>;
     /// Remove `key` (no error if absent).
     fn delete(&self, key: &K) -> Result<(), CASError>;
+    /// Store a batch of entries.
+    ///
+    /// Semantically equivalent to calling [`put`](Self::put) per item (the
+    /// default impl does exactly that), but transactional backends may override
+    /// it to land the whole batch in one write transaction — turning N durable
+    /// commits into one. Bulk writers (e.g. checkpoint promotion) should prefer
+    /// this over per-key `put`.
+    fn put_many(&self, items: &[(K, Bytes)]) -> Result<(), CASError> {
+        for (key, bytes) in items {
+            self.put(key, bytes.clone())?;
+        }
+        Ok(())
+    }
 }
 
 /// The async twin of [`SyncByteBackend`] for network backends (S3/R2/Redis),
