@@ -12,3 +12,5 @@ SYSTEM.md
 docs/live/
 .claude/agents
 .pi/agents
+.epoch-state/
+.epoch-mnt/

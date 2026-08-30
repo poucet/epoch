@@ -34,14 +34,19 @@ autoload -Uz compinit && compinit -u
 PROMPT='%F{cyan}epoch%f:%~ %# '
 ZSHRC
 
-# Split-screen layout: interactive shell on the left, the live epoch mount on
-# the right.
+# Split-screen layout: interactive shell on the left, the live epoch CoW
+# mount on the right. The mount is the durable overlay (`cas` verb) with the
+# store on the /state host bind — writes are captured and checkpointed;
+# the lower (/work, read-only) is never modified. Re-running docker-run.sh
+# with the same head resumes from the last checkpoint.
 COPY <<'KDL' /root/.config/zellij/layouts/epoch.kdl
 layout {
     pane split_direction="vertical" {
-        pane name="shell" focus=true
+        pane name="shell" focus=true {
+            cwd "/mnt/epoch"
+        }
         pane name="epoch" command="epoch" {
-            args "/work" "/mnt/epoch"
+            args "cas" "/mnt/epoch" "/work" "--state" "/state" "--head" "dev"
         }
     }
 }
@@ -49,5 +54,5 @@ KDL
 
 RUN mkdir -p /mnt/epoch
 ENV TERM=xterm-256color
-WORKDIR /work
+WORKDIR /mnt/epoch
 CMD ["zellij", "--layout", "/root/.config/zellij/layouts/epoch.kdl"]
