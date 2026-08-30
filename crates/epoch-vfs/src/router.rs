@@ -68,8 +68,8 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
-    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
-    WriteRequest,
+    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
+    VfsResult, VfsService, WriteRequest,
 };
 
 /// Name of the rules file in the lower directory root.
@@ -508,6 +508,50 @@ impl VfsService for RouterVfs {
             return self.remap_attr(attr);
         }
         self.overlay.truncate(inode_id, size)
+    }
+
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        if is_routed(parent.0) {
+            let entry = self.passthrough.symlink(self.local_of(parent)?, name, target)?;
+            return self.remap_entry(entry);
+        }
+        if let Some((parent_path, child)) = self.overlay_child_path(parent, name)?
+            && self.path_matches(&child, false)
+            && let Ok(local_parent) = self.lower_dir_id(&parent_path)
+        {
+            let entry = self.passthrough.symlink(local_parent, name, target)?;
+            return self.remap_entry(entry);
+        }
+        let entry = self.overlay.symlink(parent, name, target)?;
+        if let Some((_, child)) = self.overlay_child_path(parent, name)? {
+            self.record_path(entry.attr.inode_id, child)?;
+        }
+        Ok(entry)
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        if is_routed(inode_id.0) {
+            return self.passthrough.readlink(self.local_of(inode_id)?);
+        }
+        self.overlay.readlink(inode_id)
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        if is_routed(request.inode_id.0) {
+            let attr = self.passthrough.setattr(SetAttrRequest {
+                inode_id: self.local_of(request.inode_id)?,
+                ..request
+            })?;
+            return self.remap_attr(attr);
+        }
+        self.overlay.setattr(request)
+    }
+
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        if is_routed(inode_id.0) {
+            return self.passthrough.statfs(self.local_of(inode_id)?);
+        }
+        self.overlay.statfs(inode_id)
     }
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {

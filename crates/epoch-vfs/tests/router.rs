@@ -367,3 +367,66 @@ fn missing_epochignore_is_pure_delegation() {
     );
     assert!(!f.live.debug_snapshot().overlay_paths.is_empty());
 }
+
+/// Symlinks route like any other creation: a rule-matching path lands on the
+/// host (and its `readlink` round-trips through the routed id), anything else
+/// becomes an overlay object.
+#[cfg(unix)]
+#[test]
+fn symlink_routes_to_host_when_ignored_and_to_overlay_otherwise() {
+    let lower = ignoring_lower();
+    let f = fixture(lower.path());
+
+    // Rule-matching parent: `node_modules/dep-link` is created on the host.
+    let nm = f
+        .router
+        .lookup(ROOT_INODE_ID, OsStr::new("node_modules"))
+        .unwrap();
+    assert!(in_router_range(nm.attr.inode_id));
+    let link = f
+        .router
+        .symlink(nm.attr.inode_id, OsStr::new("dep-link"), OsStr::new("dep.txt"))
+        .unwrap();
+    assert!(in_router_range(link.attr.inode_id));
+    assert_eq!(link.attr.kind, NodeKind::Symlink);
+    assert!(lower.path().join("node_modules/dep-link").is_symlink());
+    assert_eq!(
+        f.router.readlink(link.attr.inode_id).unwrap(),
+        OsStr::new("dep.txt")
+    );
+
+    // Non-matching: an overlay object (not on the host), captured in the delta.
+    let olink = f
+        .router
+        .symlink(ROOT_INODE_ID, OsStr::new("overlay-link"), OsStr::new(".epochignore"))
+        .unwrap();
+    assert!(olink.attr.inode_id.0 < ROUTE_BASE);
+    assert!(!lower.path().join("overlay-link").exists());
+    assert_eq!(
+        f.router.readlink(olink.attr.inode_id).unwrap(),
+        OsStr::new(".epochignore")
+    );
+    assert!(
+        f.live
+            .debug_snapshot()
+            .overlay_paths
+            .iter()
+            .any(|p| p.contains("overlay-link"))
+    );
+}
+
+/// `statfs` answers on both sides of the router with the host's numbers.
+#[test]
+fn statfs_answers_through_the_router() {
+    let lower = ignoring_lower();
+    let f = fixture(lower.path());
+
+    let nm = f
+        .router
+        .lookup(ROOT_INODE_ID, OsStr::new("node_modules"))
+        .unwrap();
+    let routed = f.router.statfs(nm.attr.inode_id).unwrap();
+    let overlay_side = f.router.statfs(ROOT_INODE_ID).unwrap();
+    assert!(routed.blocks > 0);
+    assert_eq!(routed.blocks, overlay_side.blocks, "one host filesystem");
+}

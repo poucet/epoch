@@ -28,8 +28,8 @@ use std::{
 
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
-    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
-    WriteRequest,
+    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
+    VfsResult, VfsService, WriteRequest,
 };
 
 use crate::feature::{FEATURE_RANGE, FeatureSlot, control_dir_attr};
@@ -291,6 +291,39 @@ impl VfsService for ControlPlaneVfs {
             Route::Feature(feature) => feature.service.truncate(inode_id, size),
             Route::ControlPlane => Err(VfsError::ReadOnlyFilesystem),
             Route::Inner => self.inner.truncate(inode_id, size),
+        }
+    }
+
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        match self.route(parent.0) {
+            Route::Feature(feature) => feature.service.symlink(parent, name, target),
+            Route::ControlPlane => Err(VfsError::ReadOnlyFilesystem),
+            Route::Inner => self.inner.symlink(parent, name, target),
+        }
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        match self.route(inode_id.0) {
+            Route::Feature(feature) => feature.service.readlink(inode_id),
+            Route::ControlPlane => Err(VfsError::InvalidInput("not a symlink".into())),
+            Route::Inner => self.inner.readlink(inode_id),
+        }
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        match self.route(request.inode_id.0) {
+            Route::Feature(feature) => feature.service.setattr(request),
+            Route::ControlPlane => Err(VfsError::ReadOnlyFilesystem),
+            Route::Inner => self.inner.setattr(request),
+        }
+    }
+
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        match self.route(inode_id.0) {
+            // statfs answers about the *filesystem*; the synthetic `.vfs`
+            // plane lives on the inner one, so ask it (at its root).
+            Route::Feature(_) | Route::ControlPlane => self.inner.statfs(ROOT_INODE_ID),
+            Route::Inner => self.inner.statfs(inode_id),
         }
     }
 

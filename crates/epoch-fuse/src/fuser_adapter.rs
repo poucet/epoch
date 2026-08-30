@@ -2,12 +2,12 @@ use std::{ffi::OsStr, io, path::Path, sync::Arc};
 
 use epoch_vfs_api::{
     CreateRequest, Entry, FileHandle as VfsFileHandle, NodeAttr, InodeId, NodeKind, OpenMode,
-    OpenRequest, ReadRequest, VfsError, VfsService, WriteRequest,
+    OpenRequest, ReadRequest, SetAttrRequest, VfsError, VfsService, WriteRequest,
 };
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, KernelConfig, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 
 pub struct FuseSpikeFs {
@@ -158,10 +158,11 @@ impl Filesystem for FuseSpikeFs {
     }
 
     // Truncation (`O_TRUNC`, `truncate(2)`) usually arrives here as a
-    // size-setting request rather than as an open flag. Other attribute
-    // changes (chmod/chown/utimes) are accepted and ignored for now — the
-    // tree format doesn't persist them yet, and erroring would break everyday
-    // tools (`touch`, `cp -p`, editors) rather than degrade gracefully.
+    // size-setting request rather than as an open flag. `chmod` (mode) is
+    // honored and persisted (it seals into the tree entry). atime/mtime are
+    // accepted and ignored — not persisted; `make`-style mtime reasoning
+    // inside an overlay mount is a documented known gap. uid/gid changes are
+    // accepted and ignored: the overlay stamps the mounting user's ids.
     fn setattr(
         &self,
         _req: &Request,
@@ -170,8 +171,8 @@ impl Filesystem for FuseSpikeFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
@@ -180,19 +181,93 @@ impl Filesystem for FuseSpikeFs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        fuse_log!("setattr ino={} size={size:?} mode={mode:?} uid={uid:?} gid={gid:?}", ino.0);
-        let result = match size {
-            Some(size) => self.vfs.truncate(from_ino(ino), size),
-            None => self.vfs.getattr(from_ino(ino)),
-        };
+        fuse_log!(
+            "setattr ino={} size={size:?} mode={mode:?} uid={uid:?} gid={gid:?} atime={} mtime={}",
+            ino.0,
+            atime.is_some(),
+            mtime.is_some()
+        );
+        let id = from_ino(ino);
+        let result = (|| {
+            if let Some(size) = size {
+                self.vfs.truncate(id, size)?;
+            }
+            if mode.is_some() || atime.is_some() || mtime.is_some() {
+                self.vfs.setattr(SetAttrRequest {
+                    inode_id: id,
+                    mode,
+                    atime: atime.map(time_or_now),
+                    mtime: mtime.map(time_or_now),
+                })?;
+            }
+            self.vfs.getattr(id)
+        })();
         match result {
             Ok(attr) => {
-                fuse_log!("setattr ok ino={} size={}", attr.inode_id.0, attr.size);
+                fuse_log!("setattr ok ino={} size={} perm={:o}", attr.inode_id.0, attr.size, attr.perm);
                 let ttl = attr_ttl();
                 let attr = to_file_attr(attr);
                 reply.attr(&ttl, &attr);
             }
             Err(err) => reply_error_attr(reply, err),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        fuse_log!("readlink ino={}", ino.0);
+        match self.vfs.readlink(from_ino(ino)) {
+            Ok(target) => {
+                fuse_log!("readlink ok ino={} target={target:?}", ino.0);
+                reply.data(target.as_encoded_bytes());
+            }
+            Err(err) => reply_error_data(reply, err),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        fuse_log!(
+            "symlink parent={} name={link_name:?} target={target:?}",
+            parent.0
+        );
+        match self
+            .vfs
+            .symlink(from_ino(parent), link_name, target.as_os_str())
+        {
+            Ok(entry) => {
+                fuse_log!("symlink ok node={}", entry.attr.inode_id.0);
+                reply_entry(reply, entry);
+            }
+            Err(err) => reply_error_entry(reply, err),
+        }
+    }
+
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        fuse_log!("statfs ino={}", ino.0);
+        match self.vfs.statfs(from_ino(ino)) {
+            Ok(stats) => {
+                fuse_log!(
+                    "statfs ok ino={} blocks={} free={} files={}",
+                    ino.0, stats.blocks, stats.blocks_avail, stats.files
+                );
+                reply.statfs(
+                    stats.blocks,
+                    stats.blocks_free,
+                    stats.blocks_avail,
+                    stats.files,
+                    stats.files_free,
+                    stats.block_size as u32,
+                    stats.name_max,
+                    stats.block_size as u32,
+                );
+            }
+            Err(err) => reply.error(log_errno(&err)),
         }
     }
 
@@ -625,6 +700,15 @@ fn to_open_mode(flags: OpenFlags) -> OpenMode {
         OpenAccMode::O_RDONLY => OpenMode::ReadOnly,
         OpenAccMode::O_WRONLY => OpenMode::WriteOnly,
         OpenAccMode::O_RDWR => OpenMode::ReadWrite,
+    }
+}
+
+/// `TimeOrNow::Now` resolves at the adapter boundary (the overlay treats
+/// atime/mtime as best-effort anyway).
+fn time_or_now(t: fuser::TimeOrNow) -> std::time::SystemTime {
+    match t {
+        fuser::TimeOrNow::SpecificTime(time) => time,
+        fuser::TimeOrNow::Now => std::time::SystemTime::now(),
     }
 }
 

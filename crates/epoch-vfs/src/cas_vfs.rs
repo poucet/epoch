@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epoch_cas::{MemoryByteBackend, SyncByteBackend};
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
-    OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    OpenRequest, OpenedFile, ReadRequest, SetAttrRequest, StatFs, VfsError, VfsResult, VfsService,
+    WriteRequest,
 };
 use epoch_worktree::{TreeId, WorkingTree};
 
@@ -220,6 +221,30 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         tree.getattr(inode_id)
     }
 
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        let mut tree = self.lock();
+        let id = tree.symlink(parent, name, target)?;
+        Ok(Entry::new(tree.getattr(id)?))
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        self.lock().readlink(inode_id)
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        let mut tree = self.lock();
+        if let Some(mode) = request.mode {
+            tree.set_mode(request.inode_id, mode)?;
+        }
+        // atime/mtime are accepted but not persisted (documented known gap:
+        // `make`-style mtime reasoning is unreliable inside an overlay mount).
+        tree.getattr(request.inode_id)
+    }
+
+    fn statfs(&self, _inode_id: InodeId) -> VfsResult<StatFs> {
+        self.lock().statfs()
+    }
+
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
         Ok(())
     }
@@ -377,5 +402,73 @@ mod tests {
         let attr = svc.truncate(id, 6).unwrap();
         assert_eq!(attr.size, 6);
         assert_eq!(read_all(&svc, id), b"0123\0\0");
+    }
+
+    /// `symlink` + `readlink` through the service, including a seal →
+    /// `from_root` roundtrip (a checkpoint's view of the link).
+    #[test]
+    fn symlink_readlink_and_seal_roundtrip_through_the_service() {
+        let backend = MemoryByteBackend::new();
+        let svc = CasVfs::new(backend.clone());
+        let root = ROOT_INODE_ID;
+        write_file(&svc, root, "target.txt", b"contents");
+
+        let entry = svc.symlink(root, OsStr::new("link"), OsStr::new("target.txt")).unwrap();
+        assert_eq!(entry.attr.kind, NodeKind::Symlink);
+        let link = entry.attr.inode_id;
+        assert_eq!(svc.readlink(link).unwrap(), OsStr::new("target.txt"));
+
+        // The link lists as a symlink.
+        let row = svc
+            .readdir(root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "link")
+            .unwrap();
+        assert_eq!(row.kind, NodeKind::Symlink);
+
+        // readlink of a non-link is an error.
+        let target = svc.lookup(root, OsStr::new("target.txt")).unwrap().attr.inode_id;
+        assert!(matches!(svc.readlink(target), Err(VfsError::InvalidInput(_))));
+
+        // Seal (checkpoint) → a fresh service over the sealed root resolves it.
+        let sealed = svc.seal().unwrap();
+        let svc2 = CasVfs::from_root(backend, sealed).unwrap();
+        let link2 = svc2.lookup(root, OsStr::new("link")).unwrap().attr.inode_id;
+        assert_eq!(svc2.getattr(link2).unwrap().kind, NodeKind::Symlink);
+        assert_eq!(svc2.readlink(link2).unwrap(), OsStr::new("target.txt"));
+    }
+
+    /// `setattr` with a mode persists through seal; atime/mtime are accepted
+    /// and ignored.
+    #[test]
+    fn setattr_chmod_persists_through_the_service() {
+        let backend = MemoryByteBackend::new();
+        let svc = CasVfs::new(backend.clone());
+        let id = write_file(&svc, ROOT_INODE_ID, "run.sh", b"#!/bin/sh\n");
+        assert_eq!(svc.getattr(id).unwrap().perm, 0o644);
+
+        let attr = svc
+            .setattr(SetAttrRequest {
+                inode_id: id,
+                mode: Some(0o755),
+                atime: Some(std::time::SystemTime::now()),
+                mtime: Some(std::time::SystemTime::now()),
+            })
+            .unwrap();
+        assert_eq!(attr.perm, 0o755);
+
+        let sealed = svc.seal().unwrap();
+        let svc2 = CasVfs::from_root(backend, sealed).unwrap();
+        let id2 = svc2.lookup(ROOT_INODE_ID, OsStr::new("run.sh")).unwrap().attr.inode_id;
+        assert_eq!(svc2.getattr(id2).unwrap().perm, 0o755);
+    }
+
+    /// A lower-less service answers `statfs` with the synthetic shape.
+    #[test]
+    fn statfs_without_a_lower_is_synthetic() {
+        let svc = CasVfs::in_memory();
+        let stats = svc.statfs(ROOT_INODE_ID).unwrap();
+        assert_eq!(stats, StatFs::synthetic());
     }
 }

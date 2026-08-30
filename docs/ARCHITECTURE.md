@@ -34,9 +34,9 @@ Layered bottom-up; every crate depends only on crates above it in this list.
 | `epoch-tree` | `Tree<L>` Merkle tree objects with the canonical versioned codec, `TreeId`, and the link split that makes corruption unrepresentable: `EntryId` (complete tree, no whiteout possible) vs `Overlay<EntryId>` (sparse layer with tombstones). `TreeStore<Bk, L>` is just the kernel engine specialized by a type alias. |
 | `epoch-timeline` | The **engine-agnostic timeline contract**: `TimelineEvent {parents, root, timestamp_ms, meta}`, content-hashed `EventId`, the `TimelineStore` trait (events + named heads; chain-walk defaults for `at`/`log`), memory impl. Deliberately ⊥ CAS *storage* (see TIMELINE.md). |
 | `epoch-timeline-redb` | `RedbTimelineStore` — first timeline engine (events + heads tables; shareable `Arc<Database>`). |
-| `epoch-worktree` | `WorkingTree<TBk, FBk>` — the mutable inode layer: always-overlay CoW (absent lower = empty), lazy spine hydration (`DirChildren::Sealed`), copy-up, tombstones, truncate, and `seal() → TreeId` with structural-sharing short-circuits. |
+| `epoch-worktree` | `WorkingTree<TBk, FBk>` — the mutable inode layer: always-overlay CoW (absent lower = empty), lazy spine hydration (`DirChildren::Sealed`), copy-up, tombstones, truncate, symlinks as `SYMLINK_MODE` blob entries (git-style), chmod persistence via tree-entry modes, and `seal() → TreeId` with structural-sharing short-circuits. |
 | `epoch-history` | The checkpoint layer: `pending_closure` (post-order not-yet-durable walk, pruned where `far.has`), `History::commit_root` (batched promote + drain → append event → advance head), `CheckpointPolicy` (debounce/max-wait/dirty-backstop state machine) + `Scheduler` thread. |
-| `epoch-vfs-api` | The one **synchronous, object-safe `VfsService` trait** (incl. `rename` and `truncate`) + `ReadOnlyFeature` (read surface + blanket EROFS boilerplate), `InodeId`, `NodeAttr` (attrs stamped with the mounting user's uid/gid), `VfsError`. Every layer above composes against it. |
+| `epoch-vfs-api` | The one **synchronous, object-safe `VfsService` trait** (incl. `rename`, `truncate`, `symlink`/`readlink`, `setattr` (mode), `statfs`) + `ReadOnlyFeature` (read surface + blanket EROFS boilerplate), `InodeId`, `NodeAttr` (attrs stamped with the mounting user's uid/gid), `StatFs`, `VfsError`. Every layer above composes against it. |
 | `epoch-vfs` | The `VfsService` implementations and decorators: `CasVfs` (WorkingTree behind a mutex), `PassthroughVfs` (host dir; read-only or writable), `RouterVfs` (`.epochignore` pass-through), `ControlPlaneVfs` (the `.vfs` feature registry), the features `CasObjectDir`/`HistoryDir`/`DebugDir` over `TreeMounts`/`TreeBrowseFeature`, `SignalVfs` (trigger events), `CheckpointedFs`, `LoggingVfs`. |
 | `epoch-fuse` | The fuser adapter (1:1 `InodeId` ↔ ino), the macOS `mount_macfuse` helper mount, and the `epoch-fuse` binary/CLI. |
 
@@ -81,9 +81,10 @@ load-bearing only at the remote cut (§6).
 ## 4. The VFS stack
 
 One synchronous, object-safe trait — `VfsService` (lookup/getattr/readdir/
-open/read/write/create/mkdir/unlink/rmdir/**rename**/truncate/flush/fsync/
-release) — is the universal internal boundary; everything is an
-implementation or decorator of it. A durable overlay mount composes:
+open/read/write/create/mkdir/unlink/rmdir/**rename**/truncate/**symlink**/
+**readlink**/**setattr**/**statfs**/flush/fsync/release) — is the universal
+internal boundary; everything is an implementation or decorator of it. A
+durable overlay mount composes:
 
 ```
 ControlPlaneVfs            .vfs — a FEATURE REGISTRY; ids ≥ CP_BASE (0x8000…),
@@ -117,6 +118,17 @@ ControlPlaneVfs            .vfs — a FEATURE REGISTRY; ids ≥ CP_BASE (0x8000�
   atomic saves). Boundary-crossing moves — out of a fall-through directory,
   or between the overlay and a routed subtree — answer `EXDEV`, so `mv`
   falls back to copy + delete, which routes each side correctly.
+- **Symlinks are overlay objects** (git-style): an upper symlink seals as a
+  blob entry whose mode is `SYMLINK_MODE` (`0o120000`) and whose bytes are
+  the target path, so checkpoints and `.vfs/history` snapshots reproduce it
+  exactly; a lower symlink falls through and delegates `readlink`. Renaming
+  or chmod-ing a fall-through symlink copies its *target* up (never follows
+  the link). The `.vfs/debug/overlay` delta listing marks them `(symlink)`.
+- **`setattr` mode persists** (chmod): the mode lives in the tree entry, is
+  applied on copy-up, and survives checkpoint/remount; atime/mtime are
+  accepted but not persisted (documented gap for `make`-style tooling).
+  **`statfs`** answers with the lower host filesystem's numbers
+  (`statvfs(2)` on the lower) so `df` and installers see real capacity.
 - Extended attributes are stubbed (`ENOTSUP`, empty listing); synthesized
   attrs carry the mounting user's uid/gid. The fuser adapter maps `InodeId` ↔
   kernel ino 1:1; on macOS it mounts through the privileged `mount_macfuse`
@@ -160,10 +172,10 @@ fuse shim ──VfsService/UDS──▶ machine daemon ──ByteBackend+Timelin
   sweep unreachable objects and events.
 - Evictable / persistent inodes (FUSE-`forget` refcounting, ids stable across
   remount); ditto sub-mount/minted-id cache eviction.
-- Spill staging tier (working set > RAM), `symlink` + full `setattr`/xattr
-  persistence, `statfs`, drift detection of the lower, control plane + CLI,
-  non-FUSE adapters. (`.epochignore` routing shipped; live reload of its
-  rules did not.)
+- Spill staging tier (working set > RAM), xattr *storage* (stubs answer
+  `ENOTSUP`), atime/mtime persistence, drift detection of the lower, control
+  plane + CLI, non-FUSE adapters. (`.epochignore` routing shipped; live
+  reload of its rules did not.)
 
 ## Appendix — Technology stack (as used)
 

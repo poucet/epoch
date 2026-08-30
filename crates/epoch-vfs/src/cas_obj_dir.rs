@@ -284,6 +284,10 @@ where
         self.serve_read(request)
     }
 
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        self.serve_readlink(inode_id)
+    }
+
     fn release(&self, handle: FileHandle) -> VfsResult<()> {
         self.serve_release(handle)
     }

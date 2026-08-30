@@ -9,7 +9,7 @@ use std::{ffi::OsStr, sync::Arc};
 
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, OpenRequest,
-    OpenedFile, ReadRequest, VfsResult, VfsService, WriteRequest,
+    OpenedFile, ReadRequest, SetAttrRequest, StatFs, VfsResult, VfsService, WriteRequest,
 };
 
 /// `VfsService` decorator that logs each call before delegating to `inner`.
@@ -132,6 +132,32 @@ impl VfsService for LoggingVfs {
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
         eprintln!("[epoch-vfs] truncate node={} size={size}", inode_id.0);
         self.inner.truncate(inode_id, size)
+    }
+
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        eprintln!(
+            "[epoch-vfs] symlink parent={} name={:?} target={:?}",
+            parent.0, name, target
+        );
+        self.inner.symlink(parent, name, target)
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        eprintln!("[epoch-vfs] readlink node={}", inode_id.0);
+        self.inner.readlink(inode_id)
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        eprintln!(
+            "[epoch-vfs] setattr node={} mode={:?}",
+            request.inode_id.0, request.mode
+        );
+        self.inner.setattr(request)
+    }
+
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        eprintln!("[epoch-vfs] statfs node={}", inode_id.0);
+        self.inner.statfs(inode_id)
     }
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {

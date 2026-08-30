@@ -32,8 +32,8 @@ use std::{
 
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind, OpenMode,
-    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
-    WriteRequest,
+    OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
+    VfsResult, VfsService, WriteRequest,
 };
 
 /// Read-through [`VfsService`] backed by a lower directory on the host.
@@ -211,7 +211,11 @@ impl PassthroughVfs {
                     .map_err(map_io_error)?;
             }
             NodeKind::Directory => fs::create_dir(&lower).map_err(map_io_error)?,
-            NodeKind::Symlink => return Err(VfsError::Unsupported("create symlink")),
+            NodeKind::Symlink => {
+                return Err(VfsError::InvalidInput(
+                    "create with kind Symlink; use symlink()".to_owned(),
+                ));
+            }
         }
         Self::apply_mode(&lower, request.mode)?;
         let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
@@ -411,6 +415,44 @@ impl VfsService for PassthroughVfs {
         file.set_len(size).map_err(map_io_error)?;
         let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
         Ok(attr_from_metadata(inode_id, &metadata))
+    }
+
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        self.require_writable()?;
+        let parent_path = self.path_for_node(parent)?;
+        let child = child_path(&parent_path, name)?;
+        let lower = self.lower_path(&child);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, &lower).map_err(map_io_error)?;
+        #[cfg(not(unix))]
+        return Err(VfsError::Unsupported("symlink"));
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
+        Ok(Entry::new(attr_from_metadata(self.id_for_path(&child)?, &metadata)))
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<OsString> {
+        let path = self.path_for_node(inode_id)?;
+        let target = fs::read_link(self.lower_path(&path)).map_err(map_io_error)?;
+        Ok(target.into_os_string())
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        self.require_writable()?;
+        let path = self.path_for_node(request.inode_id)?;
+        let lower = self.lower_path(&path);
+        if let Some(mode) = request.mode {
+            Self::apply_mode(&lower, mode)?;
+        }
+        // atime/mtime: accepted but not applied (no `filetime` dependency;
+        // documented best-effort).
+        let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
+        Ok(attr_from_metadata(request.inode_id, &metadata))
+    }
+
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        // Read-only services answer too: `df` is a query, not a mutation.
+        let path = self.path_for_node(inode_id)?;
+        StatFs::of_path(&self.lower_path(&path))
     }
 
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {
@@ -694,5 +736,77 @@ mod tests {
             }),
             Err(VfsError::ReadOnlyFilesystem)
         );
+    }
+
+    /// Symlinks pass through to the host: create + readlink land on the lower
+    /// directory in writable mode, and a symlink already in the lower resolves
+    /// (with kind `Symlink`) in read-only mode.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_pass_through_to_the_host() {
+        let dir = TempDir::new("passthrough-link");
+        fs::write(dir.path().join("real.txt"), b"real").expect("write file");
+        std::os::unix::fs::symlink("real.txt", dir.path().join("lower-link"))
+            .expect("host symlink");
+
+        // Read-only: a pre-existing lower symlink resolves.
+        let ro = PassthroughVfs::new(dir.path());
+        let entry = ro.lookup(ROOT_INODE_ID, OsStr::new("lower-link")).expect("lookup");
+        assert_eq!(entry.attr.kind, NodeKind::Symlink);
+        assert_eq!(
+            ro.readlink(entry.attr.inode_id).expect("readlink"),
+            OsString::from("real.txt")
+        );
+        // …but creating one is refused.
+        assert_eq!(
+            ro.symlink(ROOT_INODE_ID, OsStr::new("nope"), OsStr::new("real.txt")),
+            Err(VfsError::ReadOnlyFilesystem)
+        );
+
+        // Writable: create lands on the host.
+        let rw = PassthroughVfs::writable(dir.path());
+        let created = rw
+            .symlink(ROOT_INODE_ID, OsStr::new("upper-link"), OsStr::new("real.txt"))
+            .expect("symlink");
+        assert_eq!(created.attr.kind, NodeKind::Symlink);
+        assert_eq!(
+            fs::read_link(dir.path().join("upper-link")).expect("host readlink"),
+            std::path::PathBuf::from("real.txt")
+        );
+        assert_eq!(
+            rw.readlink(created.attr.inode_id).expect("readlink"),
+            OsString::from("real.txt")
+        );
+    }
+
+    /// `chmod` through `setattr` lands on the host file; `statfs` returns the
+    /// host filesystem's numbers.
+    #[cfg(unix)]
+    #[test]
+    fn setattr_mode_and_statfs_hit_the_host() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("passthrough-attr");
+        fs::write(dir.path().join("f.sh"), b"#!/bin/sh\n").expect("write file");
+
+        let vfs = PassthroughVfs::writable(dir.path());
+        let entry = vfs.lookup(ROOT_INODE_ID, OsStr::new("f.sh")).expect("lookup");
+        let id = entry.attr.inode_id;
+        assert_eq!(entry.attr.perm, 0o644);
+
+        let attr = vfs.setattr(SetAttrRequest::mode(id, 0o755)).expect("chmod");
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(
+            fs::metadata(dir.path().join("f.sh")).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "the host file's mode changed"
+        );
+
+        let stats = vfs.statfs(ROOT_INODE_ID).expect("statfs");
+        assert!(stats.blocks > 0, "real filesystem reports real blocks");
+        assert!(stats.name_max > 0);
+        // A read-only service answers statfs too (df is a query).
+        let ro = PassthroughVfs::new(dir.path());
+        assert_eq!(ro.statfs(ROOT_INODE_ID).unwrap().blocks, stats.blocks);
     }
 }

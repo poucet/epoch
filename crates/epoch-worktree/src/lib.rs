@@ -62,7 +62,14 @@
 //! - [`seal`](WorkingTree::seal) is **sparse**: only the materialized spine and
 //!   tombstones are emitted; fall-through directories that produced nothing emit
 //!   nothing, so untouched siblings are absent from the delta.
-//! - Symlinks are out of scope for v1.
+//! - **Symlinks are first-class overlay objects** (git-style): an upper symlink
+//!   holds its target path bytes in memory and seals as a blob entry whose mode
+//!   is [`SYMLINK_MODE`] (`0o120000`) — see `epoch-tree`'s entry docs. A
+//!   lower (fall-through) symlink resolves its target from the lower on
+//!   `readlink`. Mode bits (`chmod`) persist: they live in the tree entry's
+//!   `mode` field, applied on copy-up and honored in synthesized attrs.
+//!   atime/mtime are accepted by `setattr` but not persisted (a known gap:
+//!   `make`-style mtime reasoning is unreliable inside an overlay mount).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -75,10 +82,10 @@ use std::time::UNIX_EPOCH;
 
 use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
-use epoch_tree::{EntryId, Link, LinkKind, Overlay, Tree, TreeEntry, TreeStore};
+use epoch_tree::{EntryId, Link, LinkKind, Overlay, SYMLINK_MODE, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
-    DirEntry, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, VfsError, VfsResult,
-    VfsService, ROOT_INODE_ID,
+    DirEntry, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, StatFs, VfsError,
+    VfsResult, VfsService, ROOT_INODE_ID,
 };
 
 /// Re-exported so consumers of [`WorkingTree`] can name the sealed-tree id type
@@ -108,6 +115,10 @@ pub struct WorkingTree<TBk, FBk = TBk> {
     next: u64,
 }
 
+/// The unix file-type bits mask (`S_IFMT`) — the part of a mode that says
+/// dir / regular / symlink, preserved verbatim across a chmod.
+const TYPE_BITS: u32 = 0o170000;
+
 /// One node in the live tree: its mode bits and kind-specific body.
 struct Inode {
     /// Unix mode bits as supplied by the caller / read from the sealed entry or
@@ -127,12 +138,24 @@ enum Body {
     Dir {
         children: DirChildren,
         lower: Option<InodeId>,
+        /// Set by `chmod` on this directory: forces the dir to seal an entry
+        /// for itself even when it would otherwise be an invisible
+        /// fall-through (no upper entries), so the new mode lands in the
+        /// delta.
+        mode_override: bool,
     },
     /// An upper-materialized regular file: `Clean(BlobId)` or `Dirty(FileWriter)`.
     File(FileBody),
     /// A fall-through regular file served from the lower service. The wrapped id
     /// is the file's *lower* [`InodeId`]; the overlay never exposes it directly.
     LowerFile(InodeId),
+    /// An upper symlink: the target path bytes, verbatim. Symlink targets are
+    /// immutable (a retarget is unlink + create), so there is no dirty/clean
+    /// split; the bytes seal into the CAS as a blob on `seal`.
+    Symlink(Bytes),
+    /// A fall-through symlink served from the lower service (like
+    /// [`LowerFile`](Body::LowerFile)); `readlink` delegates to the lower.
+    LowerSymlink(InodeId),
     /// A whiteout: hides the lower entry of this name (overlay deletion marker).
     Tombstone,
 }
@@ -205,6 +228,8 @@ pub struct OverlayEntry {
 pub enum OverlayEntryKind {
     /// An upper-materialized regular file (created or copied up; clean or dirty).
     File,
+    /// An upper-materialized symlink (created in the overlay or copied up).
+    Symlink,
     /// A directory created in the upper (no lower counterpart).
     Dir,
     /// A whiteout hiding the lower entry of this name.
@@ -218,6 +243,7 @@ impl std::fmt::Display for OverlayEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind {
             OverlayEntryKind::File => write!(f, "{}", self.path),
+            OverlayEntryKind::Symlink => write!(f, "{} (symlink)", self.path),
             OverlayEntryKind::Dir => write!(f, "{}/", self.path),
             OverlayEntryKind::Tombstone => write!(f, "{} (tombstone)", self.path),
             OverlayEntryKind::SealedDir => write!(f, "{}/ (sealed subtree)", self.path),
@@ -237,6 +263,7 @@ type OverlayLink = Overlay<EntryId<BlobId>>;
 enum ChildKind {
     Dir,
     File,
+    Symlink,
     Tombstone,
     Lower,
 }
@@ -333,6 +360,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 body: Body::Dir {
                     children: DirChildren::Open(BTreeMap::new()),
                     lower: root_lower,
+                    mode_override: false,
                 },
             },
         );
@@ -383,7 +411,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// this first.
     fn resolve_dir(&mut self, dir: InodeId) -> VfsResult<()> {
         let (tree_id, dir_lower) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children: DirChildren::Sealed(tid), lower } => (*tid, *lower),
+            Body::Dir { children: DirChildren::Sealed(tid), lower, .. } => (*tid, *lower),
             // Already faulted in (or not a directory) — nothing to do.
             _ => return Ok(()),
         };
@@ -404,10 +432,19 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             let child = self.alloc();
             match kind {
                 LinkKind::Blob(h) => {
-                    self.inodes.insert(
-                        child,
-                        Inode { mode, body: Body::File(FileBody::Clean(BlobId::from(h))) },
-                    );
+                    let blob = BlobId::from(h);
+                    if mode & TYPE_BITS == SYMLINK_MODE {
+                        // A symlink is a blob whose bytes are the target path
+                        // (git-style); fault the target in now (it is small).
+                        let target =
+                            self.files.get(&blob).map_err(io)?.ok_or(VfsError::NotFound)?;
+                        self.inodes.insert(child, Inode { mode, body: Body::Symlink(target) });
+                    } else {
+                        self.inodes.insert(
+                            child,
+                            Inode { mode, body: Body::File(FileBody::Clean(blob)) },
+                        );
+                    }
                 }
                 LinkKind::Tree(h) => {
                     // Resolve this child dir's lower counterpart one step down;
@@ -420,6 +457,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                             body: Body::Dir {
                                 children: DirChildren::Sealed(TreeId::from_cas_hash(h)),
                                 lower: child_lower,
+                                mode_override: false,
                             },
                         },
                     );
@@ -460,7 +498,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn lookup(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<InodeId> {
         self.resolve_dir(parent)?;
         let (cached, parent_lower) = match self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { ref children, lower } => (children.open()?.get(name).copied(), lower),
+            Body::Dir { ref children, lower, .. } => (children.open()?.get(name).copied(), lower),
             _ => return Err(VfsError::NotDirectory),
         };
 
@@ -483,19 +521,24 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// Build an overlay node from a lower entry's attrs and insert it, returning
     /// its (newly allocated) overlay [`InodeId`]. A directory becomes a fall-
     /// through `Dir` wired to its lower id; a regular file becomes a
-    /// `LowerFile`. (Symlinks are treated as regular files for v1.)
+    /// `LowerFile`; a symlink becomes a `LowerSymlink` (its target is read from
+    /// the lower on `readlink`).
     fn materialize_lower(&mut self, attr: &NodeAttr) -> InodeId {
         let id = self.alloc();
         let mode_perm = attr.perm as u32 & 0o7777;
         let body = match attr.kind {
-            NodeKind::Directory => {
-                Body::Dir { children: DirChildren::Open(BTreeMap::new()), lower: Some(attr.inode_id) }
-            }
-            NodeKind::RegularFile | NodeKind::Symlink => Body::LowerFile(attr.inode_id),
+            NodeKind::Directory => Body::Dir {
+                children: DirChildren::Open(BTreeMap::new()),
+                lower: Some(attr.inode_id),
+                mode_override: false,
+            },
+            NodeKind::RegularFile => Body::LowerFile(attr.inode_id),
+            NodeKind::Symlink => Body::LowerSymlink(attr.inode_id),
         };
         let mode = match attr.kind {
             NodeKind::Directory => 0o040000 | mode_perm,
-            _ => 0o100000 | mode_perm,
+            NodeKind::RegularFile => 0o100000 | mode_perm,
+            NodeKind::Symlink => SYMLINK_MODE | mode_perm,
         };
         self.inodes.insert(id, Inode { mode, body });
         id
@@ -511,7 +554,8 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let mut attr = match &inode.body {
             Body::Dir { .. } => NodeAttr::directory(node, UNIX_EPOCH),
             Body::File(fb) => NodeAttr::regular_file(node, self.file_size(fb)?, UNIX_EPOCH),
-            Body::LowerFile(ld) => {
+            Body::Symlink(target) => NodeAttr::symlink(node, target.len() as u64, UNIX_EPOCH),
+            Body::LowerFile(ld) | Body::LowerSymlink(ld) => {
                 let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
                 let mut a = lower.getattr(*ld)?;
                 a.inode_id = node;
@@ -531,7 +575,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn readdir(&mut self, node: InodeId) -> VfsResult<Vec<DirEntry>> {
         self.resolve_dir(node)?;
         let (cached, lower_id) = match self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { ref children, lower } => (
+            Body::Dir { ref children, lower, .. } => (
                 children.open()?.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
                 lower,
             ),
@@ -543,6 +587,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             let kind = match &self.inodes.get(id).ok_or(VfsError::NotFound)?.body {
                 Body::Dir { .. } => NodeKind::Directory,
                 Body::File(_) | Body::LowerFile(_) => NodeKind::RegularFile,
+                Body::Symlink(_) | Body::LowerSymlink(_) => NodeKind::Symlink,
                 Body::Tombstone => continue,
             };
             out.push(DirEntry::new(*id, name.clone(), kind));
@@ -560,11 +605,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 let attr = lower.getattr(de.inode_id)?;
                 let id = self.materialize_lower(&attr);
                 self.link(node, &de.name, id)?;
-                let kind = match attr.kind {
-                    NodeKind::Directory => NodeKind::Directory,
-                    _ => NodeKind::RegularFile,
-                };
-                out.push(DirEntry::new(id, de.name, kind));
+                out.push(DirEntry::new(id, de.name, attr.kind));
             }
         }
         Ok(out)
@@ -578,6 +619,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn read_at(&self, node: InodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => Err(VfsError::IsDirectory),
+            Body::Symlink(_) | Body::LowerSymlink(_) => {
+                Err(VfsError::InvalidInput("cannot read a symlink; use readlink".into()))
+            }
             Body::File(FileBody::Clean(blob)) => {
                 Ok(self.files.read_at(blob, off, len).map_err(io)?.to_vec())
             }
@@ -680,6 +724,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             // skip the clean-blob load / lower copy-up entirely.
             match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
                 Body::Dir { .. } => return Err(VfsError::IsDirectory),
+                Body::Symlink(_) | Body::LowerSymlink(_) => {
+                    return Err(VfsError::InvalidInput("cannot truncate a symlink".into()));
+                }
                 Body::Tombstone => return Err(VfsError::NotFound),
                 Body::File(_) | Body::LowerFile(_) => {}
             }
@@ -709,6 +756,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
         let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
+            Body::Symlink(_) | Body::LowerSymlink(_) => {
+                return Err(VfsError::InvalidInput("cannot write a symlink".into()));
+            }
             Body::Tombstone => return Err(VfsError::NotFound),
             Body::File(FileBody::Dirty(_)) => Step::Ready,
             Body::File(FileBody::Clean(b)) => Step::EditClean(*b),
@@ -768,10 +818,114 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let id = self.alloc();
         self.inodes.insert(
             id,
-            Inode { mode, body: Body::Dir { children: DirChildren::Open(BTreeMap::new()), lower: None } },
+            Inode {
+                mode,
+                body: Body::Dir {
+                    children: DirChildren::Open(BTreeMap::new()),
+                    lower: None,
+                    mode_override: false,
+                },
+            },
         );
         self.link(parent, name, id)?;
         Ok(id)
+    }
+
+    // --- symlink / readlink --------------------------------------------------
+
+    /// Create a symlink `name` under `parent` pointing at `target` (upper
+    /// only). The target is stored verbatim — a relative target stays
+    /// relative — and seals as a [`SYMLINK_MODE`]-moded blob (git-style), so
+    /// checkpoints and history snapshots reproduce the link exactly.
+    /// Recreating over a tombstone replaces the whiteout.
+    pub fn symlink(&mut self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<InodeId> {
+        self.resolve_dir(parent)?;
+        self.ensure_creatable(parent, name)?;
+        let id = self.alloc();
+        self.inodes.insert(
+            id,
+            Inode {
+                mode: SYMLINK_MODE | 0o777,
+                body: Body::Symlink(Bytes::copy_from_slice(target.as_bytes())),
+            },
+        );
+        self.link(parent, name, id)?;
+        Ok(id)
+    }
+
+    /// Read a symlink's target: the stored bytes for an upper link, the
+    /// lower's own `readlink` for a fall-through one.
+    pub fn readlink(&self, node: InodeId) -> VfsResult<OsString> {
+        match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
+            Body::Symlink(target) => Ok(OsString::from_vec(target.to_vec())),
+            Body::LowerSymlink(ld) => {
+                let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
+                lower.readlink(*ld)
+            }
+            Body::Tombstone => Err(VfsError::NotFound),
+            _ => Err(VfsError::InvalidInput("not a symlink".into())),
+        }
+    }
+
+    // --- setattr (mode) ------------------------------------------------------
+
+    /// Apply `chmod` to `node`: set the permission bits, preserving the type
+    /// bits. The mode persists — it seals into the node's tree entry.
+    ///
+    /// A fall-through node is **copied up** first (content for a file, the
+    /// target for a symlink, a forced self-entry for a directory) so the new
+    /// mode has an overlay home; the lower is never mutated.
+    pub fn set_mode(&mut self, node: InodeId, mode: u32) -> VfsResult<()> {
+        // Decide the copy-up step first so the borrow ends before mutation.
+        enum Step {
+            Ready,
+            CopyUpFile,
+            CopyUpSymlink(InodeId),
+            Dir,
+        }
+        let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
+            Body::Tombstone => return Err(VfsError::NotFound),
+            Body::LowerFile(_) => Step::CopyUpFile,
+            Body::LowerSymlink(ld) => Step::CopyUpSymlink(*ld),
+            Body::Dir { .. } => Step::Dir,
+            Body::File(_) | Body::Symlink(_) => Step::Ready,
+        };
+        match step {
+            Step::Ready => {}
+            Step::CopyUpFile => self.make_dirty(node)?,
+            Step::CopyUpSymlink(ld) => {
+                let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
+                let target = lower.readlink(ld)?;
+                if let Some(inode) = self.inodes.get_mut(&node) {
+                    inode.body = Body::Symlink(Bytes::copy_from_slice(target.as_bytes()));
+                }
+            }
+            Step::Dir => {
+                // Fault a sealed dir in so its (re-)seal carries the new mode.
+                self.resolve_dir(node)?;
+            }
+        }
+        let inode = self.inodes.get_mut(&node).ok_or(VfsError::NotFound)?;
+        inode.mode = (inode.mode & TYPE_BITS) | (mode & 0o7777);
+        if let Body::Dir { mode_override, .. } = &mut inode.body {
+            // A fall-through dir with no upper entries would seal to nothing;
+            // force it to emit so the mode lands in the delta.
+            *mode_override = true;
+        }
+        Ok(())
+    }
+
+    // --- statfs --------------------------------------------------------------
+
+    /// Filesystem-wide statistics: the lower's own numbers when there is one
+    /// (the overlay is bounded by RAM and the state store, not a block device,
+    /// so the lower is the honest answer `df` / installers are looking for), a
+    /// synthetic unbounded answer otherwise.
+    pub fn statfs(&self) -> VfsResult<StatFs> {
+        match &self.lower {
+            Some(lower) => lower.statfs(ROOT_INODE_ID),
+            None => Ok(StatFs::synthetic()),
+        }
     }
 
     // --- unlink / rmdir ------------------------------------------------------
@@ -784,7 +938,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
-            Body::File(_) | Body::LowerFile(_) => {}
+            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {}
             Body::Tombstone => return Err(VfsError::NotFound),
         }
         self.remove_child(parent, name, id)
@@ -798,7 +952,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn rmdir(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
-            Body::File(_) | Body::LowerFile(_) => return Err(VfsError::NotDirectory),
+            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {
+                return Err(VfsError::NotDirectory);
+            }
             Body::Tombstone => return Err(VfsError::NotFound),
             Body::Dir { .. } => {}
         }
@@ -813,7 +969,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// child, and no lower child not shadowed by a tombstone).
     fn dir_is_empty(&self, id: InodeId) -> VfsResult<bool> {
         let (children, lower) = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children, lower } => (children.open()?, *lower),
+            Body::Dir { children, lower, .. } => (children.open()?, *lower),
             _ => return Err(VfsError::NotDirectory),
         };
         // Any non-tombstone upper child means non-empty.
@@ -910,7 +1066,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 }
                 true
             }
-            Body::File(_) | Body::LowerFile(_) => false,
+            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => false,
         };
 
         // Renaming a node onto itself is a no-op.
@@ -932,6 +1088,19 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         {
             self.make_dirty(src)?;
         }
+        // A fall-through symlink likewise: its target is read from the lower
+        // and becomes an upper link (a `make_dirty`-style content copy-up
+        // would follow the link, so it is not reusable here).
+        if !src_is_dir
+            && let Some(Body::LowerSymlink(ld)) = self.inodes.get(&src).map(|n| &n.body)
+        {
+            let ld = *ld;
+            let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
+            let target = lower.readlink(ld)?;
+            if let Some(inode) = self.inodes.get_mut(&src) {
+                inode.body = Body::Symlink(Bytes::copy_from_slice(target.as_bytes()));
+            }
+        }
 
         // POSIX replace semantics for an existing target.
         match self.lookup(new_parent, new_name) {
@@ -941,7 +1110,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 let dst_is_dir = match &self.inodes.get(&dst).ok_or(VfsError::NotFound)?.body {
                     Body::Tombstone => false, // a whiteout: nothing visible to replace
                     Body::Dir { .. } => true,
-                    Body::File(_) | Body::LowerFile(_) => false,
+                    Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {
+                        false
+                    }
                 };
                 match (src_is_dir, dst_is_dir) {
                     (true, false) => return Err(VfsError::NotDirectory),
@@ -1034,13 +1205,27 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// `None` iff this is a fall-through dir (produced no entries AND has a lower)
     /// and `force_emit` is false — such a dir is absent from the delta.
     fn seal_dir(&mut self, dir: InodeId, force_emit: bool) -> VfsResult<Option<TreeId>> {
-        let (children, has_lower) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
-            // Never faulted in ⇒ unchanged subtree: re-emit its id without
-            // walking (structural sharing of clean subtrees comes for free).
-            Body::Dir { children: DirChildren::Sealed(tid), .. } => return Ok(Some(*tid)),
-            Body::Dir { children: DirChildren::Open(map), lower } => (
+        // A never-touched sealed subtree re-emits by id without walking
+        // (structural sharing of clean subtrees comes for free). A chmod'd
+        // dir is the exception: it must fault in and re-seal so the new mode
+        // lands in the tree entry.
+        let reseal = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
+            Body::Dir { children: DirChildren::Sealed(tid), mode_override, .. } => {
+                if !mode_override {
+                    return Ok(Some(*tid));
+                }
+                true
+            }
+            _ => false,
+        };
+        if reseal {
+            self.resolve_dir(dir)?;
+        }
+        let (children, has_lower, mode_overridden) = match &self.inodes.get(&dir).ok_or(VfsError::NotFound)?.body {
+            Body::Dir { children: DirChildren::Open(map), lower, mode_override } => (
                 map.iter().map(|(n, &i)| (n.clone(), i)).collect::<Vec<_>>(),
                 lower.is_some(),
+                *mode_override,
             ),
             _ => return Err(VfsError::NotDirectory),
         };
@@ -1053,8 +1238,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             let kind = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
                 Body::Dir { .. } => ChildKind::Dir,
                 Body::File(_) => ChildKind::File,
+                Body::Symlink(_) => ChildKind::Symlink,
                 Body::Tombstone => ChildKind::Tombstone,
-                Body::LowerFile(_) => ChildKind::Lower,
+                Body::LowerFile(_) | Body::LowerSymlink(_) => ChildKind::Lower,
             };
             match kind {
                 ChildKind::Dir => {
@@ -1065,6 +1251,17 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 }
                 ChildKind::File => {
                     let (blob, size) = self.seal_file(id)?;
+                    entries.push(TreeEntry::file(name_bytes, blob, mode, size));
+                }
+                ChildKind::Symlink => {
+                    // Git-style: the target path bytes are the blob content,
+                    // and the mode carries the symlink type bits.
+                    let target = match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
+                        Body::Symlink(target) => target.clone(),
+                        _ => return Err(VfsError::Io("seal: symlink body changed".into())),
+                    };
+                    let size = target.len() as u64;
+                    let blob = self.files.put(target).map_err(io)?;
                     entries.push(TreeEntry::file(name_bytes, blob, mode, size));
                 }
                 ChildKind::Tombstone => {
@@ -1082,8 +1279,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
 
         // A fall-through dir (no entries, has a lower) emits nothing unless forced
-        // (the root). A new dir (lower = None) emits even when empty.
-        if entries.is_empty() && has_lower && !force_emit {
+        // (the root) — or chmod'd (`mode_override`: the new mode needs an entry
+        // to live in). A new dir (lower = None) emits even when empty.
+        if entries.is_empty() && has_lower && !force_emit && !mode_overridden {
             return Ok(None);
         }
 
@@ -1182,13 +1380,16 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 Some(Body::File(_)) => {
                     out.push(OverlayEntry { path, kind: OverlayEntryKind::File });
                 }
+                Some(Body::Symlink(_)) => {
+                    out.push(OverlayEntry { path, kind: OverlayEntryKind::Symlink });
+                }
                 Some(Body::Tombstone) => {
                     out.push(OverlayEntry { path, kind: OverlayEntryKind::Tombstone });
                 }
                 Some(Body::Dir { children: DirChildren::Sealed(_), .. }) => {
                     out.push(OverlayEntry { path, kind: OverlayEntryKind::SealedDir });
                 }
-                Some(Body::Dir { children: DirChildren::Open(_), lower }) => {
+                Some(Body::Dir { children: DirChildren::Open(_), lower, .. }) => {
                     // An upper-created dir is delta; a hydrated fall-through dir
                     // is only a route to deeper delta.
                     if lower.is_none() {
@@ -1199,9 +1400,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                     }
                     self.collect_overlay(*child, &path, out);
                 }
-                // Cached fall-throughs are not delta; a dangling id is a bug we
-                // do not surface from a debug listing.
-                Some(Body::LowerFile(_)) | None => {}
+                // Cached fall-throughs (files and symlinks) are not delta; a
+                // dangling id is a bug we do not surface from a debug listing.
+                Some(Body::LowerFile(_) | Body::LowerSymlink(_)) | None => {}
             }
         }
     }
@@ -1220,7 +1421,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// upper nor (un-tombstoned) in the lower. A tombstone is replaceable.
     fn ensure_creatable(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let (cached, parent_lower) = match &self.inodes.get(&parent).ok_or(VfsError::NotFound)?.body {
-            Body::Dir { children, lower } => (children.open()?.get(name).copied(), *lower),
+            Body::Dir { children, lower, .. } => (children.open()?.get(name).copied(), *lower),
             _ => return Err(VfsError::NotDirectory),
         };
         if let Some(id) = cached {

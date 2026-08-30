@@ -199,6 +199,12 @@ where
         })
     }
 
+    /// `readlink` on a synthetic id minted here (no remap needed: the target
+    /// is a byte string, not an id).
+    pub fn readlink(&self, key: K, local: InodeId) -> VfsResult<std::ffi::OsString> {
+        self.mounted(key)?.readlink(local)
+    }
+
     /// Release a handle minted here (a no-op for foreign handles, so callers
     /// can forward releases blindly).
     pub fn release(&self, handle: FileHandle) -> VfsResult<()> {
@@ -298,6 +304,14 @@ impl TreeMounts {
         }
     }
 
+    /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_readlink(&self, id: InodeId) -> VfsResult<Option<std::ffi::OsString>> {
+        match self.subs.local_of(id)? {
+            Some((root, local)) => self.subs.readlink(root, local).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Release a handle minted here (no-op for foreign handles).
     pub(crate) fn release(&self, handle: FileHandle) -> VfsResult<()> {
         self.subs.release(handle)
@@ -371,6 +385,14 @@ pub(crate) trait TreeBrowseFeature: Send + Sync {
             return Ok(data);
         }
         self.mounts().try_read(request)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own nodes first, then sub-mount readlink. (A tree snapshot *can* hold
+    /// symlinks, so this must reach the mounted tree.)
+    fn serve_readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        self.mounts()
+            .try_readlink(inode_id)?
+            .ok_or(VfsError::InvalidInput("not a symlink".into()))
     }
 
     /// Own handles first, then sub-mount release.

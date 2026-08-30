@@ -227,12 +227,12 @@ mod overlay {
     use epoch_cas::MemoryByteBackend;
     use epoch_vfs_api::{
         CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
-        OpenRequest, OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
-        ROOT_INODE_ID,
+        OpenRequest, OpenedFile, ReadRequest, StatFs, VfsError, VfsResult, VfsService,
+        WriteRequest, ROOT_INODE_ID,
     };
     use epoch_worktree::WorkingTree;
 
-    use super::names;
+    use super::{names, write_file};
 
     /// A tiny read-only, in-memory lower service used purely as an overlay base.
     /// Mutating operations return [`VfsError::ReadOnlyFilesystem`] so the tests
@@ -240,6 +240,7 @@ mod overlay {
     enum Node {
         Dir(BTreeMap<OsString, InodeId>),
         File(Vec<u8>),
+        Link(OsString),
     }
 
     struct Lower {
@@ -276,6 +277,10 @@ mod overlay {
             self.insert(parent, name, Node::File(content.to_vec()))
         }
 
+        fn link(&mut self, parent: InodeId, name: &str, target: &str) -> InodeId {
+            self.insert(parent, name, Node::Link(OsString::from(target)))
+        }
+
         fn dir(&mut self, parent: InodeId, name: &str) -> InodeId {
             self.insert(parent, name, Node::Dir(BTreeMap::new()))
         }
@@ -285,11 +290,24 @@ mod overlay {
         }
     }
 
+    /// The marker `statfs` the lower answers, so tests can prove the overlay
+    /// delegated (rather than synthesizing its own numbers).
+    const LOWER_STATFS: StatFs = StatFs {
+        block_size: 4096,
+        blocks: 4242,
+        blocks_free: 2100,
+        blocks_avail: 2000,
+        files: 100,
+        files_free: 90,
+        name_max: 255,
+    };
+
     impl Lower {
         fn attr(&self, id: InodeId) -> VfsResult<NodeAttr> {
             match self.nodes.get(&id).ok_or(VfsError::NotFound)? {
                 Node::Dir(_) => Ok(NodeAttr::directory(id, UNIX_EPOCH)),
                 Node::File(b) => Ok(NodeAttr::regular_file(id, b.len() as u64, UNIX_EPOCH)),
+                Node::Link(t) => Ok(NodeAttr::symlink(id, t.len() as u64, UNIX_EPOCH)),
             }
         }
     }
@@ -318,6 +336,7 @@ mod overlay {
                 .map(|(name, &id)| {
                     let kind = match self.nodes.get(&id) {
                         Some(Node::Dir(_)) => NodeKind::Directory,
+                        Some(Node::Link(_)) => NodeKind::Symlink,
                         _ => NodeKind::RegularFile,
                     };
                     DirEntry::new(id, name.clone(), kind)
@@ -341,6 +360,7 @@ mod overlay {
                     Ok(b[start..end].to_vec())
                 }
                 Node::Dir(_) => Err(VfsError::IsDirectory),
+                Node::Link(_) => Err(VfsError::InvalidInput("cannot read a symlink".into())),
             }
         }
 
@@ -382,6 +402,17 @@ mod overlay {
 
         fn release(&self, _: FileHandle) -> VfsResult<()> {
             Ok(())
+        }
+
+        fn readlink(&self, inode_id: InodeId) -> VfsResult<OsString> {
+            match self.nodes.get(&inode_id).ok_or(VfsError::NotFound)? {
+                Node::Link(target) => Ok(target.clone()),
+                _ => Err(VfsError::InvalidInput("not a symlink".into())),
+            }
+        }
+
+        fn statfs(&self, _: InodeId) -> VfsResult<StatFs> {
+            Ok(LOWER_STATFS)
         }
     }
 
@@ -684,6 +715,244 @@ mod overlay {
             !entries.iter().any(|e| e.path == "/sub"),
             "a fall-through dir must not be listed itself"
         );
+    }
+
+    /// An overlay-created symlink: `readlink` resolves it, `getattr`/`readdir`
+    /// report the Symlink kind, it shows up in the delta listing, and it
+    /// survives a seal → rehydrate roundtrip (over the lower) byte-exactly.
+    #[test]
+    fn symlink_seals_and_rehydrates_as_an_overlay_object() {
+        use epoch_worktree::OverlayEntryKind;
+
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "target.txt", b"lower target");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        let link = wt.symlink(root, OsStr::new("link"), OsStr::new("target.txt")).unwrap();
+        assert_eq!(wt.readlink(link).unwrap(), OsString::from("target.txt"));
+        let attr = wt.getattr(link).unwrap();
+        assert_eq!(attr.kind, NodeKind::Symlink);
+        assert_eq!(attr.size, "target.txt".len() as u64);
+        assert_eq!(attr.perm, 0o777);
+
+        // readdir reports the kind.
+        let entries = wt.readdir(root).unwrap();
+        let link_row = entries.iter().find(|e| e.name == "link").unwrap();
+        assert_eq!(link_row.kind, NodeKind::Symlink);
+
+        // The delta listing names the symlink (the fall-through target is not
+        // delta and stays unlisted).
+        let overlay = wt.overlay_entries();
+        assert!(overlay.iter().any(|e| e.path == "/link" && e.kind == OverlayEntryKind::Symlink));
+        assert!(!overlay.iter().any(|e| e.path == "/target.txt"));
+
+        // Seal → rehydrate over the lower: the link is in the delta and
+        // resolves without the live tree.
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let r2 = wt2.root();
+        let link2 = wt2.lookup(r2, OsStr::new("link")).unwrap();
+        assert_eq!(wt2.getattr(link2).unwrap().kind, NodeKind::Symlink);
+        assert_eq!(wt2.readlink(link2).unwrap(), OsString::from("target.txt"));
+        // And the target it names still falls through.
+        let t2 = wt2.lookup(r2, OsStr::new("target.txt")).unwrap();
+        assert_eq!(wt2.read_at(t2, 0, 64).unwrap(), b"lower target");
+    }
+
+    /// A symlink that exists only in the lower: it falls through with kind
+    /// Symlink, `readlink` delegates to the lower, and nothing is captured
+    /// into the overlay delta.
+    #[test]
+    fn lower_symlink_falls_through_and_delegates_readlink() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "real.md", b"real");
+        b.link(ROOT_INODE_ID, "alias.md", "real.md");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        let link = wt.lookup(root, OsStr::new("alias.md")).unwrap();
+        assert_eq!(wt.getattr(link).unwrap().kind, NodeKind::Symlink);
+        assert_eq!(wt.readlink(link).unwrap(), OsString::from("real.md"));
+        // Stable identity across lookups.
+        assert_eq!(wt.lookup(root, OsStr::new("alias.md")).unwrap(), link);
+        // readdir surfaces the kind.
+        let entries = wt.readdir(root).unwrap();
+        let row = entries.iter().find(|e| e.name == "alias.md").unwrap();
+        assert_eq!(row.kind, NodeKind::Symlink);
+
+        // Not captured: the delta stays empty of the link.
+        assert!(!wt.overlay_entries().iter().any(|e| e.path == "/alias.md"));
+    }
+
+    /// Deleting a lower symlink whiteouts it; recreating a link over the
+    /// tombstone replaces it.
+    #[test]
+    fn lower_symlink_unlink_tombstones_and_recreates() {
+        let mut b = Build::new();
+        b.link(ROOT_INODE_ID, "alias", "real");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        wt.unlink(root, OsStr::new("alias")).unwrap();
+        assert_eq!(wt.lookup(root, OsStr::new("alias")).unwrap_err(), VfsError::NotFound);
+
+        let link = wt.symlink(root, OsStr::new("alias"), OsStr::new("other")).unwrap();
+        assert_eq!(wt.readlink(link).unwrap(), OsString::from("other"));
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let r2 = wt2.root();
+        let link2 = wt2.lookup(r2, OsStr::new("alias")).unwrap();
+        assert_eq!(wt2.readlink(link2).unwrap(), OsString::from("other"));
+    }
+
+    /// Renaming a fall-through symlink copies its *target* up (never following
+    /// the link) and whiteouts the old name.
+    #[test]
+    fn rename_of_lower_symlink_copies_target_up() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "real", b"x");
+        b.link(ROOT_INODE_ID, "alias", "real");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+
+        wt.rename(root, OsStr::new("alias"), root, OsStr::new("moved")).unwrap();
+        assert_eq!(wt.lookup(root, OsStr::new("alias")).unwrap_err(), VfsError::NotFound);
+        let moved = wt.lookup(root, OsStr::new("moved")).unwrap();
+        assert_eq!(wt.getattr(moved).unwrap().kind, NodeKind::Symlink);
+        assert_eq!(wt.readlink(moved).unwrap(), OsString::from("real"));
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let r2 = wt2.root();
+        assert_eq!(wt2.lookup(r2, OsStr::new("alias")).unwrap_err(), VfsError::NotFound);
+        let moved2 = wt2.lookup(r2, OsStr::new("moved")).unwrap();
+        assert_eq!(wt2.readlink(moved2).unwrap(), OsString::from("real"));
+    }
+
+    /// `chmod` on an upper file persists through seal → rehydrate (the mode
+    /// lives in the tree entry).
+    #[test]
+    fn chmod_persists_through_seal() {
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::new(backend.clone());
+        let root = wt.root();
+        write_file(&mut wt, root, "script.sh", b"#!/bin/sh\n");
+        let f = wt.lookup(root, OsStr::new("script.sh")).unwrap();
+        assert_eq!(wt.getattr(f).unwrap().perm, 0o644);
+
+        wt.set_mode(f, 0o755).unwrap();
+        assert_eq!(wt.getattr(f).unwrap().perm, 0o755);
+
+        let sealed = wt.seal().unwrap();
+        let mut wt2 = Wt::from_root(backend.clone(), sealed).unwrap();
+        let f2 = wt2.lookup(wt2.root(), OsStr::new("script.sh")).unwrap();
+        assert_eq!(wt2.getattr(f2).unwrap().perm, 0o755, "mode survives the roundtrip");
+        // Content untouched by the chmod.
+        assert_eq!(wt2.read_at(f2, 0, 64).unwrap(), b"#!/bin/sh\n");
+    }
+
+    /// `chmod` of a fall-through file copies it up (the read-only lower stub
+    /// proves the lower is never written) and the new mode seals into the
+    /// delta.
+    #[test]
+    fn chmod_of_lower_file_copies_up() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "f", b"payload");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+        let f = wt.lookup(root, OsStr::new("f")).unwrap();
+
+        wt.set_mode(f, 0o600).unwrap();
+        assert_eq!(wt.getattr(f).unwrap().perm, 0o600);
+        // Content still reads back (copy-up preserved it).
+        assert_eq!(wt.read_at(f, 0, 64).unwrap(), b"payload");
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let f2 = wt2.lookup(wt2.root(), OsStr::new("f")).unwrap();
+        assert_eq!(wt2.getattr(f2).unwrap().perm, 0o600);
+        assert_eq!(wt2.read_at(f2, 0, 64).unwrap(), b"payload");
+    }
+
+    /// `chmod` of a fall-through *directory* forces the dir to seal an entry
+    /// for itself, so the mode survives rehydration while the dir's contents
+    /// keep falling through.
+    #[test]
+    fn chmod_of_lower_dir_seals_the_mode() {
+        let mut b = Build::new();
+        let sub = b.dir(ROOT_INODE_ID, "sub");
+        b.file(sub, "inner.txt", b"inner");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+        let d = wt.lookup(root, OsStr::new("sub")).unwrap();
+
+        wt.set_mode(d, 0o700).unwrap();
+        assert_eq!(wt.getattr(d).unwrap().perm, 0o700);
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let r2 = wt2.root();
+        let d2 = wt2.lookup(r2, OsStr::new("sub")).unwrap();
+        assert_eq!(wt2.getattr(d2).unwrap().perm, 0o700);
+        // The dir still merges with the lower: its untouched child falls
+        // through.
+        let inner = wt2.lookup(d2, OsStr::new("inner.txt")).unwrap();
+        assert_eq!(wt2.read_at(inner, 0, 64).unwrap(), b"inner");
+    }
+
+    /// `chmod` of a lower symlink copies the link up with its target intact.
+    #[test]
+    fn chmod_of_lower_symlink_copies_up_the_target() {
+        let mut b = Build::new();
+        b.link(ROOT_INODE_ID, "alias", "real");
+        let lower = b.build();
+
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::overlay(backend.clone(), lower.clone());
+        let root = wt.root();
+        let link = wt.lookup(root, OsStr::new("alias")).unwrap();
+
+        wt.set_mode(link, 0o777).unwrap();
+        assert_eq!(wt.readlink(link).unwrap(), OsString::from("real"));
+
+        let delta = wt.seal().unwrap();
+        let mut wt2 = Wt::from_overlay(backend.clone(), lower.clone(), delta).unwrap();
+        let link2 = wt2.lookup(wt2.root(), OsStr::new("alias")).unwrap();
+        assert_eq!(wt2.readlink(link2).unwrap(), OsString::from("real"));
+    }
+
+    /// `statfs` on an overlay answers with the lower's numbers; a standalone
+    /// tree answers with the synthetic unbounded shape.
+    #[test]
+    fn statfs_delegates_to_the_lower() {
+        let lower = Build::new().build();
+        let wt = Wt::overlay(MemoryByteBackend::new(), lower);
+        assert_eq!(wt.statfs().unwrap(), LOWER_STATFS);
+
+        let standalone = Wt::new(MemoryByteBackend::new());
+        let stats = standalone.statfs().unwrap();
+        assert_eq!(stats, StatFs::synthetic());
+        assert!(stats.blocks_free > 0);
     }
 }
 

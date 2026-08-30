@@ -99,6 +99,29 @@ impl NodeAttr {
             flags: 0,
         }
     }
+
+    /// Attrs of a symlink of `target_len` bytes. Permission bits are the
+    /// conventional `0o777` (a symlink's mode is never consulted for access;
+    /// the target's are).
+    pub fn symlink(inode_id: InodeId, target_len: u64, now: SystemTime) -> Self {
+        Self {
+            inode_id,
+            kind: NodeKind::Symlink,
+            size: target_len,
+            blocks: target_len.div_ceil(512),
+            atime: now,
+            mtime: now,
+            ctime: now,
+            created: now,
+            perm: 0o777,
+            nlink: 1,
+            uid: process_ids().0,
+            gid: process_ids().1,
+            rdev: 0,
+            block_size: 4096,
+            flags: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +154,120 @@ impl DirEntry {
             inode_id,
             name: name.into(),
             kind,
+        }
+    }
+}
+
+/// The attribute-mutation half of `setattr(2)` that epoch supports.
+///
+/// `size` changes are **not** here — they go through
+/// [`VfsService::truncate`], because kernels deliver `O_TRUNC`/`truncate(2)`
+/// as a size-only setattr and the trait already routes those. `mode` is the
+/// chmod half: persisted (in the tree entry, so it survives checkpoint and
+/// remount). `atime`/`mtime` are accepted for wire compatibility (`touch`,
+/// `cp -p`, editors) but are **best-effort and not persisted** — a
+/// `make`-style mtime comparison inside an overlay mount is a documented
+/// known gap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetAttrRequest {
+    /// The node to modify.
+    pub inode_id: InodeId,
+    /// New permission bits (`chmod`); full unix mode — only the low 12 bits
+    /// (`0o7777`) are applied.
+    pub mode: Option<u32>,
+    /// New atime (accepted, not persisted).
+    pub atime: Option<SystemTime>,
+    /// New mtime (accepted, not persisted).
+    pub mtime: Option<SystemTime>,
+}
+
+impl SetAttrRequest {
+    /// A request touching only `inode_id` (every field `None`).
+    pub fn new(inode_id: InodeId) -> Self {
+        Self {
+            inode_id,
+            mode: None,
+            atime: None,
+            mtime: None,
+        }
+    }
+
+    /// A mode-only (`chmod`) request.
+    pub fn mode(inode_id: InodeId, mode: u32) -> Self {
+        Self {
+            mode: Some(mode),
+            ..Self::new(inode_id)
+        }
+    }
+}
+
+/// Filesystem-wide capacity/usage statistics (`statfs(2)`/`statvfs(2)`).
+///
+/// For an overlay mount these describe the **lower** host filesystem: the
+/// overlay itself is bounded by RAM (staging) and the state store, not by a
+/// block device, so the lower's numbers are the honest answer installers and
+/// `df` are looking for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatFs {
+    /// Optimal transfer block size. Set from `f_frsize` (not `f_bsize`): the
+    /// `f_blocks`/`f_bfree`/`f_bavail` counts are in `f_frsize` units on both
+    /// Linux and macOS, so this keeps `blocks × block_size` == total bytes —
+    /// which is what `df` prints.
+    pub block_size: u64,
+    /// Total data blocks (`f_blocks`).
+    pub blocks: u64,
+    /// Free blocks (`f_bfree`).
+    pub blocks_free: u64,
+    /// Free blocks available to unprivileged users (`f_bavail`).
+    pub blocks_avail: u64,
+    /// Total file nodes (`f_files`).
+    pub files: u64,
+    /// Free file nodes (`f_ffree`).
+    pub files_free: u64,
+    /// Maximum filename length (`f_namemax`).
+    pub name_max: u32,
+}
+
+impl StatFs {
+    /// The stats of the filesystem hosting `path`, via `statvfs(2)`.
+    #[cfg(unix)]
+    pub fn of_path(path: &std::path::Path) -> VfsResult<StatFs> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            VfsError::InvalidInput(format!("path contains an interior NUL: {path:?}"))
+        })?;
+        // SAFETY: `c_path` is a valid NUL-terminated CString that outlives the
+        // call; `stat` points at a zeroed `statvfs` we own.
+        let stat = unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+                return Err(VfsError::Io(std::io::Error::last_os_error().to_string()));
+            }
+            stat
+        };
+        Ok(StatFs {
+            // f_frsize, not f_bsize: see the field's doc comment.
+            block_size: stat.f_frsize as u64,
+            blocks: stat.f_blocks as u64,
+            blocks_free: stat.f_bfree as u64,
+            blocks_avail: stat.f_bavail as u64,
+            files: stat.f_files as u64,
+            files_free: stat.f_ffree as u64,
+            name_max: stat.f_namemax as u32,
+        })
+    }
+
+    /// A synthetic answer for a filesystem with no host backing (a pure
+    /// in-memory CAS tree): unbounded for practical purposes.
+    pub fn synthetic() -> StatFs {
+        StatFs {
+            block_size: 4096,
+            blocks: 1 << 28, // 1 TiB in 4 KiB blocks
+            blocks_free: 1 << 28,
+            blocks_avail: 1 << 28,
+            files: 0,
+            files_free: 1 << 30,
+            name_max: 255,
         }
     }
 }
@@ -288,6 +425,38 @@ pub trait VfsService: Send + Sync {
     /// filesystems must implement this for shell redirection (`>`) to work.
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr>;
 
+    /// Create a symlink `name` under `parent` pointing at `target` (the raw
+    /// target path bytes, stored verbatim — relative targets stay relative).
+    /// The default answers [`Unsupported`](VfsError::Unsupported); writable
+    /// filesystems override it.
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        let _ = (parent, name, target);
+        Err(VfsError::Unsupported("symlink"))
+    }
+
+    /// Read a symlink's target. The default answers
+    /// [`Unsupported`](VfsError::Unsupported).
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<OsString> {
+        let _ = inode_id;
+        Err(VfsError::Unsupported("readlink"))
+    }
+
+    /// Apply the non-size attribute changes in `request` (see
+    /// [`SetAttrRequest`] for what persists), returning the updated
+    /// attributes. The default answers [`Unsupported`](VfsError::Unsupported).
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        let _ = request;
+        Err(VfsError::Unsupported("setattr"))
+    }
+
+    /// Filesystem-wide capacity statistics (`statfs(2)`). `inode_id` identifies
+    /// which filesystem is asked (any live node of it). The default answers
+    /// [`Unsupported`](VfsError::Unsupported).
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        let _ = inode_id;
+        Err(VfsError::Unsupported("statfs"))
+    }
+
     fn flush(&self, handle: FileHandle) -> VfsResult<()>;
 
     /// Explicit durability request (`fsync(2)`/`fdatasync(2)`) for an open
@@ -321,6 +490,12 @@ pub trait ReadOnlyFeature: Send + Sync {
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
     /// See [`VfsService::read`].
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>>;
+    /// See [`VfsService::readlink`]. Default: no symlinks here (a feature that
+    /// serves tree snapshots overrides it — see
+    /// [`TreeBrowseFeature`](crate::submount) in `epoch-vfs`).
+    fn readlink(&self, _inode_id: InodeId) -> VfsResult<OsString> {
+        Err(VfsError::InvalidInput("not a symlink".into()))
+    }
     /// Drop a handle minted by [`open`](Self::open). Default: handles are
     /// stateless, nothing to do.
     fn release(&self, _handle: FileHandle) -> VfsResult<()> {
@@ -350,6 +525,10 @@ impl<T: ReadOnlyFeature> VfsService for T {
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
         ReadOnlyFeature::read(self, request)
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<OsString> {
+        ReadOnlyFeature::readlink(self, inode_id)
     }
 
     fn write(&self, _request: WriteRequest<'_>) -> VfsResult<u32> {
@@ -383,6 +562,14 @@ impl<T: ReadOnlyFeature> VfsService for T {
     }
 
     fn truncate(&self, _inode_id: InodeId, _size: u64) -> VfsResult<NodeAttr> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn symlink(&self, _parent: InodeId, _name: &OsStr, _target: &OsStr) -> VfsResult<Entry> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+
+    fn setattr(&self, _request: SetAttrRequest) -> VfsResult<NodeAttr> {
         Err(VfsError::ReadOnlyFilesystem)
     }
 

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use epoch_history::{SchedulerHandle, TriggerEvent};
 use epoch_vfs_api::{
     CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, OpenRequest,
-    OpenedFile, ReadRequest, VfsError, VfsResult, VfsService, WriteRequest,
+    OpenedFile, ReadRequest, SetAttrRequest, StatFs, VfsError, VfsResult, VfsService, WriteRequest,
 };
 
 /// The event-emitting decorator. See the [module docs](self).
@@ -117,6 +117,31 @@ impl VfsService for SignalVfs {
         // dirty so the next durability signal checkpoints it.
         self.scheduler.signal(TriggerEvent::Wrote(0));
         Ok(attr)
+    }
+
+    fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
+        let entry = self.inner.symlink(parent, name, target)?;
+        // A symlink creation is a metadata-only mutation: no write/flush pair
+        // follows it.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        self.scheduler.signal(TriggerEvent::Flush);
+        Ok(entry)
+    }
+
+    fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
+        self.inner.readlink(inode_id)
+    }
+
+    fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
+        let attr = self.inner.setattr(request)?;
+        // A chmod is a metadata-only mutation with no write/flush pair.
+        self.scheduler.signal(TriggerEvent::Wrote(0));
+        self.scheduler.signal(TriggerEvent::Flush);
+        Ok(attr)
+    }
+
+    fn statfs(&self, inode_id: InodeId) -> VfsResult<StatFs> {
+        self.inner.statfs(inode_id)
     }
 
     fn flush(&self, handle: FileHandle) -> VfsResult<()> {

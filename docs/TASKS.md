@@ -66,9 +66,11 @@ reads AND writes bypass the overlay and are never checkpointed.
    `.epochignore` fall-through caveats).
 4. **GC by retention** (`epoch-gc`) — mark from heads (+ live volatile roots),
    sweep unreachable objects/events; cleans checkpoint crash orphans.
-5. **VfsService gaps** — `symlink`; full `setattr` persistence (mode/times
-   are accepted-and-ignored); xattr *storage* (currently `ENOTSUP` stubs);
-   seal-on-close in `release`; `statfs`.
+5. **VfsService gaps** — xattr *storage* (currently `ENOTSUP` stubs);
+   seal-on-close in `release`; atime/mtime persistence (`setattr` accepts
+   them but does not persist them — `make`-style mtime reasoning inside an
+   overlay mount is a known gap). (`symlink`/`readlink`, `setattr` **mode**
+   persistence, and `statfs` landed — see `docs/ops/CHANGELOG.md`.)
 
 ## 4. Deferred (agreed, not started)
 
