@@ -24,7 +24,18 @@ libc = "0.2"
 # macOS mounts through the privileged `mount_macfuse` helper (see src/macfuse.rs):
 # socketpair + SCM_RIGHTS fd passing, plus fcntl/umount. `nix` is already in the
 # tree via fuser, so this adds no new transitive cost.
+#
+# `macfuse-4-compat` is REQUIRED on macOS: macFUSE 4.x/5.x send a 16-byte
+# `fuse_rename_in` (newdir + flags + padding), while fuser defaults to the
+# Linux 8-byte layout (newdir only). Without the feature the two name strings
+# are read out of the zero padding and arrive EMPTY — rename(2) fails 100% of
+# the time (mv, editor atomic saves, `jj git init` all break). The feature only
+# changes that one struct's parse width, so it must stay macOS-only: on Linux
+# the extra 8 bytes do not exist and enabling it there would break rename
+# symmetrically. Cargo unions features per-target, so Linux builds are
+# unaffected by this declaration.
 [target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", optional = true, features = ["macfuse-4-compat"] }
 nix = { version = "0.30", features = ["socket", "fs", "mount"] }
 
 [[bin]]

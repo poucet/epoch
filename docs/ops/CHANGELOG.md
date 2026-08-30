@@ -44,3 +44,9 @@ Cost: `VfsService` grew four defaulted methods (`Unsupported` unless
 overridden — existing implementors keep compiling); the `Body::Dir` variants
 carry a `mode_override` flag. atime/mtime persistence was deliberately left
 out (§1.5's best-effort allowance).
+
+**rename(2) works on macFUSE 5.x; rmdir of emptied lower dirs fixed** · 2026-08-30 01:40 · qnxoqvlu
+ - Root cause: fuser 0.17 parses `FUSE_RENAME` as the 8-byte Linux `fuse_rename_in` unless its `macfuse-4-compat` feature is on; macFUSE 4.x/5.x send 16 bytes (`newdir`+`flags`+`padding`), so both name strings were read out of zero padding and arrived empty — 100% rename failure (`mv`, editor atomic saves, `jj git init`). Fix: enable `macfuse-4-compat` for `cfg(target_os = "macos")` only, in `crates/epoch-fuse/Cargo.toml` (per-target feature union; Linux untouched).
+ - Follow-on found by the live acceptance test: `rmdir` of an emptied fall-through directory failed ENOTEMPTY because `WorkingTree` counted the lower `readdir`'s synthesized `.`/`..` entries as children (and `readdir` cached them as real nodes). Both lower-merge points now skip dot entries; regression test `overlay::rmdir_emptied_fall_through_dir_ignores_lower_dot_entries`; the test lower now emits dot entries like the real `PassthroughVfs`.
+ - Verified live on macFUSE 5.3.1: `mv` of lower file / upper file / lower directory (EXDEV → copy+delete), editor atomic-save cycle, `jj git init` + commit inside a mount; same suite green on Linux (Docker, `fuser-mount`).
+ - Cost: none user-visible; macOS and Linux now parse different rename wire widths, per-target. Found-not-fixed: Dockerfile cargo cache-mount can bake a stale binary (see ISSUES).

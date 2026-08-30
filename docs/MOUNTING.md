@@ -20,10 +20,23 @@ we mount natively with macFUSE instead.
 
 FUSE-T mounts without a kernel extension, which would avoid the approval below.
 It links and even mounts, but **`fuser` 0.17 is protocol-incompatible with it**:
-fuser hard-compiles the macFUSE 4.x wire layout (`macfuse-4-compat`) and rejects
-FUSE-T's requests right after INIT (`"Invalid request"`). Upstream issue
+it rejects FUSE-T's requests right after INIT (`"Invalid request"`). Upstream issue
 [cberner/fuser#273](https://github.com/cberner/fuser/issues/273) is open and
 unresolved. Until that changes (or we fork fuser), macFUSE is the native path.
+
+## macFUSE 5.x needs `macfuse-4-compat` (was: rename arrives with empty names)
+
+macFUSE 4.x/5.x send `FUSE_RENAME` with a **16-byte** `fuse_rename_in`
+(`newdir` + `flags` + `padding`, for `renamex_np`-style flags); stock fuser
+parses the Linux **8-byte** layout (`newdir` only) unless its
+`macfuse-4-compat` feature is on. With the wrong width the two name strings
+are read out of the zero padding, so every rename arrived as
+`rename parent=N name="" newname=""` → ENOENT, and `mv`, editor atomic saves
+and `jj git init` all failed 100% of the time. `epoch-fuse` enables the
+feature on `cfg(target_os = "macos")` only (`crates/epoch-fuse/Cargo.toml`) —
+enabling it on Linux would break rename symmetrically, since the extra 8
+bytes do not exist there. (2026-08-30: verified live on macFUSE 5.3.1 and on
+Linux in Docker.)
 
 ## One-time: enable the macFUSE kernel extension (Apple Silicon)
 

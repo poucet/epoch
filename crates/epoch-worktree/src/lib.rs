@@ -596,6 +596,11 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         if let Some(ld) = lower_id {
             let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
             for de in lower.readdir(ld)? {
+                // The `VfsService::readdir` contract includes synthesized `.`/`..`
+                // entries (see `PassthroughVfs`); they are not mergeable content.
+                if de.name == "." || de.name == ".." {
+                    continue;
+                }
                 if cached.iter().any(|(n, _)| n == &de.name) {
                     // Already overridden / tombstoned / cached — skip.
                     continue;
@@ -983,6 +988,11 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         if let Some(ld) = lower {
             let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
             for de in lower.readdir(ld)? {
+                // `.`/`..` are synthesized by the lower service, not content —
+                // they must not count toward non-emptiness.
+                if de.name == "." || de.name == ".." {
+                    continue;
+                }
                 let shadowed = children
                     .get(&de.name)
                     .map(|cid| matches!(self.inodes.get(cid).map(|n| &n.body), Some(Body::Tombstone)))

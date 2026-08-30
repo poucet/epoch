@@ -331,16 +331,24 @@ mod overlay {
                 Node::Dir(m) => m,
                 _ => return Err(VfsError::NotDirectory),
             };
-            Ok(dir
-                .iter()
-                .map(|(name, &id)| {
+            // Mirror the real `PassthroughVfs` contract: listings lead with
+            // synthesized `.`/`..` entries. The overlay must ignore them (it
+            // used to count them as children, making every lower dir
+            // un-rmdir-able and caching fake dot nodes).
+            let dots = [
+                DirEntry::new(inode_id, OsString::from("."), NodeKind::Directory),
+                DirEntry::new(ROOT_INODE_ID, OsString::from(".."), NodeKind::Directory),
+            ];
+            Ok(dots
+                .into_iter()
+                .chain(dir.iter().map(|(name, &id)| {
                     let kind = match self.nodes.get(&id) {
                         Some(Node::Dir(_)) => NodeKind::Directory,
                         Some(Node::Link(_)) => NodeKind::Symlink,
                         _ => NodeKind::RegularFile,
                     };
                     DirEntry::new(id, name.clone(), kind)
-                })
+                }))
                 .collect())
         }
 
@@ -447,6 +455,45 @@ mod overlay {
             wt.rename(root, OsStr::new("sub"), root, OsStr::new("sub2"))
                 .unwrap_err(),
             VfsError::CrossDevice
+        );
+    }
+
+    /// The `mv` fallback for a fall-through directory (EXDEV → copy + delete):
+    /// after every lower child is unlinked (tombstoned), `rmdir` must succeed —
+    /// the synthesized `.`/`..` entries in a lower `readdir` listing are not
+    /// content and must not count toward non-emptiness, even after a `readdir`
+    /// has run. Regression test: `PassthroughVfs` listings lead with dot
+    /// entries, which made every lower directory un-rmdir-able.
+    #[test]
+    fn rmdir_emptied_fall_through_dir_ignores_lower_dot_entries() {
+        let mut b = Build::new();
+        let dir = b.dir(ROOT_INODE_ID, "dir-lower");
+        let sub = b.dir(dir, "sub");
+        b.file(sub, "nested.txt", b"nested");
+        let lower = b.build();
+        let mut wt = WorkingTree::overlay(MemoryByteBackend::new(), lower);
+        let root = wt.root();
+
+        let dir = wt.lookup(root, OsStr::new("dir-lower")).unwrap();
+        let sub = wt.lookup(dir, OsStr::new("sub")).unwrap();
+
+        // A listing first: must neither surface the lower's dots nor cache
+        // them as children.
+        let names: Vec<_> = wt
+            .readdir(sub)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, [OsString::from("nested.txt")]);
+
+        // Delete phase: unlink the last real child (tombstone), then rmdir up.
+        wt.unlink(sub, OsStr::new("nested.txt")).unwrap();
+        wt.rmdir(dir, OsStr::new("sub")).unwrap();
+        wt.rmdir(root, OsStr::new("dir-lower")).unwrap();
+        assert_eq!(
+            wt.lookup(root, OsStr::new("dir-lower")).unwrap_err(),
+            VfsError::NotFound
         );
     }
 
