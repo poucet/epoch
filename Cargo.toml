@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/epoch-bench",
     "crates/epoch-cas",
     "crates/epoch-cas-moka",
     "crates/epoch-cas-redb",

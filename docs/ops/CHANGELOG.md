@@ -105,3 +105,20 @@ stamp every checkpoint's `meta` with schema-v1 attribution
 schema on the free-form `meta` field; store-side reads still obey redb's
 single-writer rule (live state dirs must be unmounted or copied — the verbs
 say so). Spec: `docs/reference/EXPORT-AUDIT.md`.
+
+- **epoch-bench: the benchmark suite EPOCH-FIXES §2.4 mandates** · 2026-08-30 02:13 · qupstnsnnzwy
+  New crate `crates/epoch-bench` (+ `bench/run-mount.sh`, `bench/README.md`):
+  micro op-classes (stat-walk, read, write+fsync, copy-up, rename, unlink),
+  macro envelopes (spawn-heavy churn with writes forced in-dir, 10⁴-entry
+  stat-storm, editor atomic-save, bulk-write), spin-up grid {10³,10⁴,10⁵} ×
+  {10 MB,1 GB,10 GB} (sparse-by-default, warm-cache caveat printed), sqlite
+  mmap smoke, and realworld pairs (git/jj flows, sed -i loop, cargo build
+  ×bare (same machine, same run), workload CPU (rusage), daemon CPU + peak
+  RSS (ps sampling), §2.2 ceilings pass/fail. Known breakage (macFUSE 5.x
+  rename wire bug, symlink ENOSYS) degrades to KNOWN-FAIL, never crashes.
+  First live-mount numbers: stat-walk 25× (≤3× FAIL), reads 10.3× (≤2× FAIL),
+  stat-storm 20× at 10⁴-scale (FAIL), copy-up 10 ms ✓, write+fsync 0.6 ms ✓,
+  mount→first-read 247–250 ms ✓ at ≤10⁴ files, bulk-write RSS growth
+  +882 MiB per GiB written (the §2.3 staging-tier hazard, now measured). Cost: one workspace crate with deps on
+  epoch-cas/epoch-vfs/epoch-vfs-api + libc; the report-only rows carry no
+  ceilings by design (§2.3).

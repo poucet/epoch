@@ -1,0 +1,14 @@
+[package]
+name = "epoch-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+epoch-cas = { path = "../epoch-cas" }
+epoch-vfs = { path = "../epoch-vfs" }
+epoch-vfs-api = { path = "../epoch-vfs-api" }
+libc = "0.2"
+
+[[bin]]
+name = "epoch-bench"
+path = "src/main.rs"

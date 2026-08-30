@@ -10,6 +10,7 @@ SYSTEM.md
 .workspaces/
 .screenshots/
 docs/live/
+.bench-scratch/
 .claude/agents
 .pi/agents
 .epoch-state/

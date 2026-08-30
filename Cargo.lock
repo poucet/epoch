@@ -160,6 +160,16 @@ name = "epoch"
 version = "0.1.0"
 
 [[package]]
+name = "epoch-bench"
+version = "0.1.0"
+dependencies = [
+ "epoch-cas",
+ "epoch-vfs",
+ "epoch-vfs-api",
+ "libc",
+]
+
+[[package]]
 name = "epoch-cas"
 version = "0.1.0"
 dependencies = [
