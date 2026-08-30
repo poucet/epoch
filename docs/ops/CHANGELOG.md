@@ -5,6 +5,47 @@ format is stated once in SYSTEM.md §2.
 
 ## Unreleased
 
+### atime/mtime: in-memory session times, checkpoint-stamped history · 2026-08-30 02:44 · ynvtzmkokpkm
+
+Lane `times-persistence`, per `docs/design/EPOCH-FIXES.md` §1.5 — pulled
+forward from "best-effort / acceptable to leave" by Chris, with a design
+constraint that replaced the briefed tree-format v2: **times never live in
+content-addressed storage** (a time in the tree would make identical content
+hash differently per mtime and collapse CAS dedup across checkpoints and
+forks). The tree codec therefore stays v1 and time-free; what landed is the
+three-layer model (TASKS.md §3.7):
+
+- **Live mount — in-memory session times** on the `WorkingTree` inode:
+  explicit `setattr` (`utimes(2)`/`FATTR_ATIME`/`FATTR_MTIME`, `UTIME_OMIT`
+  per-field) sets them exactly; `write_at`/`truncate`/creates bump `mtime`
+  (and `atime`) to now; copy-up of a fall-through file carries the lower's
+  own times until written; **reads never touch atime** (effective `noatime`
+  for implicit updates — also what keeps a read from arming the checkpoint
+  trigger). `ctime` is the metadata-change instant (chmod/utimes/rename).
+- **History/portal views — checkpoint-instant stamps**: `.vfs/history/*` and
+  `.vfs/cas/<tree>` entries all report `mtime = atime =` the snapshot event's
+  `timestamp_ms`, applied in `SubMounts::remap_attr` via a per-root stamp
+  registry (`TreeMounts::stamp_snapshot`), never stored. A point-in-time view
+  has one honest time.
+- **CAS + redb — time-free, always**: dedup is structural. Test
+  `times_never_change_content_hashes` proves two same-bytes files with
+  *different* mtimes share one blob id and one root tree id, and a time-only
+  change between seals yields the *same* root (no phantom checkpoint).
+
+Verified through a real macFUSE mount: `touch -d` exact; `touch -a`/`-m`
+independent; write bumps mtime; read leaves atime; `cp -p` preserves mtime
+(lower *and* overlay); a `make` demo builds/skips/rebuilds correctly; two
+checkpoints stamp the same unchanged file at their own instants; remount
+shows mode persisted (in CAS) and times reset to epoch — the documented
+consequence, with the brief's remount-persistence acceptance criterion
+**dropped** (session-scoped by design; a build does not span remounts).
+
+Cost: `SetAttrRequest`'s atime/mtime are now honored (was accept-and-ignore);
+`PassthroughVfs::setattr` applies times to the host via a new `utimensat`
+helper in `epoch-vfs-api` (`epoch-vfs` is `forbid(unsafe_code)`). The
+`.vfs/history` attr-synthesis layer grew a stamp registry — the only
+threading the event timestamp needed.
+
 ### vfs-semantics batch: symlink + setattr-mode + statfs · 2026-08-30 01:49 · pynyrqopqtvt
 
 Lane `vfs-semantics`, per `docs/design/EPOCH-FIXES.md` §1.2/§1.5/§1.6. Three

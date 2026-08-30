@@ -195,6 +195,20 @@ impl PassthroughVfs {
         Ok(())
     }
 
+    /// Apply atime/mtime to a host path (`utimensat(2)` via the `epoch-vfs-api`
+    /// helper, which owns the unsafe).
+    fn apply_times(
+        lower: &Path,
+        atime: Option<std::time::SystemTime>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> VfsResult<()> {
+        #[cfg(unix)]
+        epoch_vfs_api::utimes_path(lower, atime, mtime)?;
+        #[cfg(not(unix))]
+        let _ = (lower, atime, mtime);
+        Ok(())
+    }
+
     /// Shared mutation path of `create`/`mkdir`: make the node on the host,
     /// apply the mode, and return its entry.
     fn create_node(&self, request: &CreateRequest) -> VfsResult<(PathBuf, Entry)> {
@@ -443,8 +457,11 @@ impl VfsService for PassthroughVfs {
         if let Some(mode) = request.mode {
             Self::apply_mode(&lower, mode)?;
         }
-        // atime/mtime: accepted but not applied (no `filetime` dependency;
-        // documented best-effort).
+        // atime/mtime land on the host file (utimensat; `UTIME_OMIT` for the
+        // unset half; symlink times set on the link itself).
+        if request.atime.is_some() || request.mtime.is_some() {
+            Self::apply_times(&lower, request.atime, request.mtime)?;
+        }
         let metadata = fs::symlink_metadata(&lower).map_err(map_io_error)?;
         Ok(attr_from_metadata(request.inode_id, &metadata))
     }

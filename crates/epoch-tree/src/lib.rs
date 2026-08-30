@@ -81,7 +81,7 @@ pub mod store;
 pub mod tree;
 
 pub use codec::{TreeCodec, TREE_FORMAT_VERSION};
-pub use entry::{TreeEntry, SYMLINK_MODE};
+pub use entry::{EntryTime, TreeEntry, SYMLINK_MODE};
 pub use error::TreeError;
 pub use id::{BlobRef, EntryId, Link, LinkKind, Overlay, TreeId};
 pub use store::TreeStore;

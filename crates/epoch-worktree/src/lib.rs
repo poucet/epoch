@@ -50,9 +50,8 @@
 //!
 //! - Inodes are **session-scoped**: allocated from a monotonic counter, stable
 //!   for the life of this `WorkingTree`, not persisted and not preserved across
-//!   history. Hardlinks, a durable inode table, and per-inode uid/gid/timestamps
-//!   are future work; timestamps for upper nodes are reported as [`UNIX_EPOCH`]
-//!   (a `LowerFile` reports the lower's own timestamps).
+//!   history. Hardlinks, a durable inode table, and per-inode uid/gid are future
+//!   work.
 //! - [`from_root`](WorkingTree::from_root) / [`from_overlay`](WorkingTree::from_overlay)
 //!   hydrate **lazily**: only the root is recorded, and each directory's children
 //!   fault in from the CAS one spine level per access (see [`DirChildren`]). Lower
@@ -68,8 +67,42 @@
 //!   lower (fall-through) symlink resolves its target from the lower on
 //!   `readlink`. Mode bits (`chmod`) persist: they live in the tree entry's
 //!   `mode` field, applied on copy-up and honored in synthesized attrs.
-//!   atime/mtime are accepted by `setattr` but not persisted (a known gap:
-//!   `make`-style mtime reasoning is unreliable inside an overlay mount).
+//!
+//! ## Timestamps: in-memory only, never content-addressed
+//!
+//! `mtime`/`atime` live **only on the live inode**, never in the CAS — not in
+//! the blob object, not in the tree object (the codec stays time-free). This is
+//! a structural invariant, not a convention: two entries with identical content
+//! and different mtimes seal to the *same* blob and tree ids, so dedup and
+//! content addressing cannot be broken by a timestamp. (A time-in-tree design
+//! would make every write re-hash its whole ancestry and destroy sharing across
+//! checkpoints and forks.)
+//!
+//! The semantics, per node:
+//!
+//! - **explicit `setattr`** (`utimes(2)` / `FATTR_ATIME`/`FATTR_MTIME`) sets the
+//!   in-memory times exactly, like `chmod` sets the mode. A fall-through node is
+//!   copied up first so the times have an overlay home; the lower is never
+//!   mutated.
+//! - **writes and truncates** bump `mtime` (and `atime`) to the wall-clock now;
+//!   creates initialize all three times to now.
+//! - **copy-up carries the lower's times**: a fall-through file materialized on
+//!   first write keeps the lower's `mtime`/`atime` until the write itself bumps
+//!   them (the POSIX `cp` expectation).
+//! - **reads never touch `atime`** — the mount behaves as if mounted `noatime`
+//!   for implicit updates. Only an explicit `setattr` sets `atime`. (Updating
+//!   atime per read would also arm the checkpoint trigger per read and destroy
+//!   the debounce model.)
+//! - **`ctime`** is the metadata-change instant (chmod/utimes/rename); it is
+//!   live but *never persisted* anywhere — a fresh session reports the zeroed
+//!   default.
+//!
+//! What that costs, stated plainly: times do **not** survive unmount → remount
+//! (a remounted overlay shows the zeroed defaults), and `.vfs/history/*` /
+//! `.vfs/cas` snapshots — which rehydrate from the time-free CAS tree — report
+//! zeroed times too. Those are *content* views. `make`-style freshness works
+//! within a mount session (a build does not span remounts); it does not resume
+//! across one.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -78,11 +111,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
-use epoch_tree::{EntryId, Link, LinkKind, Overlay, SYMLINK_MODE, Tree, TreeEntry, TreeStore};
+use epoch_tree::{EntryId, EntryTime, Link, LinkKind, Overlay, SYMLINK_MODE, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
     DirEntry, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, StatFs, VfsError,
     VfsResult, VfsService, ROOT_INODE_ID,
@@ -119,12 +152,61 @@ pub struct WorkingTree<TBk, FBk = TBk> {
 /// dir / regular / symlink, preserved verbatim across a chmod.
 const TYPE_BITS: u32 = 0o170000;
 
-/// One node in the live tree: its mode bits and kind-specific body.
+/// One node in the live tree: its mode bits, session timestamps, and
+/// kind-specific body.
 struct Inode {
     /// Unix mode bits as supplied by the caller / read from the sealed entry or
     /// the lower's attrs, preserved verbatim across seal/hydrate.
     mode: u32,
+    /// Modification time — in-memory only (see the crate docs). Bumped by
+    /// writes/truncates, set exactly by `setattr`, carried from the lower on
+    /// copy-up, zeroed (the epoch) after a rehydrate.
+    mtime: EntryTime,
+    /// Access time — in-memory only. Updated **only** by an explicit `setattr`
+    /// (the mount is effectively `noatime` for implicit updates); reads never
+    /// touch it.
+    atime: EntryTime,
+    /// Metadata-change time — in-memory only and *not* settable via `setattr`:
+    /// `chmod`/`utimes`/rename stamp it with the wall-clock now.
+    ctime: EntryTime,
     body: Body,
+}
+
+impl Inode {
+    /// A fresh inode with all session timestamps zeroed (used for nodes whose
+    /// times are supplied by the caller / lower immediately after).
+    fn bare(mode: u32, body: Body) -> Inode {
+        Inode {
+            mode,
+            mtime: EntryTime::EPOCH,
+            atime: EntryTime::EPOCH,
+            ctime: EntryTime::EPOCH,
+            body,
+        }
+    }
+
+    /// A fresh inode with all session timestamps set to the wall-clock now
+    /// (creates: file, directory, symlink).
+    fn new(mode: u32, body: Body) -> Inode {
+        let now = EntryTime::from_system_time(SystemTime::now());
+        Inode {
+            mode,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            body,
+        }
+    }
+
+    /// A fresh inode whose session timestamps are copied from a lower entry's
+    /// attrs (fall-through materialization / copy-up): the overlay reports the
+    /// lower's times until the node is written or explicitly re-stamped.
+    fn with_times(mode: u32, body: Body, attr: &NodeAttr) -> Inode {
+        let mut inode = Inode::bare(mode, body);
+        inode.mtime = EntryTime::from_system_time(attr.mtime);
+        inode.atime = EntryTime::from_system_time(attr.atime);
+        inode
+    }
 }
 
 enum Body {
@@ -355,14 +437,14 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let mut inodes = HashMap::new();
         inodes.insert(
             ROOT_INODE_ID,
-            Inode {
+            Inode::bare(
                 mode,
-                body: Body::Dir {
+                Body::Dir {
                     children: DirChildren::Open(BTreeMap::new()),
                     lower: root_lower,
                     mode_override: false,
                 },
-            },
+            ),
         );
         Self {
             trees: TreeStore::new(tree_backend),
@@ -438,11 +520,12 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                         // (git-style); fault the target in now (it is small).
                         let target =
                             self.files.get(&blob).map_err(io)?.ok_or(VfsError::NotFound)?;
-                        self.inodes.insert(child, Inode { mode, body: Body::Symlink(target) });
+                        self.inodes
+                            .insert(child, Inode::bare(mode, Body::Symlink(target)));
                     } else {
                         self.inodes.insert(
                             child,
-                            Inode { mode, body: Body::File(FileBody::Clean(blob)) },
+                            Inode::bare(mode, Body::File(FileBody::Clean(blob))),
                         );
                     }
                 }
@@ -452,18 +535,18 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                     let child_lower = self.lower_child_dir(dir_lower, &name);
                     self.inodes.insert(
                         child,
-                        Inode {
+                        Inode::bare(
                             mode,
-                            body: Body::Dir {
+                            Body::Dir {
                                 children: DirChildren::Sealed(TreeId::from_cas_hash(h)),
                                 lower: child_lower,
                                 mode_override: false,
                             },
-                        },
+                        ),
                     );
                 }
                 LinkKind::Tombstone => {
-                    self.inodes.insert(child, Inode { mode, body: Body::Tombstone });
+                    self.inodes.insert(child, Inode::bare(mode, Body::Tombstone));
                 }
             }
             children.insert(name, child);
@@ -523,6 +606,13 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     /// through `Dir` wired to its lower id; a regular file becomes a
     /// `LowerFile`; a symlink becomes a `LowerSymlink` (its target is read from
     /// the lower on `readlink`).
+    /// Build an overlay node from a lower entry's attrs and insert it, returning
+    /// its (newly allocated) overlay [`InodeId`]. A directory becomes a fall-
+    /// through `Dir` wired to its lower id; a regular file becomes a
+    /// `LowerFile`; a symlink becomes a `LowerSymlink` (its target is read from
+    /// the lower on `readlink`). The node's session times start as the lower's
+    /// own, so a fall-through `stat` reports real lower times and a later
+    /// copy-up preserves them (the POSIX `cp` expectation).
     fn materialize_lower(&mut self, attr: &NodeAttr) -> InodeId {
         let id = self.alloc();
         let mode_perm = attr.perm as u32 & 0o7777;
@@ -540,15 +630,19 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             NodeKind::RegularFile => 0o100000 | mode_perm,
             NodeKind::Symlink => SYMLINK_MODE | mode_perm,
         };
-        self.inodes.insert(id, Inode { mode, body });
+        let inode = Inode::with_times(mode, body, attr);
+        self.inodes.insert(id, inode);
         id
     }
 
     // --- getattr / readdir ---------------------------------------------------
 
-    /// Attributes of `node` (kind, mode, size). Upper nodes report
-    /// [`UNIX_EPOCH`] timestamps; a fall-through file reports the lower's own
-    /// attrs (with the `inode_id` remapped to the overlay id).
+    /// Attributes of `node` (kind, mode, size, times).
+    ///
+    /// Times are the session values (see the crate docs): explicit `setattr` /
+    /// write-bump for upper nodes, the lower's own for a fall-through node
+    /// (re-read live from the lower), zeroed after a rehydrate. `ctime` is the
+    /// in-memory metadata-change instant. Reads never modify `atime`.
     pub fn getattr(&self, node: InodeId) -> VfsResult<NodeAttr> {
         let inode = self.inodes.get(&node).ok_or(VfsError::NotFound)?;
         let mut attr = match &inode.body {
@@ -564,6 +658,9 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             Body::Tombstone => return Err(VfsError::NotFound),
         };
         attr.perm = (inode.mode & 0o7777) as u16;
+        attr.mtime = inode.mtime.to_system_time();
+        attr.atime = inode.atime.to_system_time();
+        attr.ctime = inode.ctime.to_system_time();
         Ok(attr)
     }
 
@@ -708,9 +805,13 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     ///   read into a fresh writer, the inode flips to [`File`](Body::File)
     ///   keeping the **same [`InodeId`]**, and the write is applied. The lower is
     ///   never mutated.
+    ///
+    /// The write bumps the node's session `mtime` (and `atime`) to now; a
+    /// copied-up lower file keeps the lower's times only until the first write.
     pub fn write_at(&mut self, node: InodeId, off: u64, data: &[u8]) -> VfsResult<u32> {
         self.make_dirty(node)?;
         self.writer_mut(node)?.write_at(off, data);
+        self.bump_mtime(node);
         Ok(data.len() as u32)
     }
 
@@ -739,10 +840,12 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             if let Some(inode) = self.inodes.get_mut(&node) {
                 inode.body = Body::File(FileBody::Dirty(writer));
             }
+            self.bump_mtime(node);
             return Ok(());
         }
         self.make_dirty(node)?;
         self.writer_mut(node)?.truncate(len);
+        self.bump_mtime(node);
         Ok(())
     }
 
@@ -810,7 +913,10 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         self.ensure_creatable(parent, name)?;
         let writer = self.files.edit(None).map_err(io)?;
         let id = self.alloc();
-        self.inodes.insert(id, Inode { mode, body: Body::File(FileBody::Dirty(writer)) });
+        self.inodes.insert(
+            id,
+            Inode::new(mode, Body::File(FileBody::Dirty(writer))),
+        );
         self.link(parent, name, id)?;
         Ok(id)
     }
@@ -823,14 +929,14 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let id = self.alloc();
         self.inodes.insert(
             id,
-            Inode {
+            Inode::new(
                 mode,
-                body: Body::Dir {
+                Body::Dir {
                     children: DirChildren::Open(BTreeMap::new()),
                     lower: None,
                     mode_override: false,
                 },
-            },
+            ),
         );
         self.link(parent, name, id)?;
         Ok(id)
@@ -849,10 +955,10 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let id = self.alloc();
         self.inodes.insert(
             id,
-            Inode {
-                mode: SYMLINK_MODE | 0o777,
-                body: Body::Symlink(Bytes::copy_from_slice(target.as_bytes())),
-            },
+            Inode::new(
+                SYMLINK_MODE | 0o777,
+                Body::Symlink(Bytes::copy_from_slice(target.as_bytes())),
+            ),
         );
         self.link(parent, name, id)?;
         Ok(id)
@@ -912,12 +1018,84 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
         let inode = self.inodes.get_mut(&node).ok_or(VfsError::NotFound)?;
         inode.mode = (inode.mode & TYPE_BITS) | (mode & 0o7777);
+        inode.ctime = EntryTime::from_system_time(SystemTime::now());
         if let Body::Dir { mode_override, .. } = &mut inode.body {
             // A fall-through dir with no upper entries would seal to nothing;
             // force it to emit so the mode lands in the delta.
             *mode_override = true;
         }
         Ok(())
+    }
+
+    // --- setattr (times) -----------------------------------------------------
+
+    /// Apply `utimes(2)` to `node`: set the session `mtime` and/or `atime`
+    /// exactly (a `None` half is left alone — the `UTIME_OMIT` case). Times are
+    /// in-memory only (see the crate docs); `ctime` is stamped with now.
+    ///
+    /// Like [`set_mode`](Self::set_mode), a fall-through node is **copied up**
+    /// first so the times have an overlay home: a file's content moves into the
+    /// CAS, a symlink's target is re-homed, a directory force-emits its own
+    /// entry. The lower is never mutated.
+    pub fn set_times(
+        &mut self,
+        node: InodeId,
+        mtime: Option<SystemTime>,
+        atime: Option<SystemTime>,
+    ) -> VfsResult<()> {
+        if mtime.is_none() && atime.is_none() {
+            return Ok(());
+        }
+        // Copy up a fall-through node first (same shapes as `set_mode`).
+        enum Step {
+            Ready,
+            CopyUpFile,
+            CopyUpSymlink(InodeId),
+            Dir,
+        }
+        let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
+            Body::Tombstone => return Err(VfsError::NotFound),
+            Body::LowerFile(_) => Step::CopyUpFile,
+            Body::LowerSymlink(ld) => Step::CopyUpSymlink(*ld),
+            Body::Dir { .. } => Step::Dir,
+            Body::File(_) | Body::Symlink(_) => Step::Ready,
+        };
+        match step {
+            Step::Ready => {}
+            Step::CopyUpFile => self.make_dirty(node)?,
+            Step::CopyUpSymlink(ld) => {
+                let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
+                let target = lower.readlink(ld)?;
+                if let Some(inode) = self.inodes.get_mut(&node) {
+                    inode.body = Body::Symlink(Bytes::copy_from_slice(target.as_bytes()));
+                }
+            }
+            Step::Dir => self.resolve_dir(node)?,
+        }
+        let inode = self.inodes.get_mut(&node).ok_or(VfsError::NotFound)?;
+        if let Some(m) = mtime {
+            inode.mtime = EntryTime::from_system_time(m);
+        }
+        if let Some(a) = atime {
+            inode.atime = EntryTime::from_system_time(a);
+        }
+        inode.ctime = EntryTime::from_system_time(SystemTime::now());
+        if let Body::Dir { mode_override, .. } = &mut inode.body {
+            // A utimes'd fall-through dir must seal a self-entry too, or the
+            // times die with the session's invisibility in the delta.
+            *mode_override = true;
+        }
+        Ok(())
+    }
+
+    /// Bump `node`'s session `mtime` (and `atime`) to the wall-clock now. The
+    /// write/truncate stamp; reads never call this.
+    fn bump_mtime(&mut self, node: InodeId) {
+        if let Some(inode) = self.inodes.get_mut(&node) {
+            let now = EntryTime::from_system_time(SystemTime::now());
+            inode.mtime = now;
+            inode.atime = now;
+        }
     }
 
     // --- statfs --------------------------------------------------------------
@@ -1014,7 +1192,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             // slot. We free the old inode and install a tombstone in `children`.
             self.inodes.remove(&id);
             let tomb = self.alloc();
-            self.inodes.insert(tomb, Inode { mode: 0, body: Body::Tombstone });
+            self.inodes.insert(tomb, Inode::bare(0, Body::Tombstone));
             self.link(parent, name, tomb)?;
         } else {
             self.unlink_child(parent, name)?;
@@ -1147,12 +1325,17 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         // keeping the moved inode alive.
         if self.name_in_lower(parent, name)? {
             let tomb = self.alloc();
-            self.inodes.insert(tomb, Inode { mode: 0, body: Body::Tombstone });
+            self.inodes.insert(tomb, Inode::bare(0, Body::Tombstone));
             self.link(parent, name, tomb)?;
         } else {
             self.unlink_child(parent, name)?;
         }
 
+        // POSIX: rename is a metadata change — stamp the source's ctime (the
+        // name changed; the content, mtime and atime did not).
+        if let Some(inode) = self.inodes.get_mut(&src) {
+            inode.ctime = EntryTime::from_system_time(SystemTime::now());
+        }
         // Attach at the new location, freeing a leftover whiteout slot if the
         // target map still holds one (created by `remove_child` above, or by
         // an earlier deletion of a lower name).
@@ -1280,6 +1463,8 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                         id: Overlay::Tombstone,
                         mode: 0,
                         size: 0,
+                        mtime: EntryTime::EPOCH,
+                        atime: EntryTime::EPOCH,
                     });
                 }
                 ChildKind::Lower => {

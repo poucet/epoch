@@ -125,8 +125,11 @@ ControlPlaneVfs            .vfs — a FEATURE REGISTRY; ids ≥ CP_BASE (0x8000�
   or chmod-ing a fall-through symlink copies its *target* up (never follows
   the link). The `.vfs/debug/overlay` delta listing marks them `(symlink)`.
 - **`setattr` mode persists** (chmod): the mode lives in the tree entry, is
-  applied on copy-up, and survives checkpoint/remount; atime/mtime are
-  accepted but not persisted (documented gap for `make`-style tooling).
+  applied on copy-up, and survives checkpoint/remount. **atime/mtime persist
+  for the session, in-memory only** (explicit `utimes` exact, writes bump
+  mtime, copy-up carries lower times, reads never touch atime) — never in
+  the CAS, so a timestamp cannot change a content hash; history snapshots
+  stamp every entry with the checkpoint instant (see TASKS.md §3.7).
   **`statfs`** answers with the lower host filesystem's numbers
   (`statvfs(2)` on the lower) so `df` and installers see real capacity.
 - Extended attributes are stubbed (`ENOTSUP`, empty listing); synthesized
@@ -173,7 +176,7 @@ fuse shim ──VfsService/UDS──▶ machine daemon ──ByteBackend+Timelin
 - Evictable / persistent inodes (FUSE-`forget` refcounting, ids stable across
   remount); ditto sub-mount/minted-id cache eviction.
 - Spill staging tier (working set > RAM), xattr *storage* (stubs answer
-  `ENOTSUP`), atime/mtime persistence, drift detection of the lower, control
+  `ENOTSUP`), drift detection of the lower, control
   plane + CLI, non-FUSE adapters. (`.epochignore` routing shipped; live
   reload of its rules did not.)
 

@@ -236,8 +236,11 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         if let Some(mode) = request.mode {
             tree.set_mode(request.inode_id, mode)?;
         }
-        // atime/mtime are accepted but not persisted (documented known gap:
-        // `make`-style mtime reasoning is unreliable inside an overlay mount).
+        // atime/mtime persist for the session: they live on the in-memory
+        // inode (never in the CAS), set exactly as requested.
+        if request.atime.is_some() || request.mtime.is_some() {
+            tree.set_times(request.inode_id, request.mtime, request.atime)?;
+        }
         tree.getattr(request.inode_id)
     }
 
@@ -439,8 +442,9 @@ mod tests {
         assert_eq!(svc2.readlink(link2).unwrap(), OsStr::new("target.txt"));
     }
 
-    /// `setattr` with a mode persists through seal; atime/mtime are accepted
-    /// and ignored.
+    /// `setattr` with a mode persists through seal; atime/mtime persist for
+    /// the session (in-memory only — a rehydrated tree reports the zeroed
+    /// defaults).
     #[test]
     fn setattr_chmod_persists_through_the_service() {
         let backend = MemoryByteBackend::new();
@@ -462,6 +466,69 @@ mod tests {
         let svc2 = CasVfs::from_root(backend, sealed).unwrap();
         let id2 = svc2.lookup(ROOT_INODE_ID, OsStr::new("run.sh")).unwrap().attr.inode_id;
         assert_eq!(svc2.getattr(id2).unwrap().perm, 0o755);
+    }
+
+    /// `utimes` through the service sets atime/mtime exactly (and reports the
+    /// full attr back); the set times hold for the session's lifetime.
+    #[test]
+    fn setattr_utimes_persist_for_the_session() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let svc = CasVfs::in_memory();
+        let id = write_file(&svc, ROOT_INODE_ID, "stamped.txt", b"x");
+        let t = UNIX_EPOCH + Duration::new(1_577_836_800, 0); // 2020-01-01
+
+        let attr = svc
+            .setattr(SetAttrRequest {
+                inode_id: id,
+                mode: None,
+                atime: Some(t),
+                mtime: Some(t),
+            })
+            .unwrap();
+        assert_eq!((attr.atime, attr.mtime), (t, t));
+        // A later getattr still reports the set times (session persistence).
+        let again = svc.getattr(id).unwrap();
+        assert_eq!((again.atime, again.mtime), (t, t));
+        // The returned size was synthesized against the live writer, not lost.
+        assert_eq!(attr.size, 1);
+    }
+
+    /// A write through the service bumps mtime; a read does not touch atime.
+    #[test]
+    fn write_bumps_mtime_read_leaves_atime() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let svc = CasVfs::in_memory();
+        let id = write_file(&svc, ROOT_INODE_ID, "f.txt", b"data");
+        let t0 = UNIX_EPOCH + Duration::new(1_577_836_800, 0);
+        svc.setattr(SetAttrRequest {
+            inode_id: id,
+            mode: None,
+            atime: Some(t0),
+            mtime: Some(t0),
+        })
+        .unwrap();
+
+        let _ = read_all(&svc, id);
+        assert_eq!(svc.getattr(id).unwrap().atime, t0, "a read never touches atime");
+
+        let opened = svc
+            .open(OpenRequest {
+                inode_id: id,
+                mode: OpenMode::ReadWrite,
+                truncate: false,
+                append: false,
+            })
+            .unwrap();
+        svc.write(WriteRequest {
+            inode_id: id,
+            handle: opened.handle,
+            offset: 4,
+            data: b"!",
+        })
+        .unwrap();
+        svc.release(opened.handle).unwrap();
+        let attr = svc.getattr(id).unwrap();
+        assert!(attr.mtime > t0, "the write bumps mtime to now");
     }
 
     /// A lower-less service answers `statfs` with the synthetic shape.

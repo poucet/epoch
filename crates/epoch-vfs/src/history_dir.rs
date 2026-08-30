@@ -158,14 +158,21 @@ where
         Ok(resolved)
     }
 
-    /// The checkpointed root [`TreeId`] of `event`.
+    /// The checkpointed root [`TreeId`] of `event`, registering the event's
+    /// `timestamp_ms` as that snapshot's point-in-time stamp (see
+    /// [`TreeMounts::stamp_snapshot`]): every entry served under the snapshot
+    /// reports `mtime = atime =` the checkpoint instant.
     fn root_of(&self, event: EventId) -> VfsResult<epoch_tree::TreeId> {
-        Ok(self
+        let record = self
             .history
             .event(&event)
             .map_err(history_error)?
-            .ok_or(VfsError::NotFound)?
-            .root)
+            .ok_or(VfsError::NotFound)?;
+        self.mounts.stamp_snapshot(
+            record.root,
+            UNIX_EPOCH + Duration::from_millis(record.timestamp_ms),
+        );
+        Ok(record.root)
     }
 
     /// The root entry of `event`'s snapshot, as seen from `.vfs/history`.
@@ -379,5 +386,79 @@ mod tests {
         assert_eq!(parse_ago("5w-ago"), None, "unknown unit");
         assert_eq!(parse_ago("-ago"), None);
         assert_eq!(parse_ago("12345"), None, "absolute, not relative");
+    }
+
+    /// Two checkpoints at different times stamp the *same unchanged file* with
+    /// its own snapshot's instant: `history/<t1>/f` reports t1, `history/<t2>/f`
+    /// reports t2. (The file is identical across both roots — only the sibling
+    /// changed — which is exactly what makes content-addressing compatible
+    /// with point-in-time stamps.)
+    #[test]
+    fn snapshots_stamp_entries_with_the_checkpoint_instant() {
+        use epoch_cas::MemoryByteBackend;
+        use epoch_history::History;
+        use epoch_timeline::MemoryTimelineStore;
+        use epoch_vfs_api::{ROOT_INODE_ID, VfsService};
+
+        use crate::cas_obj_dir::CasObjectDir;
+        use crate::cas_vfs::CasVfs;
+        use crate::control_plane::{CP_BASE, ControlPlaneVfs};
+        use crate::feature::FEATURE_RANGE;
+        use crate::submount::TreeMounts;
+
+        let tier = epoch_cas::TieredByteBackend::new(
+            MemoryByteBackend::new(),
+            MemoryByteBackend::new(),
+        );
+        let history = Arc::new(History::new(
+            tier.clone(),
+            Arc::new(MemoryTimelineStore::new()),
+            "main",
+        ));
+        let live = CasVfs::new(tier.clone());
+
+        // t1: create `unchanged`; checkpoint at t1.
+        live.create(epoch_vfs_api::CreateRequest::file(ROOT_INODE_ID, "unchanged", 0o644))
+            .unwrap();
+        let root1 = live.seal().unwrap();
+        history.commit_root_at(root1, 1_000_000, None).unwrap();
+
+        // t2: add a sibling (a *new* root hash; `unchanged` is untouched).
+        live.create(epoch_vfs_api::CreateRequest::file(ROOT_INODE_ID, "sibling", 0o644))
+            .unwrap();
+        let root2 = live.seal().unwrap();
+        assert_ne!(root1, root2, "a sibling change moves the root");
+        history.commit_root_at(root2, 2_000_000, None).unwrap();
+
+        // The production wiring: the cas portal owns the shared TreeMounts,
+        // the history feature resolves into it.
+        let tree_mounts: Arc<std::sync::OnceLock<Arc<TreeMounts>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let mounts_out = Arc::clone(&tree_mounts);
+        let cp = ControlPlaneVfs::new(Arc::new(live))
+            .with_feature("cas", move |slot| {
+                let portal = Arc::new(CasObjectDir::new(slot, tier.clone(), None));
+                let _ = mounts_out.set(portal.tree_mounts());
+                portal
+            })
+            .with_feature("history", move |slot| {
+                let mounts = tree_mounts.get().expect("cas registers first").clone();
+                Arc::new(HistoryDir::new(history, slot, mounts))
+            });
+        let history_id = InodeId(CP_BASE + 2 * FEATURE_RANGE);
+
+        // The same file, read through each checkpoint's snapshot.
+        let t1_entry = cp
+            .lookup(history_id, OsStr::new("1000000"))
+            .and_then(|e| cp.lookup(e.attr.inode_id, OsStr::new("unchanged")))
+            .unwrap();
+        let t2_entry = cp
+            .lookup(history_id, OsStr::new("2000000"))
+            .and_then(|e| cp.lookup(e.attr.inode_id, OsStr::new("unchanged")))
+            .unwrap();
+
+        assert_eq!(t1_entry.attr.mtime, UNIX_EPOCH + Duration::from_millis(1_000_000));
+        assert_eq!(t2_entry.attr.mtime, UNIX_EPOCH + Duration::from_millis(2_000_000));
+        assert_eq!(t1_entry.attr.atime, t1_entry.attr.mtime);
     }
 }

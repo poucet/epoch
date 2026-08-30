@@ -222,7 +222,7 @@ mod overlay {
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
-    use std::time::UNIX_EPOCH;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use epoch_cas::MemoryByteBackend;
     use epoch_vfs_api::{
@@ -245,11 +245,17 @@ mod overlay {
 
     struct Lower {
         nodes: HashMap<InodeId, Node>,
+        /// Per-node (mtime, atime) reported by `getattr` — distinct, fixed
+        /// values so tests can tell the lower's times apart from the overlay's
+        /// (created/bumped) ones. Defaults to the epoch.
+        times: HashMap<InodeId, (SystemTime, SystemTime)>,
     }
 
     /// Fluent builder for a [`Lower`] tree; every inserted node gets a fresh id.
     struct Build {
         nodes: HashMap<InodeId, Node>,
+        /// Per-node (mtime, atime) overrides, installed via [`file_timed`].
+        times: HashMap<InodeId, (SystemTime, SystemTime)>,
         next: u64,
     }
 
@@ -259,6 +265,7 @@ mod overlay {
             nodes.insert(ROOT_INODE_ID, Node::Dir(BTreeMap::new()));
             Self {
                 nodes,
+                times: HashMap::new(),
                 next: ROOT_INODE_ID.0 + 1,
             }
         }
@@ -277,6 +284,19 @@ mod overlay {
             self.insert(parent, name, Node::File(content.to_vec()))
         }
 
+        /// A file whose `getattr` reports the given (mtime, atime).
+        fn file_timed(
+            &mut self,
+            parent: InodeId,
+            name: &str,
+            content: &[u8],
+            times: (SystemTime, SystemTime),
+        ) -> InodeId {
+            let id = self.file(parent, name, content);
+            self.times.insert(id, times);
+            id
+        }
+
         fn link(&mut self, parent: InodeId, name: &str, target: &str) -> InodeId {
             self.insert(parent, name, Node::Link(OsString::from(target)))
         }
@@ -286,7 +306,10 @@ mod overlay {
         }
 
         fn build(self) -> Arc<Lower> {
-            Arc::new(Lower { nodes: self.nodes })
+            Arc::new(Lower {
+                nodes: self.nodes,
+                times: self.times,
+            })
         }
     }
 
@@ -304,11 +327,15 @@ mod overlay {
 
     impl Lower {
         fn attr(&self, id: InodeId) -> VfsResult<NodeAttr> {
-            match self.nodes.get(&id).ok_or(VfsError::NotFound)? {
-                Node::Dir(_) => Ok(NodeAttr::directory(id, UNIX_EPOCH)),
-                Node::File(b) => Ok(NodeAttr::regular_file(id, b.len() as u64, UNIX_EPOCH)),
-                Node::Link(t) => Ok(NodeAttr::symlink(id, t.len() as u64, UNIX_EPOCH)),
-            }
+            let (mtime, atime) = self.times.get(&id).copied().unwrap_or((UNIX_EPOCH, UNIX_EPOCH));
+            let mut attr = match self.nodes.get(&id).ok_or(VfsError::NotFound)? {
+                Node::Dir(_) => NodeAttr::directory(id, UNIX_EPOCH),
+                Node::File(b) => NodeAttr::regular_file(id, b.len() as u64, UNIX_EPOCH),
+                Node::Link(t) => NodeAttr::symlink(id, t.len() as u64, UNIX_EPOCH),
+            };
+            attr.mtime = mtime;
+            attr.atime = atime;
+            Ok(attr)
         }
     }
 
@@ -1000,6 +1027,157 @@ mod overlay {
         let stats = standalone.statfs().unwrap();
         assert_eq!(stats, StatFs::synthetic());
         assert!(stats.blocks_free > 0);
+    }
+
+    // --- session timestamps (in-memory only; see the crate docs) ------------
+
+    /// A fixed instant distinct from both the epoch and "now".
+    fn t2020() -> SystemTime {
+        UNIX_EPOCH + Duration::new(1_577_836_800, 0) // 2020-01-01T00:00:00Z
+    }
+
+    /// `setattr` times (`utimes`) persist for the session, independent per
+    /// field (the `UTIME_OMIT` half is untouched), and `ctime` is stamped.
+    #[test]
+    fn setattr_times_persist_independently() {
+        let mut wt = Wt::new(MemoryByteBackend::new());
+        let f = wt.create(ROOT_INODE_ID, OsStr::new("f"), 0o644).unwrap();
+
+        let set_mtime = t2020();
+        wt.set_times(f, Some(set_mtime), None).unwrap();
+        let attr = wt.getattr(f).unwrap();
+        assert_eq!(attr.mtime, set_mtime);
+        assert_ne!(attr.atime, UNIX_EPOCH, "create stamped atime; mtime-only touch leaves it");
+        assert!(attr.ctime > UNIX_EPOCH, "utimes stamps ctime");
+
+        let set_atime = UNIX_EPOCH + Duration::new(1_600_000_000, 0);
+        wt.set_times(f, None, Some(set_atime)).unwrap();
+        let attr = wt.getattr(f).unwrap();
+        assert_eq!(attr.mtime, set_mtime, "atime-only touch leaves mtime");
+        assert_eq!(attr.atime, set_atime);
+    }
+
+    /// A write bumps mtime (and atime) to now; an explicit `setattr` time is
+    /// exact until the next write.
+    #[test]
+    fn write_bumps_mtime_and_overrides_an_explicit_set() {
+        let mut wt = Wt::new(MemoryByteBackend::new());
+        let f = wt.create(ROOT_INODE_ID, OsStr::new("f"), 0o644).unwrap();
+        wt.set_times(f, Some(t2020()), Some(t2020())).unwrap();
+        assert_eq!(wt.getattr(f).unwrap().mtime, t2020());
+
+        wt.write_at(f, 0, b"data").unwrap();
+        let attr = wt.getattr(f).unwrap();
+        assert!(attr.mtime > t2020(), "the write re-stamps mtime with now");
+    }
+
+    /// Reads never update atime: the mount is effectively `noatime` for
+    /// implicit updates, so a read after an explicit `utimes` leaves the set
+    /// value alone.
+    #[test]
+    fn reads_do_not_touch_atime() {
+        let mut wt = Wt::new(MemoryByteBackend::new());
+        let file = wt.create(ROOT_INODE_ID, OsStr::new("f"), 0o100644).unwrap();
+        wt.write_at(file, 0, b"data").unwrap();
+        wt.set_times(file, None, Some(t2020())).unwrap();
+        let before = wt.getattr(file).unwrap().atime;
+        let _ = wt.read_at(file, 0, 4).unwrap();
+        let _ = wt.lookup(ROOT_INODE_ID, OsStr::new("f")).unwrap();
+        assert_eq!(wt.getattr(file).unwrap().atime, before);
+        assert_eq!(before, t2020());
+    }
+
+    /// Copy-up on first write carries the lower file's times; the write itself
+    /// then bumps mtime. Before any write the fall-through `getattr` reports
+    /// the lower's own times.
+    #[test]
+    fn copy_up_preserves_lower_times_until_written() {
+        let (lower_mtime, lower_atime) = (t2020(), t2020() + Duration::new(5, 0));
+        let mut b = Build::new();
+        b.file_timed(ROOT_INODE_ID, "lower.txt", b"lower content", (lower_mtime, lower_atime));
+        let lower = b.build();
+        let mut wt = Wt::overlay(MemoryByteBackend::new(), lower);
+
+        let id = wt.lookup(ROOT_INODE_ID, OsStr::new("lower.txt")).unwrap();
+        let attr = wt.getattr(id).unwrap();
+        assert_eq!((attr.mtime, attr.atime), (lower_mtime, lower_atime), "fall-through reports lower times");
+
+        wt.write_at(id, 0, b"X").unwrap();
+        let attr = wt.getattr(id).unwrap();
+        assert_eq!(attr.atime, attr.mtime, "the write bumps both to now");
+        assert!(attr.mtime > lower_mtime);
+        assert_eq!(wt.read_at(id, 1, 13).unwrap(), b"ower content");
+    }
+
+    /// `utimes` on a fall-through file copies it up (times get an overlay
+    /// home); the content follows and the lower is untouched.
+    #[test]
+    fn utimes_copies_up_a_fall_through_file() {
+        let mut b = Build::new();
+        b.file(ROOT_INODE_ID, "lower.txt", b"lower content");
+        let lower = b.build();
+        let mut wt = Wt::overlay(MemoryByteBackend::new(), lower);
+
+        let id = wt.lookup(ROOT_INODE_ID, OsStr::new("lower.txt")).unwrap();
+        wt.set_times(id, Some(t2020()), Some(t2020())).unwrap();
+        let attr = wt.getattr(id).unwrap();
+        assert_eq!((attr.mtime, attr.atime), (t2020(), t2020()));
+        // The node is now upper-owned: content sealed into the CAS.
+        assert_eq!(wt.read_at(id, 0, 13).unwrap(), b"lower content");
+        assert!(
+            wt.overlay_entries().iter().any(|e| e.path == "/lower.txt"),
+            "the utimes'd file is overlay delta"
+        );
+    }
+
+    /// A symlink's own times are settable (lchmod-style) and live for the
+    /// session; a rehydrate from the time-free CAS tree reports the zeroed
+    /// defaults (documented consequence of the in-memory design).
+    #[test]
+    fn symlink_times_are_settable_and_session_persistent() {
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::new(backend.clone());
+        let real = wt.create(ROOT_INODE_ID, OsStr::new("real"), 0o100644).unwrap();
+        wt.write_at(real, 0, b"x").unwrap();
+        let link = wt.symlink(ROOT_INODE_ID, OsStr::new("link"), OsStr::new("real")).unwrap();
+        wt.set_times(link, Some(t2020()), Some(t2020())).unwrap();
+        assert_eq!(wt.getattr(link).unwrap().mtime, t2020());
+
+        let root = wt.seal().unwrap();
+        let mut wt2 = Wt::from_root(backend.clone(), root).unwrap();
+        let link2 = wt2.lookup(ROOT_INODE_ID, OsStr::new("link")).unwrap();
+        // Rehydrated from the time-free CAS tree: zeroed defaults (documented).
+        assert_eq!(wt2.getattr(link2).unwrap().mtime, UNIX_EPOCH);
+    }
+
+    /// THE dedup invariant: times are not content. Two files with identical
+    /// bytes and *different* session mtimes seal to the same blob id and the
+    /// same root tree id; a time-only change between seals changes nothing.
+    #[test]
+    fn times_never_change_content_hashes() {
+        let backend = MemoryByteBackend::new();
+        let mut wt = Wt::new(backend.clone());
+        let a = wt.create(ROOT_INODE_ID, OsStr::new("a"), 0o100644).unwrap();
+        wt.write_at(a, 0, b"same bytes").unwrap();
+        let b = wt.create(ROOT_INODE_ID, OsStr::new("b"), 0o100644).unwrap();
+        wt.write_at(b, 0, b"same bytes").unwrap();
+        wt.set_times(a, Some(t2020()), Some(t2020())).unwrap();
+        wt.set_times(b, Some(UNIX_EPOCH + Duration::new(1_900_000_000, 0)), None).unwrap();
+
+        let root1 = wt.seal().unwrap();
+        // Seal again after a *time-only* change: identical root, no new event.
+        wt.set_times(a, Some(t2020() + Duration::new(999, 0)), None).unwrap();
+        let root2 = wt.seal().unwrap();
+        assert_eq!(root1, root2, "a time-only change must not alter the tree hash");
+
+        // And the two same-bytes files share one blob in the CAS.
+        let tree: epoch_tree::Tree<epoch_tree::Overlay<epoch_tree::EntryId<epoch_file_cas::BlobId>>> =
+            epoch_cas::SyncCAS::get(&epoch_tree::TreeStore::new(backend), &root1)
+                .unwrap()
+                .unwrap();
+        let blob_a = tree.get(b"a").unwrap().id;
+        let blob_b = tree.get(b"b").unwrap().id;
+        assert_eq!(blob_a, blob_b, "identical bytes share one blob id regardless of mtime");
     }
 }
 

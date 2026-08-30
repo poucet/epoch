@@ -59,7 +59,7 @@ use core::marker::PhantomData;
 
 use epoch_cas::{Bytes, CASError, CASHash, Codec, object_kind};
 
-use crate::entry::TreeEntry;
+use crate::entry::{EntryTime, TreeEntry};
 use crate::id::{Link, LinkKind, TreeId};
 use crate::tree::Tree;
 
@@ -207,6 +207,11 @@ impl<L: Link + 'static> Codec<Tree<L>> for TreeCodec<L> {
                 id,
                 mode,
                 size,
+                // The codec is time-free by design: timestamps live in the
+                // runtime layer (in-memory on the working tree), never in
+                // content-addressed storage, so a time never changes a hash.
+                mtime: EntryTime::EPOCH,
+                atime: EntryTime::EPOCH,
             });
         }
 

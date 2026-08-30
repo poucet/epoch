@@ -33,6 +33,8 @@
 //! [`Overlay::Tombstone`] and its [`mode`](TreeEntry::mode) and
 //! [`size`](TreeEntry::size) are `0`.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use epoch_cas::Bytes;
 
 use crate::id::{Link, Overlay, TreeId};
@@ -44,13 +46,92 @@ use crate::id::{Link, Overlay, TreeId};
 /// modelling symlinks as moded blobs rather than a separate entry kind.
 pub const SYMLINK_MODE: u32 = 0o120000;
 
-/// One named child of a tree: a filename plus the child's link, mode and size.
+/// Nanoseconds per second; the canonical upper bound of [`EntryTime::nanos`].
+const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+/// One persisted timestamp: seconds since the unix epoch plus a nanosecond
+/// adjustment, in the normalized timespec form (`nanos` in `0..1e9`; negative
+/// `secs` carries the pre-epoch range).
+///
+/// This is the tree format's time representation (format v2 persists `mtime`
+/// and `atime` per entry). It maps losslessly to and from
+/// [`SystemTime`](std::time::SystemTime); the normalized form is what keeps the
+/// encoding canonical (one byte shape per instant), which content addressing
+/// requires. The default is [`EntryTime::EPOCH`] — "no time recorded".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryTime {
+    /// Whole seconds relative to the unix epoch (negative = before 1970).
+    pub secs: i64,
+    /// Nanosecond adjustment, always `< 1_000_000_000` (checked on decode).
+    pub nanos: u32,
+}
+
+impl EntryTime {
+    /// The unix epoch — the default for entries built without a known time.
+    pub const EPOCH: EntryTime = EntryTime { secs: 0, nanos: 0 };
+
+    /// Whether the value is in canonical (normalized) form.
+    pub fn is_canonical(&self) -> bool {
+        self.nanos < NANOS_PER_SEC
+    }
+
+    /// Convert a [`SystemTime`] to the normalized `(secs, nanos)` form,
+    /// preserving pre-epoch instants.
+    pub fn from_system_time(t: SystemTime) -> Self {
+        match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => EntryTime {
+                secs: d.as_secs() as i64,
+                nanos: d.subsec_nanos(),
+            },
+            Err(before) => {
+                let d = before.duration();
+                if d.subsec_nanos() == 0 {
+                    EntryTime {
+                        secs: -(d.as_secs() as i64),
+                        nanos: 0,
+                    }
+                } else {
+                    // e.g. 1.75 s before the epoch = -2 s + 250 ms.
+                    EntryTime {
+                        secs: -(d.as_secs() as i64) - 1,
+                        nanos: NANOS_PER_SEC - d.subsec_nanos(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convert back to a [`SystemTime`]. A non-canonical `nanos` field
+    /// (≥ 1 s) is clamped rather than overflowed; such values never come from
+    /// the validating codec.
+    pub fn to_system_time(self) -> SystemTime {
+        if self.secs >= 0 {
+            UNIX_EPOCH + Duration::new(self.secs as u64, self.nanos.min(NANOS_PER_SEC - 1))
+        } else {
+            // magnitude = |secs| - nanos/1e9 (see from_system_time).
+            let nanos = self.nanos.min(NANOS_PER_SEC - 1);
+            let (mag_secs, mag_nanos) = if nanos == 0 {
+                ((-(self.secs)) as u64, 0)
+            } else {
+                ((-(self.secs + 1)) as u64, NANOS_PER_SEC - nanos)
+            };
+            UNIX_EPOCH - Duration::new(mag_secs, mag_nanos)
+        }
+    }
+}
+
+/// One named child of a tree: a filename plus the child's link, mode, size and
+/// persisted timestamps.
 ///
 /// `name` is raw filename bytes (not necessarily UTF-8). `mode` carries the
 /// unix permission/type bits (e.g. `0o100644` for a regular file, `0o040000`
 /// for a directory, [`SYMLINK_MODE`] for a symlink). `size` is the logical
 /// content size in bytes — for directories (and tombstones) it is conventionally
-/// `0`.
+/// `0`. `mtime`/`atime` are the persisted modification/access times (tree
+/// format v2); they default to [`EntryTime::EPOCH`] ("no time recorded") and
+/// are set explicitly via [`with_times`](TreeEntry::with_times). A tombstone
+/// addresses no object: its `id` is [`Overlay::Tombstone`] and its other fields
+/// are all zeroed (times are not encoded for tombstones).
 ///
 /// Generic over the link type `L` (see the [module docs](self)).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +145,10 @@ pub struct TreeEntry<L> {
     /// Logical content size in bytes (`0` by convention for directories and
     /// tombstones).
     pub size: u64,
+    /// Persisted modification time (format v2); `0` for a tombstone.
+    pub mtime: EntryTime,
+    /// Persisted access time (format v2); `0` for a tombstone.
+    pub atime: EntryTime,
 }
 
 impl<L: Link> TreeEntry<L> {
@@ -78,6 +163,8 @@ impl<L: Link> TreeEntry<L> {
             id: L::from_blob(id),
             mode,
             size,
+            mtime: EntryTime::EPOCH,
+            atime: EntryTime::EPOCH,
         }
     }
 
@@ -89,7 +176,25 @@ impl<L: Link> TreeEntry<L> {
             id: L::from_tree(id),
             mode,
             size: 0,
+            mtime: EntryTime::EPOCH,
+            atime: EntryTime::EPOCH,
         }
+    }
+
+    /// Set the persisted timestamps (builder form): the entry's modification
+    /// and access times, sealed into the tree object.
+    pub fn with_times(mut self, mtime: EntryTime, atime: EntryTime) -> TreeEntry<L> {
+        self.mtime = mtime;
+        self.atime = atime;
+        self
+    }
+
+    /// Set the persisted timestamps from [`SystemTime`]s (builder form).
+    pub fn with_system_times(self, mtime: SystemTime, atime: SystemTime) -> TreeEntry<L> {
+        self.with_times(
+            EntryTime::from_system_time(mtime),
+            EntryTime::from_system_time(atime),
+        )
     }
 }
 
@@ -106,6 +211,8 @@ impl<E> TreeEntry<Overlay<E>> {
             id: Overlay::Tombstone,
             mode: 0,
             size: 0,
+            mtime: EntryTime::EPOCH,
+            atime: EntryTime::EPOCH,
         }
     }
 }
@@ -179,5 +286,48 @@ mod tests {
         assert_eq!(e.mode, SYMLINK_MODE);
         assert!(e.id.is_blob());
         assert_eq!(e.size, target.len() as u64);
+    }
+
+    #[test]
+    fn entry_time_default_is_the_epoch() {
+        let e = TreeEntry::<Complete>::file(Bytes::from_static(b"f"), sample_hash(1), 0o100644, 1);
+        assert_eq!(e.mtime, EntryTime::EPOCH);
+        assert_eq!(e.atime, EntryTime::EPOCH);
+        assert_eq!(EntryTime::default(), EntryTime::EPOCH);
+    }
+
+    #[test]
+    fn entry_time_system_time_roundtrips() {
+        let cases = [
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789),
+            SystemTime::now(),
+            // Pre-epoch instants: exact second and sub-second.
+            SystemTime::UNIX_EPOCH - Duration::new(1, 0),
+            SystemTime::UNIX_EPOCH - Duration::new(1, 750_000_000),
+            SystemTime::UNIX_EPOCH - Duration::new(0, 1),
+        ];
+        for t in cases {
+            let et = EntryTime::from_system_time(t);
+            assert!(et.is_canonical(), "{et:?} not canonical");
+            assert_eq!(et.to_system_time(), t, "round-trip failed for {t:?}");
+        }
+    }
+
+    #[test]
+    fn with_times_sets_both_fields() {
+        let m = EntryTime { secs: 100, nanos: 5 };
+        let a = EntryTime { secs: 200, nanos: 7 };
+        let e = TreeEntry::<Complete>::file(Bytes::from_static(b"f"), sample_hash(1), 0o100644, 1)
+            .with_times(m, a);
+        assert_eq!((e.mtime, e.atime), (m, a));
+        let t0 = SystemTime::UNIX_EPOCH + Duration::new(42, 42);
+        let e2 = TreeEntry::<Complete>::dir(
+            Bytes::from_static(b"d"),
+            TreeId::from_cas_hash(sample_hash(2)),
+            0o040755,
+        )
+        .with_system_times(t0, t0);
+        assert_eq!(e2.mtime.to_system_time(), t0);
     }
 }

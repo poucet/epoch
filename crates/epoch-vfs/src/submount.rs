@@ -32,6 +32,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::SystemTime,
 };
 
 use epoch_tree::TreeId;
@@ -40,11 +41,20 @@ use epoch_vfs_api::{
     ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
 };
 
+/// The per-key snapshot-stamp lookup (see [`SubMounts::stamp_of`]).
+type StampOf<K> = Arc<dyn Fn(&K) -> Option<SystemTime> + Send + Sync>;
+
 /// The keyed sub-mount table. See the [module docs](self).
 pub(crate) struct SubMounts<K> {
     /// The owning feature's id/handle allocator (already slice-based).
     next_id: Arc<AtomicU64>,
     state: RwLock<SubState<K>>,
+    /// Optional per-key snapshot stamp, consulted by [`remap_attr`](Self::remap_attr):
+    /// a tree sub-mount opened as a point-in-time snapshot (a `.vfs/history`
+    /// checkpoint) stamps every entry with the snapshot's instant. `None` for
+    /// non-tree sub-mounts and unstamped trees (the `.vfs/cas` portal reached
+    /// by bare hash), whose nodes report the rehydrated defaults.
+    stamp_of: Option<StampOf<K>>,
 }
 
 struct SubState<K> {
@@ -72,7 +82,14 @@ where
                 from_local: HashMap::new(),
                 handles: HashMap::new(),
             }),
+            stamp_of: None,
         }
+    }
+
+    /// Install the per-key snapshot-stamp lookup (tree-browsing features only).
+    pub fn with_stamps(mut self, stamp_of: StampOf<K>) -> SubMounts<K> {
+        self.stamp_of = Some(stamp_of);
+        self
     }
 
     fn read_state(&self) -> VfsResult<std::sync::RwLockReadGuard<'_, SubState<K>>> {
@@ -133,10 +150,16 @@ where
     }
 
     /// Rewrite a sub-mount-local attr into the feature's id space, stripping
-    /// write permission bits (sub-mounts are immutable views).
+    /// write permission bits (sub-mounts are immutable views). A sub-mount
+    /// with a registered snapshot stamp reports it as every entry's
+    /// `mtime`/`atime` (see the field's doc comment).
     pub fn remap_attr(&self, key: K, mut attr: NodeAttr) -> VfsResult<NodeAttr> {
         attr.inode_id = self.synthetic_id(key, attr.inode_id)?;
         attr.perm &= 0o555;
+        if let Some(stamp) = self.stamp_of.as_ref().and_then(|f| f(&key)) {
+            attr.mtime = stamp;
+            attr.atime = stamp;
+        }
         Ok(attr)
     }
 
@@ -231,6 +254,8 @@ pub struct TreeMounts {
     /// Builds the filesystem for a root (captures backend + optional lower).
     build: Box<dyn Fn(TreeId) -> VfsResult<Arc<dyn VfsService>> + Send + Sync>,
     subs: SubMounts<TreeId>,
+    /// Point-in-time stamps per root (see [`stamp_snapshot`](Self::stamp_snapshot)).
+    stamps: Arc<RwLock<HashMap<TreeId, SystemTime>>>,
 }
 
 impl TreeMounts {
@@ -239,9 +264,27 @@ impl TreeMounts {
         next_id: Arc<AtomicU64>,
         build: impl Fn(TreeId) -> VfsResult<Arc<dyn VfsService>> + Send + Sync + 'static,
     ) -> TreeMounts {
+        let stamps: Arc<RwLock<HashMap<TreeId, SystemTime>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let lookup = Arc::clone(&stamps);
         TreeMounts {
             build: Box::new(build),
-            subs: SubMounts::new(next_id),
+            subs: SubMounts::new(next_id).with_stamps(Arc::new(move |root: &TreeId| {
+                lookup.read().ok()?.get(root).copied()
+            })),
+            stamps,
+        }
+    }
+
+    /// Record that `root` was opened as the snapshot of a checkpoint at
+    /// `stamp` (the event's `timestamp_ms`): every attr served from the
+    /// sub-mount reports `mtime = atime = stamp`. The first registration wins
+    /// (a root's stamp is its first-known snapshot instant; a second event
+    /// with the same root stamps the same content at its own instant — either
+    /// is a true point-in-time).
+    pub(crate) fn stamp_snapshot(&self, root: TreeId, stamp: SystemTime) {
+        if let Ok(mut stamps) = self.stamps.write() {
+            stamps.entry(root).or_insert(stamp);
         }
     }
 

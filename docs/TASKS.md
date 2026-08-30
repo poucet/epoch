@@ -74,10 +74,46 @@ reads AND writes bypass the overlay and are never checkpointed.
 4. **GC by retention** (`epoch-gc`) — mark from heads (+ live volatile roots),
    sweep unreachable objects/events; cleans checkpoint crash orphans.
 5. **VfsService gaps** — xattr *storage* (currently `ENOTSUP` stubs);
-   seal-on-close in `release`; atime/mtime persistence (`setattr` accepts
-   them but does not persist them — `make`-style mtime reasoning inside an
-   overlay mount is a known gap). (`symlink`/`readlink`, `setattr` **mode**
-   persistence, and `statfs` landed — see `docs/ops/CHANGELOG.md`.)
+   seal-on-close in `release`. (`symlink`/`readlink`, `setattr` **mode**
+   persistence, `statfs`, and atime/mtime semantics landed — see
+   `docs/ops/CHANGELOG.md`.)
+
+### 3.6 VfsService semantics survey (per EPOCH-FIXES §1.6)
+
+Full operation surface, what landed, and what is deliberately refused.
+Verdicts are from `docs/design/EPOCH-FIXES.md` §1.2/§1.5/§1.6.
+
+| Semantic | Status | Verdict |
+|---|---|---|
+| `symlink` / `readlink` | ✅ landed (overlay objects; `SYMLINK_MODE` blob entries; resolve inside history snapshots and the `.vfs/cas` portal) | P0 — closed (§1.2) |
+| `setattr` **mode** persistence | ✅ landed (persisted in tree entries; survives seal/remount) | P1 — closed (§1.5) |
+| `statfs` | ✅ landed (lower's real `statvfs` numbers) | P3 — closed (§1.6) |
+| atime/mtime | ✅ landed **in-memory, session-scoped**: explicit `setattr` exact, writes bump mtime, copy-up carries lower times, reads never touch atime (`noatime`-for-reads). Never in CAS — dedup is structural. History snapshots stamp every entry with the checkpoint instant. Resets on remount (documented). | P1 — closed (§1.5) |
+| xattr storage | `ENOTSUP` stubs (silently degrading is the right interim posture) | P2 — real storage only when a signing toolchain must run in-mount (§1.6) |
+| `link(2)` (hardlink) | no op — adapter answers `EPERM` | P3 — accept `EPERM`; document (§1.6) |
+| flock / POSIX locks | no handler; kernel emulates | P3 — document cross-path incoherence (locks in a mount are not coherent with locks on the host path for the same file) (§1.6) |
+| mmap coherence | unmeasured; no `writeback`/`direct_io` mount opts | P3 — the bench suite measures it; no implementation demanded (§1.6, §2.4) |
+| fallocate / punch-hole (sparse) | no op | P3 — acceptable; chunked CAS represents holes-as-absence at agent sizes (§1.6) |
+| seal-on-close in `release` | not yet (writers seal at checkpoint time) | roadmap §3.5 |
+
+Refused / never (per EPOCH-FIXES §3.3): **read-deny of host paths outside the
+mountpoint** — a mount can only see paths that traverse it, so no VFS-layer
+decorator can deny `~/Documents`; that is permanently the syscall layer's job.
+
+### 3.7 Timestamp semantics (the three-layer model)
+
+Where a time comes from, per view — the full story after the atime/mtime work:
+
+| View | mtime/atime source | Notes |
+|---|---|---|
+| **live mount** | the in-memory inode | explicit `utimes`/`FATTR_MTIME` sets it exactly; a write bumps it to now; a fall-through file reports the lower's real stat until copied up (and copy-up carries those times). Reads never update atime. |
+| **history snapshot** (`.vfs/history/*`, `.vfs/cas/<tree>`) | the snapshot's checkpoint event `timestamp_ms` | every entry stamped with the checkpoint instant — a point-in-time view has one honest time. Applied in `SubMounts::remap_attr`, not stored. |
+| **CAS and redb** | nothing — time-free, always | identical content ⇒ identical blob/tree ids regardless of mtime; a time-only change between seals yields the *same* root hash. |
+
+Consequences (accepted, documented): times do **not** survive unmount →
+remount (a remounted overlay reports the epoch until re-stamped), and
+`make`-style freshness works within a mount session but does not resume
+across one (a build does not span remounts).
 
 ### 3.6 VfsService semantics survey (per EPOCH-FIXES §1.6)
 

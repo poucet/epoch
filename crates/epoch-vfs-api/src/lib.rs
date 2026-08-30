@@ -164,10 +164,10 @@ impl DirEntry {
 /// [`VfsService::truncate`], because kernels deliver `O_TRUNC`/`truncate(2)`
 /// as a size-only setattr and the trait already routes those. `mode` is the
 /// chmod half: persisted (in the tree entry, so it survives checkpoint and
-/// remount). `atime`/`mtime` are accepted for wire compatibility (`touch`,
-/// `cp -p`, editors) but are **best-effort and not persisted** — a
-/// `make`-style mtime comparison inside an overlay mount is a documented
-/// known gap.
+/// remount). `atime`/`mtime` are persisted **for the mount session only** —
+/// they live on the in-memory inode, never in content-addressed storage, so a
+/// timestamp can never change a content hash (see `epoch-worktree`'s crate
+/// docs for the invariant and the remount/history consequences).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetAttrRequest {
     /// The node to modify.
@@ -175,9 +175,10 @@ pub struct SetAttrRequest {
     /// New permission bits (`chmod`); full unix mode — only the low 12 bits
     /// (`0o7777`) are applied.
     pub mode: Option<u32>,
-    /// New atime (accepted, not persisted).
+    /// New atime (explicit set only; reads never update it — the mount is
+    /// effectively `noatime` for implicit updates).
     pub atime: Option<SystemTime>,
-    /// New mtime (accepted, not persisted).
+    /// New mtime (explicit set; writes also bump it).
     pub mtime: Option<SystemTime>,
 }
 
@@ -270,6 +271,58 @@ impl StatFs {
             name_max: 255,
         }
     }
+}
+
+/// Set a host file's atime/mtime via `utimensat(2)` (`UTIME_OMIT` for a
+/// `None` half). Symlink times are set on the link itself
+/// (`AT_SYMLINK_NOFOLLOW`).
+///
+/// Lives here (not in `epoch-vfs`) for the same reason as
+/// [`StatFs::of_path`]: `epoch-vfs` is `forbid(unsafe_code)`.
+#[cfg(unix)]
+pub fn utimes_path(
+    path: &std::path::Path,
+    atime: Option<SystemTime>,
+    mtime: Option<SystemTime>,
+) -> VfsResult<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    fn to_timespec(t: Option<SystemTime>) -> libc::timespec {
+        match t {
+            None => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            Some(t) => match t.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(d) => libc::timespec {
+                    tv_sec: d.as_secs() as libc::time_t,
+                    tv_nsec: d.subsec_nanos() as _,
+                },
+                Err(before) => {
+                    // Normalize a pre-epoch instant to timespec form.
+                    let d = before.duration();
+                    libc::timespec {
+                        tv_sec: -(d.as_secs() as libc::time_t) - 1,
+                        tv_nsec: (1_000_000_000u32 - d.subsec_nanos()) as _,
+                    }
+                }
+            },
+        }
+    }
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        VfsError::InvalidInput(format!("path contains an interior NUL: {path:?}"))
+    })?;
+    let times = [to_timespec(atime), to_timespec(mtime)];
+    // SAFETY: `c_path` is a valid NUL-terminated CString and `times` points at
+    // two valid timespecs; both outlive the call.
+    let rc = unsafe {
+        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if rc != 0 {
+        return Err(VfsError::Io(std::io::Error::last_os_error().to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
