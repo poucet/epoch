@@ -19,6 +19,11 @@ EPOCH_PROBE=1 ./mount-mac.sh         # legacy read-only probe (no CAS/timeline; 
 
 Knobs: `EPOCH_HEAD` (timeline head, default `main`), `EPOCH_HARD_FSYNC=1`, `EPOCH_MOUNT`.
 
+Store-side (no mount needed; reads `<state-dir>/epoch.redb` directly — unmount
+or copy the state dir first, redb is single-writer): `epoch diff|export|audit
+<state-dir> [--head <name>]` — the landing verbs and audit log. See
+`docs/reference/EXPORT-AUDIT.md`.
+
 Inside the mount, `.vfs/` is the control plane (a registry of pluggable features):
 
 | Path | What |
@@ -103,6 +108,14 @@ decorator can deny `~/Documents`; that is permanently the syscall layer's job.
 - Spill staging tier for working sets larger than RAM.
 - `.epochignore` live reload (rules load once at mount).
 - Control plane (REST/gRPC) + `epoch-cli`; non-FUSE adapters; merge events.
+  The **store-side landing verbs landed ahead of the daemon** (per
+  `docs/design/EPOCH-FIXES.md` §1.3/§5.1: export is the lane lifecycle's
+  correctness, the daemon is ergonomics): `epoch diff|export|audit
+  <state-dir>` — semantic JSON diff with reconstructed rename pairs, merged-
+  snapshot materialization, and the mount-attributed write log. Schema and
+  claims: `docs/reference/EXPORT-AUDIT.md`. Still deferred from the original
+  item: the control plane itself and merge events (`epoch` deliberately has
+  no merge verb).
 - Housekeeping: spent `.worktrees/{vfs-debug,route-ignore}` workspaces can be
   `jj workspace forget` + removed.
 

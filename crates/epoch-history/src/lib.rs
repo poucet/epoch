@@ -28,11 +28,15 @@
 mod closure;
 mod error;
 mod history;
+pub mod inspect;
 mod policy;
 mod scheduler;
 
 pub use closure::pending_closure;
 pub use error::HistoryError;
 pub use history::History;
+pub use inspect::{
+    AuditRecord, DiffEntry, InspectError, MaterializeStats, audit_log, diff_roots, materialize,
+};
 pub use policy::{CheckpointPolicy, Decision, TriggerEvent};
 pub use scheduler::{CheckpointFn, Scheduler, SchedulerHandle};

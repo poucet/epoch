@@ -94,6 +94,21 @@ the deferred `OpaqueTree` ingestion (CAS-to-CAS squash, `TASKS.md` §4) buys.
 
 ### Trigger
 
+### Event `meta`: mount attribution (schema v1)
+
+Every checkpoint a mount commits stamps `meta` with a schema'd JSON
+attribution — `{"v":1,"mount":"m-<16hex>","head":"main","user":"…","host":"…","lower":"…"}`
+(`epoch_timeline::Attribution`; `user`/`host`/`lower` optional, omitted when
+unknown). The mount id is generated once per mount (`epoch-fuse` startup);
+`lower` is the overlaid directory's absolute path and doubles as the store-
+side verbs' default for `--lower`. This is the first committed schema for the
+free-form `meta` field: old events carry no meta (or free text) and both
+decode fine — `Attribution::parse` answers `None` for anything that is not a
+schema-v1 payload. The audit surface (`epoch audit`, see
+`docs/reference/EXPORT-AUDIT.md`) attributes every write-log entry by it.
+
+### Trigger
+
 `CheckpointPolicy` (pure state machine) + `Scheduler` (thread + mpsc):
 debounce 5ms, max-wait cap 500ms since first-dirty, dirty-bytes backstop
 64 MiB. `flush`/soft-`fsync`/`release` are debounce signals; writes only feed

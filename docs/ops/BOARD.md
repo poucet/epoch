@@ -19,6 +19,9 @@ Legend: 🚧 in flight · ✅ landed · ⏸ deferred.
 ## Deferred by decision
 
 ## Landed index
-
 - ✅ `fix-rename` — rename(2) on macFUSE 5.x (fuser `macfuse-4-compat` wire layout) + lower-dots `rmdir` fix (EPOCH-FIXES §1.1)
 - ✅ `vfs-semantics` — symlink/readlink overlay objects, setattr mode persistence, statfs (EPOCH-FIXES §1.2/§1.5/§1.6)
+
+| Landed | What | Change |
+|---|---|---|
+| 🚧 2026-08-30 02:15 | export/landing verbs (`epoch diff\|export\|audit`) + mount-attributed audit surface | nttzrqvn |

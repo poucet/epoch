@@ -15,11 +15,17 @@ epoch-vfs = { path = "../epoch-vfs" }
 epoch-cas = { path = "../epoch-cas" }
 epoch-cas-moka = { path = "../epoch-cas-moka" }
 epoch-cas-redb = { path = "../epoch-cas-redb" }
+epoch-file-cas = { path = "../epoch-file-cas" }
 epoch-history = { path = "../epoch-history" }
+epoch-timeline = { path = "../epoch-timeline" }
 epoch-timeline-redb = { path = "../epoch-timeline-redb" }
+epoch-tree = { path = "../epoch-tree" }
 redb = "2"
 fuser = { version = "0.17", optional = true }
 libc = "0.2"
+
+[dev-dependencies]
+epoch-worktree = { path = "../epoch-worktree" }
 
 # macOS mounts through the privileged `mount_macfuse` helper (see src/macfuse.rs):
 # socketpair + SCM_RIGHTS fd passing, plus fcntl/umount. `nix` is already in the
@@ -42,3 +48,9 @@ nix = { version = "0.30", features = ["socket", "fs", "mount"] }
 name = "epoch-fuse"
 path = "src/main.rs"
 required-features = ["fuser-support"]
+
+# The store-side companion (diff/export/audit): no FUSE involved, so it needs
+# no fuser feature and builds on any platform.
+[[bin]]
+name = "epoch"
+path = "src/bin/epoch.rs"

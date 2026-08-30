@@ -6,11 +6,12 @@ use std::{
     sync::Arc,
 };
 
-use epoch_cas::{CachingByteBackend, MemoryByteBackend, TieredByteBackend};
+use epoch_cas::{Blake3Hasher, CachingByteBackend, ContentHasher, MemoryByteBackend, TieredByteBackend};
 use epoch_cas_moka::MokaByteBackend;
 use epoch_cas_redb::RedbByteBackend;
 use epoch_fuse::fuser_adapter::mount_spike;
 use epoch_history::{CheckpointPolicy, History, Scheduler};
+use epoch_timeline::Attribution;
 use epoch_timeline_redb::RedbTimelineStore;
 use epoch_vfs::router::EPOCHIGNORE_FILE;
 use epoch_vfs::{
@@ -157,7 +158,19 @@ fn mount_durable(
     let tier = TieredByteBackend::new(MemoryByteBackend::new(), far);
     let timeline = Arc::new(RedbTimelineStore::new(db)?);
 
-    let history = Arc::new(History::new(tier.clone(), timeline, head));
+    let history = Arc::new(History::new(tier.clone(), timeline, head.clone()));
+
+    // Every checkpoint this mount commits is stamped with its identity — the
+    // attribution the `epoch audit` write log attributes entries by. The
+    // mount id is generated once per mount; the parent maps mount id → lane.
+    let attribution = Attribution {
+        mount: mount_id(),
+        head: head.clone(),
+        user: env::var("USER").or_else(|_| env::var("LOGNAME")).ok(),
+        host: hostname(),
+        lower: lower_path.as_ref().map(|p| p.display().to_string()),
+    };
+    eprintln!("[epoch-fuse] mount id {} (head {head})", attribution.mount);
 
     // Resume from the head's last checkpoint, or start fresh. An overlay mount
     // resumes its sparse delta over the lower; a standalone one its full root.
@@ -185,7 +198,8 @@ fn mount_durable(
         },
     };
 
-    let checkpointed = CheckpointedFs::new(Arc::clone(&live), Arc::clone(&history));
+    let checkpointed = CheckpointedFs::new(Arc::clone(&live), Arc::clone(&history))
+        .with_meta(Some(attribution.to_meta_json()));
     let scheduler = Scheduler::spawn(
         CheckpointPolicy::default(),
         Box::new(move || checkpointed.checkpoint()),
@@ -231,6 +245,31 @@ fn mount_durable(
     // Unmounted: dropping the scheduler runs a final checkpoint if needed.
     drop(scheduler);
     Ok(())
+}
+
+/// A per-mount identity: `m-<16 hex>` derived from host/pid/start-time.
+fn mount_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let material = format!("{}:{}:{nanos}", hostname().unwrap_or_default(), std::process::id());
+    let hash = Blake3Hasher::hash(material.as_bytes());
+    format!("m-{}", &hash.to_hex()[..16])
+}
+
+/// The host name, best-effort (`None` when undeterminable — the attribution
+/// schema treats it as optional).
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid writable buffer of `buf.len()` bytes.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
 }
 
 /// Wrap `overlay` in a [`RouterVfs`] when `<lower_dir>/.epochignore` exists:

@@ -50,3 +50,17 @@ out (§1.5's best-effort allowance).
  - Follow-on found by the live acceptance test: `rmdir` of an emptied fall-through directory failed ENOTEMPTY because `WorkingTree` counted the lower `readdir`'s synthesized `.`/`..` entries as children (and `readdir` cached them as real nodes). Both lower-merge points now skip dot entries; regression test `overlay::rmdir_emptied_fall_through_dir_ignores_lower_dot_entries`; the test lower now emits dot entries like the real `PassthroughVfs`.
  - Verified live on macFUSE 5.3.1: `mv` of lower file / upper file / lower directory (EXDEV → copy+delete), editor atomic-save cycle, `jj git init` + commit inside a mount; same suite green on Linux (Docker, `fuser-mount`).
  - Cost: none user-visible; macOS and Linux now parse different rename wire widths, per-target. Found-not-fixed: Dockerfile cargo cache-mount can bake a stale binary (see ISSUES).
+
+### 2026-08-30 02:15 · nttzrqvn — export/landing verbs + audit surface
+
+`epoch diff|export|audit <state-dir>` (new `epoch` binary in `epoch-fuse`,
+no FUSE feature needed; logic in `epoch_history::inspect`): schema-versioned
+JSON diff with reconstructed rename pairs (blob-id, subtree-id, and
+cross-lower content-hash matching), merged-snapshot materialization honoring
+tombstones, and the derived write log with mount attribution. Mounts now
+stamp every checkpoint's `meta` with schema-v1 attribution
+(`epoch_timeline::Attribution`: mount id, head, user, host, lower);
+`CheckpointedFs::with_meta` plumbs it through. Cost: the first committed
+schema on the free-form `meta` field; store-side reads still obey redb's
+single-writer rule (live state dirs must be unmounted or copied — the verbs
+say so). Spec: `docs/reference/EXPORT-AUDIT.md`.

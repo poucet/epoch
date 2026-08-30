@@ -21,6 +21,10 @@ use crate::cas_vfs::CasVfs;
 pub struct CheckpointedFs<Near, Far> {
     vfs: Arc<CasVfs<TieredByteBackend<Near, Far>>>,
     history: Arc<History<Near, Far>>,
+    /// The `meta` payload stamped on every event this mount commits — the
+    /// mount's [`Attribution`](epoch_timeline::Attribution) JSON. `None`
+    /// records events without attribution (tests, in-memory mounts).
+    meta: Option<String>,
 }
 
 impl<Near, Far> Clone for CheckpointedFs<Near, Far> {
@@ -28,6 +32,7 @@ impl<Near, Far> Clone for CheckpointedFs<Near, Far> {
         Self {
             vfs: Arc::clone(&self.vfs),
             history: Arc::clone(&self.history),
+            meta: self.meta.clone(),
         }
     }
 }
@@ -43,7 +48,15 @@ where
         vfs: Arc<CasVfs<TieredByteBackend<Near, Far>>>,
         history: Arc<History<Near, Far>>,
     ) -> Self {
-        Self { vfs, history }
+        Self { vfs, history, meta: None }
+    }
+
+    /// Stamp every committed event with `meta` (a schema'd
+    /// [`Attribution`](epoch_timeline::Attribution) JSON payload) so the
+    /// audit surface can attribute checkpoints to this mount.
+    pub fn with_meta(mut self, meta: Option<String>) -> Self {
+        self.meta = meta;
+        self
     }
 
     /// Run one checkpoint: seal under the tree lock, commit off-lock.
@@ -53,7 +66,7 @@ where
             .vfs
             .seal()
             .map_err(|err| HistoryError::Seal(err.to_string()))?;
-        self.history.commit_root(root, None)
+        self.history.commit_root(root, self.meta.clone())
     }
 }
 

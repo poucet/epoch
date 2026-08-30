@@ -28,10 +28,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod attribution;
 mod event;
 mod id;
 mod memory;
 mod store;
+
+pub use attribution::{ATTRIBUTION_SCHEMA_VERSION, Attribution, escape_json_string_into};
 
 pub use event::{TimelineEvent, TIMELINE_EVENT_FORMAT_VERSION};
 pub use id::EventId;
