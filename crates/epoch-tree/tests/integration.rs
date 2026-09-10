@@ -169,20 +169,36 @@ fn codec_decode_rejects_malformed_input() {
     let t = Tree::from_entries([blob(b"a", 1, 0o100644, 0), blob(b"b", 2, 0o100644, 0)]).unwrap();
     let good = TreeCodec::<L>::encode(&t).to_vec();
 
+    // Bad object kind.
+    let mut bad_kind = good.clone();
+    bad_kind[0] = b'X';
+    assert!(matches!(
+        TreeCodec::<L>::decode(&bad_kind),
+        Err(CASError::Codec(_))
+    ));
+
     // Bad version.
     let mut bad_version = good.clone();
-    bad_version[0] = TREE_FORMAT_VERSION.wrapping_add(1);
+    bad_version[1] = TREE_FORMAT_VERSION.wrapping_add(1);
     assert!(matches!(
         TreeCodec::<L>::decode(&bad_version),
         Err(CASError::Codec(_))
     ));
 
-    // Unknown kind tag (first tag byte after 1+4 header). Tag 2 is Tombstone, so
+    // Unknown kind tag (first tag byte after 1+1+4 header). Tag 2 is Tombstone, so
     // an *unknown* tag must be > 2.
     let mut bad_tag = good.clone();
-    bad_tag[5] = 9;
+    bad_tag[6] = 9;
     assert!(matches!(
         TreeCodec::<L>::decode(&bad_tag),
+        Err(CASError::Codec(_))
+    ));
+
+    // Truncated buffer / excessive entry count.
+    let mut bad_count = good.clone();
+    bad_count[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        TreeCodec::<L>::decode(&bad_count),
         Err(CASError::Codec(_))
     ));
 
@@ -194,6 +210,7 @@ fn codec_decode_rejects_malformed_input() {
 
     // Unsorted entries: hand-build descending order.
     let mut unsorted = Vec::new();
+    unsorted.push(epoch_cas::object_kind::TREE);
     unsorted.push(TREE_FORMAT_VERSION);
     unsorted.extend_from_slice(&2u32.to_le_bytes());
     for name in [b"z".as_slice(), b"a".as_slice()] {
@@ -211,6 +228,7 @@ fn codec_decode_rejects_malformed_input() {
 
     // Duplicate names.
     let mut dup = Vec::new();
+    dup.push(epoch_cas::object_kind::TREE);
     dup.push(TREE_FORMAT_VERSION);
     dup.extend_from_slice(&2u32.to_le_bytes());
     for _ in 0..2 {

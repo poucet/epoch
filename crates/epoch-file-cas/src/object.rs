@@ -129,6 +129,13 @@ impl Codec<FileObject> for FileObjectCodec {
             }
             TAG_CHUNKED => {
                 let count = reader.u32()? as usize;
+                if count > reader.remaining() / FileObjectCodec::CHUNK_ENCODED_LEN {
+                    return Err(CASError::Codec(format!(
+                        "truncated FileObject: needed at least {} bytes for {count} chunks, have {}",
+                        count.saturating_mul(FileObjectCodec::CHUNK_ENCODED_LEN),
+                        reader.remaining()
+                    )));
+                }
                 let mut chunks = Vec::with_capacity(count);
                 for _ in 0..count {
                     let id = CASHash::from_bytes(reader.array32()?);
@@ -156,6 +163,10 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8]) -> Reader<'a> {
         Reader { bytes, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], CASError> {
@@ -254,15 +265,23 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_tag() {
-        let err = FileObjectCodec::decode(&[9u8, 0, 0]).unwrap_err();
+        let err = FileObjectCodec::decode(&[object_kind::FILE, 9u8, 0, 0]).unwrap_err();
         assert!(matches!(err, CASError::Codec(_)));
     }
 
     #[test]
     fn decode_rejects_truncation() {
         // Inline tag claiming 10 bytes but supplying none.
-        let mut bytes = vec![TAG_INLINE];
+        let mut bytes = vec![object_kind::FILE, TAG_INLINE];
         bytes.extend_from_slice(&10u64.to_le_bytes());
+        let err = FileObjectCodec::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CASError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_rejects_chunk_count_exceeding_buffer() {
+        let mut bytes = vec![object_kind::FILE, TAG_CHUNKED];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         let err = FileObjectCodec::decode(&bytes).unwrap_err();
         assert!(matches!(err, CASError::Codec(_)));
     }

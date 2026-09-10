@@ -94,6 +94,13 @@ impl TimelineEvent {
             )));
         }
         let parent_count = r.u32()? as usize;
+        if parent_count > r.remaining() / HASH_LEN {
+            return Err(TimelineError::Codec(format!(
+                "truncated event: needed at least {} byte(s) for {parent_count} parents, have {}",
+                parent_count.saturating_mul(HASH_LEN),
+                r.remaining()
+            )));
+        }
         let mut parents = Vec::with_capacity(parent_count);
         for _ in 0..parent_count {
             parents.push(EventId::from_cas_hash(CASHash::from_bytes(r.hash()?)));
@@ -139,6 +146,10 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], TimelineError> {
         let end = self.pos.checked_add(n).ok_or_else(|| {
             TimelineError::Codec("length overflow while decoding event".to_string())
@@ -239,6 +250,13 @@ mod tests {
         bad[0] = 99;
         assert!(matches!(
             TimelineEvent::decode(&bad),
+            Err(TimelineError::Codec(_))
+        ));
+
+        let mut bad_parents = enc.clone();
+        bad_parents[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            TimelineEvent::decode(&bad_parents),
             Err(TimelineError::Codec(_))
         ));
 

@@ -149,6 +149,14 @@ impl<L: Link + 'static> Codec<Tree<L>> for TreeCodec<L> {
             )));
         }
         let count = r.u32()? as usize;
+        let min_entry_len = if L::tombstone().is_some() { 5 } else { 49 };
+        if count > r.remaining() / min_entry_len {
+            return Err(codec_err(format!(
+                "truncated tree: needed at least {} byte(s) for {count} entries, have {}",
+                count.saturating_mul(min_entry_len),
+                r.remaining()
+            )));
+        }
 
         let mut entries: Vec<TreeEntry<L>> = Vec::with_capacity(count);
         // Track the previous name to enforce strict-ascending order in one pass
@@ -425,6 +433,17 @@ mod tests {
     fn decode_rejects_bad_kind_tag() {
         let mut enc = TreeCodec::<Complete>::encode(&Tree::empty()).to_vec();
         enc[0] = b'X';
+        assert!(matches!(
+            TreeCodec::<Complete>::decode(&enc),
+            Err(CASError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_count_exceeding_buffer() {
+        let mut enc = TreeCodec::<Complete>::encode(&Tree::empty()).to_vec();
+        // Set count to a large number that cannot fit in the remaining 0 bytes.
+        enc[2..6].copy_from_slice(&100u32.to_le_bytes());
         assert!(matches!(
             TreeCodec::<Complete>::decode(&enc),
             Err(CASError::Codec(_))
