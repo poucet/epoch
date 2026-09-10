@@ -1,6 +1,7 @@
 # epoch
 
 [![CI](https://github.com/poucet/epoch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/poucet/epoch/actions/workflows/ci.yml?query=branch%3Amain)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-CI%20report-blue?logo=github)](https://github.com/poucet/epoch/actions/workflows/ci.yml?query=branch%3Amain)
 
 A time-traveling copy-on-write filesystem for AI agents and developer
 workflows.
