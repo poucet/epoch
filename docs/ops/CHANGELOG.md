@@ -5,6 +5,18 @@ format is stated once in SYSTEM.md §2.
 
 ## Unreleased
 
+### CI bare Epoch-FS verification in Docker (jj git clone & cargo build) · 2026-09-10 09:03 · npurszno
+
+- **Bare Epoch-FS overlay verification in Docker** (`.github/workflows/ci.yml`, `bench/verify-bare-docker.sh`, `bench/verify-bare-overlay.sh`): Added a dedicated CI test running on `linux-ci` inside Docker with Linux kernel FUSE (`--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`).
+- **Coding agent filesystem semantics validated from blank slate**:
+  - Mounts bare `epoch` CAS overlay over an empty lower directory (overlaying nothing).
+  - Performs `jj git clone` of the repository directly from GitHub into the bare mount.
+  - Inspects `jj status` and `jj log`.
+  - Runs `cargo build` inside the cloned repository in the bare mount, verifying compiler file locks, mmap, rlib outputs, and target artifacts.
+  - Executes the compiled `./target/debug/epoch` binary directly from the FUSE mount to verify executable permissions and ELF loading.
+  - Performs file edits on `src/main.rs`, creates `jj commit -m "..."`, and inspects `.vfs/debug` telemetry.
+- **Docker dev container updates** (`Dockerfile`): Added `git`, `fuse3`, `libfuse3-dev`, and prebuilt `jj` (Jujutsu) binary to the container image.
+
 ### VFS & FUSE throughput optimizations: readdirplus, kernel tuning, chunk parallelism · 2026-09-10 08:50 · rrkyuost
 
 - **FUSE `readdirplus` wire and VFS integration** (`crates/epoch-vfs-api`, `crates/epoch-fuse`, `crates/epoch-vfs`, `crates/epoch-worktree`): Added `DirEntryPlus` carrying `NodeAttr` per dentry. Implemented `Filesystem::readdirplus` in `fuser_adapter.rs` and `VfsService::readdir_plus` across all VFS layers (`PassthroughVfs`, `CasVfs`, `ControlPlaneVfs`, `RouterVfs`, `SignalVfs`, `SubMounts`, `TreeMounts`). Directory listings now serve dentry + stat attributes in one round-trip, eliminating N `getattr` calls per directory listing.

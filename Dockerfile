@@ -4,10 +4,10 @@
 # backend mounts with no macFUSE, no kernel extension, and no approvals.
 FROM rust:slim
 
-# rustc needs a C linker; curl/ca-certificates fetch zellij; zsh is the
-# interactive shell; mount/umount ship with debian-slim (util-linux).
+# rustc needs a C linker; curl/ca-certificates fetch tools; zsh is the
+# interactive shell; fuse3/libfuse3-dev for FUSE; git for VCS operations.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates zsh \
+ && apt-get install -y --no-install-recommends gcc libc6-dev curl ca-certificates git fuse3 libfuse3-dev zsh \
  && rm -rf /var/lib/apt/lists/*
 
 # Zellij — a Rust terminal multiplexer. Grab the prebuilt musl binary matching
@@ -16,6 +16,13 @@ RUN arch="$(uname -m)" \
  && curl -fsSL "https://github.com/zellij-org/zellij/releases/latest/download/zellij-${arch}-unknown-linux-musl.tar.gz" \
     | tar -xz -C /usr/local/bin zellij \
  && chmod +x /usr/local/bin/zellij
+
+# Jujutsu (jj) VCS for agent workflows
+RUN arch="$(uname -m)" \
+ && JJ_VER="v0.28.0" \
+ && curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VER}/jj-${JJ_VER}-${arch}-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin ./jj \
+ && chmod +x /usr/local/bin/jj
 
 # Build the spike once and expose it as `epoch` on PATH. The cache mounts keep
 # rebuilds fast when you re-run the helper script after editing code.

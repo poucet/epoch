@@ -52,6 +52,12 @@ jobs:
           # Runs micro, macro, and realworld suites (git clone, jj commit, cargo build from scratch)
           ./bench/run-mount.sh --quick --groups "micro macro realworld" --no-fail-exit --markdown mount-bench.md
 
+      - name: Verify Bare Epoch-FS in Docker (JJ Git Clone & Cargo Build)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./bench/verify-bare-docker.sh
+
       - name: Publish Benchmark Results to GitHub Actions Summary
         if: always()
         run: |
