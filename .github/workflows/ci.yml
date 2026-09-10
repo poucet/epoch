@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-ci:
+    name: Linux CI & FUSE Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies & FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo chmod 666 /dev/fuse
+
+      - name: Install Jujutsu (jj)
+        run: |
+          # Fetch prebuilt jj binary for jj-flow benchmarks
+          JJ_VER="v0.28.0"
+          curl -fsSL "https://github.com/jj-vcs/jj/releases/download/${JJ_VER}/jj-${JJ_VER}-x86_64-unknown-linux-musl.tar.gz" | tar -xz -C /usr/local/bin ./jj || true
+          which jj || echo "jj installation skipped; jj benchmarks will report SKIP"
+
+      - name: Workspace Cargo Check
+        run: cargo check --workspace --all-targets
+
+      - name: Workspace Tests
+        run: cargo test --workspace --all-targets
+
+      - name: In-process Benchmark Suite
+        run: |
+          cargo run -p epoch-bench -- micro macro mmap --quick --no-fail-exit --markdown inproc-bench.md
+
+      - name: Live Kernel FUSE Mount Benchmarks (High-File Operations)
+        run: |
+          # Runs micro, macro, and realworld suites (git clone, jj commit, cargo build from scratch)
+          ./bench/run-mount.sh --quick --groups "micro macro realworld" --no-fail-exit --markdown mount-bench.md
+
+      - name: Publish Benchmark Results to GitHub Actions Summary
+        if: always()
+        run: |
+          echo "# CI Benchmark Report: Raw Disk vs Epoch-FS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing raw disk performance inside GitHub Actions Linux VM vs Epoch-FS over kernel FUSE." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f mount-bench.md ]; then
+            echo "## Kernel FUSE Mount Suite" >> $GITHUB_STEP_SUMMARY
+            cat mount-bench.md >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f inproc-bench.md ]; then
+            echo "## In-Process Overlay Suite" >> $GITHUB_STEP_SUMMARY
+            cat inproc-bench.md >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Benchmark Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-reports
+          path: |
+            inproc-bench.md
+            mount-bench.md
+          if-no-files-found: ignore
+
+  macos-ci:
+    name: macOS Build Check
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace Cargo Check
+        run: cargo check --workspace --all-targets

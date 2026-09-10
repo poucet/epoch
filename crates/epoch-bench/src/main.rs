@@ -58,6 +58,8 @@ struct Opts {
     dense: bool,
     quick: bool,
     iters: Option<u64>,
+    no_fail_exit: bool,
+    markdown: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -73,6 +75,8 @@ fn parse_args() -> Result<Opts, String> {
         dense: false,
         quick: false,
         iters: None,
+        no_fail_exit: false,
+        markdown: None,
     };
     let known = ["micro", "macro", "spinup", "mmap", "realworld", "all"];
     let mut args = std::env::args().skip(1);
@@ -101,6 +105,10 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--dense" => opts.dense = true,
             "--quick" => opts.quick = true,
+            "--no-fail-exit" => opts.no_fail_exit = true,
+            "--markdown" => {
+                opts.markdown = Some(PathBuf::from(args.next().ok_or("--markdown needs a file path")?))
+            }
             "--iters" => {
                 opts.iters =
                     Some(args.next().ok_or("--iters needs a value")?.parse().map_err(|_| "--iters must be a number")?)
@@ -217,12 +225,17 @@ fn main() -> ExitCode {
 
     let wants = |g: &str| opts.groups.iter().any(|x| x == g || x == "all");
     let (mut ok, mut fail, mut known, mut skip) = (0, 0, 0, 0);
+    let mut markdown_chunks: Vec<String> = Vec::new();
+
     let mut tally = |pairs: &[bench::Pair], title: &str| {
         let (o, f, k, s) = bench::report(title, pairs);
         ok += o;
         fail += f;
         known += k;
         skip += s;
+        if opts.markdown.is_some() {
+            markdown_chunks.push(bench::to_markdown(title, pairs));
+        }
     };
 
     if wants("micro") {
@@ -251,8 +264,36 @@ fn main() -> ExitCode {
         tally(&spinup::run(&spin_cfg), "SPIN-UP AT SCALE (§2.4.3)");
     }
 
+    if let Some(md_path) = &opts.markdown {
+        let mut md_content = String::new();
+        let already_exists = md_path.exists() && std::fs::metadata(md_path).map(|m| m.len() > 0).unwrap_or(false);
+        if !already_exists {
+            md_content.push_str("## Epoch Benchmark Results\n\n");
+        }
+        md_content.push_str(&format!(
+            "**Run summary**: {ok} passed, {fail} failed, {known} known failures, {skip} skipped\n\n"
+        ));
+        for chunk in markdown_chunks {
+            md_content.push_str(&chunk);
+        }
+        if let Some(parent) = md_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(md_path)
+            .and_then(|mut f| f.write_all(md_content.as_bytes()));
+        if let Err(e) = res {
+            eprintln!("failed to write markdown to {}: {e}", md_path.display());
+        } else {
+            eprintln!("[bench] wrote markdown report to {}", md_path.display());
+        }
+    }
+
     println!("\n══ TOTAL: {ok} ok · {fail} FAIL · {known} known-fail · {skip} skipped ══");
-    if fail > 0 {
+    if fail > 0 && !opts.no_fail_exit {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

@@ -26,11 +26,15 @@ cd "$REPO_ROOT"
 QUICK=""
 SUITES="micro macro spinup mmap realworld"
 KEEP=0
+MARKDOWN_ARG=""
+NO_FAIL_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick) QUICK="--quick"; shift ;;
     --groups) SUITES="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --markdown) MARKDOWN_ARG="--markdown $2"; shift 2 ;;
+    --no-fail-exit) NO_FAIL_ARG="--no-fail-exit"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -43,21 +47,40 @@ BARE_B="$SCRATCH/bare-b"
 STATE_A="$SCRATCH/state-a"
 STATE_B="$SCRATCH/state-b"
 
-# ── preflight ────────────────────────────────────────────────────────────────
-if [[ ! -d /Library/Filesystems/macfuse.fs ]]; then
-  echo "macFUSE not installed — use \`cargo run -p epoch-bench -- ...\` (in-process mode) or ./docker-run.sh" >&2
+# ── preflight & OS detection ──────────────────────────────────────────────────
+OS="$(uname -s)"
+if [[ "$OS" == "Darwin" ]]; then
+  if [[ ! -d /Library/Filesystems/macfuse.fs ]]; then
+    echo "macFUSE not installed — use \`cargo run -p epoch-bench -- ...\` (in-process mode) or ./docker-run.sh" >&2
+    exit 1
+  fi
+  FUSE_FEATURE="fuser-adapter"
+  unmount_fs() {
+    umount "$1" 2>/dev/null || diskutil unmount force "$1" >/dev/null 2>&1 || true
+  }
+elif [[ "$OS" == "Linux" ]]; then
+  if [[ ! -e /dev/fuse ]]; then
+    echo "/dev/fuse not found — ensure FUSE is enabled" >&2
+    exit 1
+  fi
+  FUSE_FEATURE="fuser-mount"
+  unmount_fs() {
+    fusermount -u "$1" 2>/dev/null || fusermount3 -u "$1" 2>/dev/null || umount "$1" 2>/dev/null || true
+  }
+else
+  echo "Unsupported OS for kernel mount benchmark: $OS" >&2
   exit 1
 fi
 
-echo "▸ building epoch-bench + epoch-fuse (release)…" >&2
+echo "▸ building epoch-bench + epoch-fuse ($FUSE_FEATURE, release)…" >&2
 cargo build --release -p epoch-bench || exit 1
-cargo build --release -p epoch-fuse --features fuser-adapter || exit 1
+cargo build --release -p epoch-fuse --features "$FUSE_FEATURE" || exit 1
 BENCH="$REPO_ROOT/target/release/epoch-bench"
 FUSE="$REPO_ROOT/target/release/epoch-fuse"
 
 # ── scratch ──────────────────────────────────────────────────────────────────
 if [[ -d "$SCRATCH" ]]; then
-  umount "$MNT" 2>/dev/null || diskutil unmount force "$MNT" >/dev/null 2>&1 || true
+  unmount_fs "$MNT"
   rm -rf "$SCRATCH"
 fi
 mkdir -p "$LOWER" "$MNT" "$BARE_A" "$BARE_B" "$STATE_A" "$STATE_B"
@@ -68,7 +91,7 @@ cleanup() {
     kill "$DAEMON_PID" 2>/dev/null
     wait "$DAEMON_PID" 2>/dev/null
   fi
-  umount "$MNT" 2>/dev/null || diskutil unmount force "$MNT" >/dev/null 2>&1 || true
+  unmount_fs "$MNT"
   [[ "$KEEP" == 0 ]] && rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
@@ -88,7 +111,7 @@ mount_epoch() {  # mount_epoch <state-dir>
 }
 
 unmount_epoch() {
-  umount "$MNT" 2>/dev/null || diskutil unmount force "$MNT" >/dev/null 2>&1 || true
+  unmount_fs "$MNT"
   wait "$DAEMON_PID" 2>/dev/null
   DAEMON_PID=""
 }
@@ -96,7 +119,7 @@ unmount_epoch() {
 # ── phase A: no .epochignore — full suite ────────────────────────────────────
 echo "▸ phase A: mount (no .epochignore) — $SUITES, cargo overlay mode" >&2
 mount_epoch "$STATE_A" || exit 1
-"$BENCH" $SUITES $QUICK \
+"$BENCH" $SUITES $QUICK $NO_FAIL_ARG $MARKDOWN_ARG \
   --bare "$BARE_A" \
   --mount "$MNT" --lower "$LOWER" --daemon-pid "$DAEMON_PID" \
   --fuse-bin "$FUSE" \
@@ -110,7 +133,7 @@ if [[ " $SUITES " == *" realworld "* ]]; then
   echo "▸ phase B: fresh mount with /target/ in .epochignore — cargo-build-ignore" >&2
   printf '/target/\n' > "$LOWER/.epochignore"
   mount_epoch "$STATE_B" || exit 1
-  "$BENCH" realworld $QUICK \
+  "$BENCH" realworld $QUICK $NO_FAIL_ARG $MARKDOWN_ARG \
     --bare "$BARE_B" \
     --mount "$MNT" --lower "$LOWER" --daemon-pid "$DAEMON_PID" \
     --fuse-bin "$FUSE" \

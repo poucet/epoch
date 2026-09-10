@@ -269,6 +269,65 @@ pub fn report(title: &str, pairs: &[Pair]) -> (u64, u64, u64, u64) {
     (ok, fail, known, skip)
 }
 
+/// Format the suite as a GitHub Flavored Markdown table comparing bare disk
+/// vs epoch mount, suitable for GitHub Actions step summaries.
+pub fn to_markdown(title: &str, pairs: &[Pair]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("### {title}\n\n"));
+    out.push_str("| Workload | Bare Disk | Epoch Mount | ×Bare | Ceiling | Work CPU | Daemon CPU | Daemon RSS | Verdict | Note |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+    for pair in pairs {
+        let row = &pair.mount;
+        let bare = pair
+            .bare
+            .wall
+            .map(fmt_dur)
+            .unwrap_or_else(|| "—".into());
+        let mount = row.wall.map(fmt_dur).unwrap_or_else(|| "—".into());
+        let ratio = pair
+            .ratio()
+            .map(|r| format!("{r:.2}×"))
+            .unwrap_or_else(|| "—".into());
+        let ceiling = match &row.ceiling {
+            Ceiling::MaxRatio(r) => format!("≤ {r:.0}× bare"),
+            Ceiling::MaxAbs(d) => format!("≤ {}", fmt_dur(*d).trim()),
+            Ceiling::None => "report only".to_string(),
+        };
+        let mut note = row.note.clone();
+        if pair.bare.status != Status::Ok {
+            note = format!("[bare: {}] {note}", status_tag(&pair.bare.status));
+        }
+        if let Some(rss_note) = row.resources.rss_note() {
+            note = if note.is_empty() {
+                rss_note
+            } else {
+                format!("{note}; {rss_note}")
+            };
+        }
+        let status = match &row.status {
+            Status::Ok => "✅ ok".to_string(),
+            Status::Fail(r) => format!("❌ FAIL({r})"),
+            Status::KnownFail(r) => format!("⚠️ KNOWN-FAIL({r})"),
+            Status::Skip(r) => format!("⏭️ SKIP({r})"),
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            row.name,
+            bare.trim(),
+            mount.trim(),
+            ratio,
+            ceiling,
+            row.resources.work_cpu(),
+            row.resources.daemon_cpu(),
+            row.resources.peak_rss(),
+            status,
+            note.replace('|', "\\|"),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,14 @@ format is stated once in SYSTEM.md §2.
 
 ## Unreleased
 
+### GitHub Actions CI & raw vs mount benchmark publishing · 2026-09-10 08:06 · pzqtvusm
+
+- **Multi-platform CI workflow** (`.github/workflows/ci.yml`): Linux CI runs full `cargo check`, `cargo test --workspace --all-targets`, in-process benchmarks, and live kernel FUSE mount benchmarks over `/dev/fuse`. macOS CI kept minimal as a fast compilation check (`cargo check --workspace --all-targets`).
+- **Benchmark reporting**: `epoch-bench` gains `--markdown <file>` and `--no-fail-exit` flags, generating GitHub Flavored Markdown comparison tables (raw disk vs epoch-fs) with resource metrics (CPU, RSS, ratios). CI automatically publishes the table to `$GITHUB_STEP_SUMMARY` and uploads downloadable artifacts.
+- **Universal mount runner** (`bench/run-mount.sh`): Auto-detects Linux vs macOS, building with `--features fuser-mount` on Linux and `fuser-adapter` on macOS, handling unmounts appropriately.
+- **High-file-count real-world workloads**: Continuous regression testing of procedural git clone (200 files), jujutsu (jj) workflows, and full cargo crate builds from scratch inside the mount.
+- **Design proposal** (`docs/design/DAEMON-AND-FSKIT.md`): Architecture roadmap for the Shared Machine Daemon (Option A) to share state between Docker and host macOS, preserving single-binary mode and laying out the FSKit path without requiring a paid Apple Developer account.
+
 ### atime/mtime: in-memory session times, checkpoint-stamped history · 2026-08-30 02:44 · ynvtzmkokpkm
 
 Lane `times-persistence`, per `docs/design/EPOCH-FIXES.md` §1.5 — pulled

@@ -20,9 +20,11 @@ Legend: 🚧 in flight · ✅ landed · ⏸ deferred.
 - ✅ `export-audit` — `epoch diff`/`export`/`audit` verbs + event attribution (EPOCH-FIXES §1.3, §3.2)
 - ✅ `times-persistence` — in-memory session times (never in CAS), checkpoint-stamped history views (EPOCH-FIXES §1.5)
 - ✅ `bench` — `epoch-bench` suite: micro/macro/realworld, CPU+RSS costs (EPOCH-FIXES §2.4)
+- ✅ `ci-bench` — GitHub Actions CI (Linux live FUSE + high-file realworld benchmarks, minimal macOS build check, step summary publishing)
 
 | Landed | What | Change |
 |---|---|---|
 | 2026-08-30 02:15 | export/landing verbs (`epoch diff\|export\|audit`) + mount-attributed audit surface | nttzrqvn |
 | 2026-08-30 02:44 | in-memory session times (never in CAS), checkpoint-stamped history views | ynvtzmko |
 | 2026-08-30 03:02 | `epoch-bench` suite: micro/macro/realworld, CPU+RSS costs | qupstnsn |
+| 2026-09-10 08:06 | GitHub Actions CI with live Linux FUSE benchmarks + step summary publishing | pzqtvusm |
