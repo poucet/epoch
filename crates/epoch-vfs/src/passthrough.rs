@@ -31,7 +31,7 @@ use std::{
 };
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind, OpenMode,
+    CreateRequest, CreatedNode, DirEntry, DirEntryPlus, Entry, FileHandle, NodeAttr, InodeId, NodeKind, OpenMode,
     OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
     VfsResult, VfsService, WriteRequest,
 };
@@ -132,7 +132,13 @@ impl PassthroughVfs {
     }
 
     fn id_for_path(&self, relative: &Path) -> VfsResult<InodeId> {
+        if let Some(&id) = self.read_state()?.id_by_path.get(relative) {
+            return Ok(id);
+        }
         let mut state = self.write_state()?;
+        if let Some(&id) = state.id_by_path.get(relative) {
+            return Ok(id);
+        }
         Ok(id_for_path(
             &mut state,
             &self.next_node_id,
@@ -283,6 +289,33 @@ impl VfsService for PassthroughVfs {
             let child_id = self.id_for_path(&child)?;
             let kind = kind_from_metadata(&metadata);
             entries.push(DirEntry::new(child_id, name, kind));
+        }
+
+        Ok(entries)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        let path = self.path_for_node(inode_id)?;
+        let mut entries = Vec::new();
+        for dot in self.dot_entries(inode_id, &path)? {
+            let attr = self.getattr(dot.inode_id)?;
+            entries.push(DirEntryPlus::with_entry(dot, attr));
+        }
+
+        let lower_path = self.lower_path(&path);
+        let metadata = fs::symlink_metadata(&lower_path).map_err(map_io_error)?;
+        if !metadata.is_dir() {
+            return Err(VfsError::NotDirectory);
+        }
+
+        for entry in fs::read_dir(lower_path).map_err(map_io_error)? {
+            let entry = entry.map_err(map_io_error)?;
+            let name = entry.file_name();
+            let child = child_path(&path, &name)?;
+            let metadata = entry.metadata().map_err(map_io_error)?;
+            let child_id = self.id_for_path(&child)?;
+            let attr = attr_from_metadata(child_id, &metadata);
+            entries.push(DirEntryPlus::new(child_id, name, attr));
         }
 
         Ok(entries)

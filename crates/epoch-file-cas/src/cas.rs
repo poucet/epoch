@@ -110,11 +110,29 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
         match object {
             FileObject::Inline(content) => Ok(Some(content)),
             FileObject::Chunked { chunks } => {
-                let mut out = Vec::with_capacity(
-                    chunks.iter().map(|c| c.len as usize).sum::<usize>(),
-                );
-                for chunk in &chunks {
-                    out.extend_from_slice(&self.load_chunk(chunk)?);
+                if chunks.is_empty() {
+                    return Ok(Some(Bytes::new()));
+                }
+                if chunks.len() == 1 {
+                    return Ok(Some(self.load_chunk(&chunks[0])?));
+                }
+                let mut results: Vec<Result<Bytes, CASError>> = (0..chunks.len())
+                    .map(|_| Ok(Bytes::new()))
+                    .collect();
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(chunks.len());
+                    for chunk in &chunks {
+                        handles.push(s.spawn(|| self.load_chunk(chunk)));
+                    }
+                    for (i, handle) in handles.into_iter().enumerate() {
+                        results[i] = handle.join().unwrap();
+                    }
+                });
+                let total_len = chunks.iter().map(|c| c.len as usize).sum::<usize>();
+                let mut out = Vec::with_capacity(total_len);
+                for res in results {
+                    let bytes = res?;
+                    out.extend_from_slice(&bytes);
                 }
                 Ok(Some(Bytes::from(out)))
             }
@@ -142,27 +160,49 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
                 Ok(content.slice(off as usize..off as usize + want))
             }
             FileObject::Chunked { chunks } => {
-                let mut out = Vec::with_capacity(want);
-                // Walk chunks by cumulative offset, fetching only those that
-                // overlap `[off, end)`.
+                let mut relevant_chunks = Vec::new();
                 let mut chunk_start: u64 = 0;
                 for chunk in &chunks {
                     let chunk_end = chunk_start + chunk.len as u64;
                     if chunk_end <= off {
-                        // Entirely before the window — skip without fetching.
                         chunk_start = chunk_end;
                         continue;
                     }
                     if chunk_start >= end {
-                        // Past the window — nothing more to read.
                         break;
                     }
-                    let bytes = self.load_chunk(chunk)?;
-                    // Intersect `[off, end)` with this chunk's span.
                     let from = off.saturating_sub(chunk_start) as usize;
                     let to = (end.min(chunk_end) - chunk_start) as usize;
-                    out.extend_from_slice(&bytes[from..to]);
+                    relevant_chunks.push((chunk, from, to));
                     chunk_start = chunk_end;
+                }
+
+                if relevant_chunks.is_empty() {
+                    return Ok(Bytes::new());
+                }
+                if relevant_chunks.len() == 1 {
+                    let (chunk, from, to) = relevant_chunks[0];
+                    let bytes = self.load_chunk(chunk)?;
+                    return Ok(bytes.slice(from..to));
+                }
+
+                let mut results: Vec<Result<Bytes, CASError>> = (0..relevant_chunks.len())
+                    .map(|_| Ok(Bytes::new()))
+                    .collect();
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(relevant_chunks.len());
+                    for (chunk, _, _) in &relevant_chunks {
+                        handles.push(s.spawn(|| self.load_chunk(chunk)));
+                    }
+                    for (i, handle) in handles.into_iter().enumerate() {
+                        results[i] = handle.join().unwrap();
+                    }
+                });
+
+                let mut out = Vec::with_capacity(want);
+                for ((_, from, to), res) in relevant_chunks.into_iter().zip(results) {
+                    let bytes = res?;
+                    out.extend_from_slice(&bytes[from..to]);
                 }
                 Ok(Bytes::from(out))
             }
@@ -230,14 +270,39 @@ impl<B: SyncByteBackend + Clone> FileCas<B> {
         if content.len() <= INLINE_MAX {
             return Ok(FileObject::Inline(Bytes::copy_from_slice(content)));
         }
-        let mut chunks = Vec::with_capacity(content.len().div_ceil(CHUNK_SIZE));
-        for piece in content.chunks(CHUNK_SIZE) {
-            let id = self.chunks.put(Bytes::copy_from_slice(piece))?;
-            // CHUNK_SIZE fits in u32, so `piece.len()` always does too.
-            chunks.push(ChunkRef {
-                id,
-                len: piece.len() as u32,
+        let pieces: Vec<&[u8]> = content.chunks(CHUNK_SIZE).collect();
+        if pieces.len() == 1 {
+            let id = self.chunks.put(Bytes::copy_from_slice(pieces[0]))?;
+            return Ok(FileObject::Chunked {
+                chunks: vec![ChunkRef {
+                    id,
+                    len: pieces[0].len() as u32,
+                }],
             });
+        }
+
+        let mut results: Vec<Result<ChunkRef, CASError>> = (0..pieces.len())
+            .map(|_| Err(CASError::NotFound))
+            .collect();
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(pieces.len());
+            for piece in &pieces {
+                handles.push(s.spawn(|| {
+                    let id = self.chunks.put(Bytes::copy_from_slice(piece))?;
+                    Ok(ChunkRef {
+                        id,
+                        len: piece.len() as u32,
+                    })
+                }));
+            }
+            for (i, handle) in handles.into_iter().enumerate() {
+                results[i] = handle.join().unwrap();
+            }
+        });
+
+        let mut chunks = Vec::with_capacity(pieces.len());
+        for res in results {
+            chunks.push(res?);
         }
         Ok(FileObject::Chunked { chunks })
     }

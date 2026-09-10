@@ -158,6 +158,43 @@ impl DirEntry {
     }
 }
 
+/// A directory entry bundled with its attributes, used by [`VfsService::readdir_plus`]
+/// and FUSE's `readdirplus` wire protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntryPlus {
+    pub inode_id: InodeId,
+    pub name: OsString,
+    pub kind: NodeKind,
+    pub attr: NodeAttr,
+    pub ttl: Duration,
+    pub generation: u64,
+}
+
+impl DirEntryPlus {
+    pub fn new(inode_id: InodeId, name: impl Into<OsString>, attr: NodeAttr) -> Self {
+        let kind = attr.kind;
+        Self {
+            inode_id,
+            name: name.into(),
+            kind,
+            attr,
+            ttl: Duration::from_secs(1),
+            generation: 0,
+        }
+    }
+
+    pub fn with_entry(entry: DirEntry, attr: NodeAttr) -> Self {
+        Self {
+            inode_id: entry.inode_id,
+            name: entry.name,
+            kind: entry.kind,
+            attr,
+            ttl: Duration::from_secs(1),
+            generation: 0,
+        }
+    }
+}
+
 /// The attribute-mutation half of `setattr(2)` that epoch supports.
 ///
 /// `size` changes are **not** here — they go through
@@ -444,6 +481,20 @@ pub trait VfsService: Send + Sync {
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>>;
 
+    /// Read directory entries together with their attributes.
+    ///
+    /// The default implementation calls [`readdir`](Self::readdir) and then [`getattr`](Self::getattr)
+    /// for each entry. Services with native attribute metadata override this to avoid extra lookups/syscalls.
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        let entries = self.readdir(inode_id)?;
+        let mut plus = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let attr = self.getattr(entry.inode_id)?;
+            plus.push(DirEntryPlus::with_entry(entry, attr));
+        }
+        Ok(plus)
+    }
+
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>>;
@@ -539,6 +590,16 @@ pub trait ReadOnlyFeature: Send + Sync {
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr>;
     /// See [`VfsService::readdir`].
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>>;
+    /// Extended directory listing returning entries and their attributes in a single call.
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        let entries = self.readdir(inode_id)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let attr = self.getattr(entry.inode_id)?;
+            out.push(DirEntryPlus::new(entry.inode_id, entry.name, attr));
+        }
+        Ok(out)
+    }
     /// Read-only open (writable modes were already rejected).
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile>;
     /// See [`VfsService::read`].
@@ -567,6 +628,10 @@ impl<T: ReadOnlyFeature> VfsService for T {
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
         ReadOnlyFeature::readdir(self, inode_id)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        ReadOnlyFeature::readdir_plus(self, inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {

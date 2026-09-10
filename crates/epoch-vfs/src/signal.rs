@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use epoch_history::{SchedulerHandle, TriggerEvent};
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, OpenRequest,
+    CreateRequest, CreatedNode, DirEntry, DirEntryPlus, Entry, FileHandle, InodeId, NodeAttr, OpenRequest,
     OpenedFile, ReadRequest, SetAttrRequest, StatFs, VfsError, VfsResult, VfsService, WriteRequest,
 };
 
@@ -49,6 +49,10 @@ impl VfsService for SignalVfs {
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
         self.inner.readdir(inode_id)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        self.inner.readdir_plus(inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {

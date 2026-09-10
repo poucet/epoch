@@ -21,6 +21,7 @@ Legend: 🚧 in flight · ✅ landed · ⏸ deferred.
 - ✅ `times-persistence` — in-memory session times (never in CAS), checkpoint-stamped history views (EPOCH-FIXES §1.5)
 - ✅ `bench` — `epoch-bench` suite: micro/macro/realworld, CPU+RSS costs (EPOCH-FIXES §2.4)
 - ✅ `ci-bench` — GitHub Actions CI (Linux live FUSE + high-file realworld benchmarks, minimal macOS build check, step summary publishing)
+- ✅ `vfs-throughput-opt` — readdirplus wire & VFS integration, FUSE kernel readahead/write/splice tuning, snapshot TTL cache, multi-chunk read/write parallelism, CasVfs RwLock, RouterVfs fast-paths
 
 | Landed | What | Change |
 |---|---|---|
@@ -28,3 +29,4 @@ Legend: 🚧 in flight · ✅ landed · ⏸ deferred.
 | 2026-08-30 02:44 | in-memory session times (never in CAS), checkpoint-stamped history views | ynvtzmko |
 | 2026-08-30 03:02 | `epoch-bench` suite: micro/macro/realworld, CPU+RSS costs | qupstnsn |
 | 2026-09-10 08:06 | GitHub Actions CI with live Linux FUSE benchmarks + step summary publishing | pzqtvusm |
+| 2026-09-10 08:50 | VFS & FUSE throughput optimizations (readdirplus, kernel tuning, chunk parallelism) | rrkyuost |

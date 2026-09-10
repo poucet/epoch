@@ -6,8 +6,8 @@ use epoch_vfs_api::{
 };
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, KernelConfig, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    INodeNo, InitFlags, KernelConfig, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 
 pub struct FuseSpikeFs {
@@ -97,8 +97,30 @@ macro_rules! fuse_log {
 }
 
 impl Filesystem for FuseSpikeFs {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         fuse_log!("init");
+        // Optimization G: Tune kernel readahead and max write buffers
+        let _ = config.set_max_readahead(1024 * 1024);
+        let _ = config.set_max_write(1024 * 1024);
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
+
+        // Add capability flags if supported by the kernel
+        let caps = config.capabilities();
+        let mut to_add = InitFlags::empty();
+        to_add |= caps & InitFlags::FUSE_DO_READDIRPLUS;
+        to_add |= caps & InitFlags::FUSE_READDIRPLUS_AUTO;
+        to_add |= caps & InitFlags::FUSE_PARALLEL_DIROPS;
+        to_add |= caps & InitFlags::FUSE_AUTO_INVAL_DATA;
+        #[cfg(not(target_os = "macos"))]
+        {
+            to_add |= caps & InitFlags::FUSE_SPLICE_READ;
+            to_add |= caps & InitFlags::FUSE_SPLICE_WRITE;
+            to_add |= caps & InitFlags::FUSE_SPLICE_MOVE;
+        }
+        if !to_add.is_empty() {
+            let _ = config.add_capabilities(to_add);
+        }
         Ok(())
     }
 
@@ -149,7 +171,7 @@ impl Filesystem for FuseSpikeFs {
                     attr.gid,
                     attr.nlink
                 );
-                let ttl = attr_ttl();
+                let ttl = attr_ttl(from_ino(ino));
                 let attr = to_file_attr(attr);
                 reply.attr(&ttl, &attr);
             }
@@ -205,7 +227,7 @@ impl Filesystem for FuseSpikeFs {
         match result {
             Ok(attr) => {
                 fuse_log!("setattr ok ino={} size={} perm={:o}", attr.inode_id.0, attr.size, attr.perm);
-                let ttl = attr_ttl();
+                let ttl = attr_ttl(attr.inode_id);
                 let attr = to_file_attr(attr);
                 reply.attr(&ttl, &attr);
             }
@@ -508,6 +530,47 @@ impl Filesystem for FuseSpikeFs {
         }
     }
 
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        fuse_log!("readdirplus ino={} offset={offset}", ino.0);
+        match self.vfs.readdir_plus(from_ino(ino)) {
+            Ok(entries) => {
+                let total = entries.len();
+                for (index, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                    fuse_log!(
+                        "readdirplus add offset={} node={} name={:?} kind={:?}",
+                        index + 1,
+                        entry.inode_id.0,
+                        entry.name,
+                        entry.kind
+                    );
+                    let file_attr = to_file_attr(entry.attr);
+                    let ttl = attr_ttl(entry.inode_id);
+                    let full = reply.add(
+                        to_ino(entry.inode_id),
+                        (index + 1) as u64,
+                        entry.name,
+                        &ttl,
+                        &file_attr,
+                        Generation(0),
+                    );
+                    if full {
+                        break;
+                    }
+                }
+                fuse_log!("readdirplus ok total={total}");
+                reply.ok();
+            }
+            Err(err) => reply.error(log_errno(&err)),
+        }
+    }
+
     fn releasedir(
         &self,
         _req: &Request,
@@ -609,8 +672,12 @@ fn reply_entry(reply: ReplyEntry, entry: Entry) {
     reply.entry(&ttl, &attr, Generation(entry.generation));
 }
 
-fn attr_ttl() -> std::time::Duration {
-    std::time::Duration::from_secs(1)
+fn attr_ttl(inode: InodeId) -> std::time::Duration {
+    if inode.0 >= epoch_vfs::CP_BASE {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_secs(1)
+    }
 }
 
 fn log_errno(error: &VfsError) -> Errno {

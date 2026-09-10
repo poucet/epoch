@@ -5,6 +5,15 @@ format is stated once in SYSTEM.md §2.
 
 ## Unreleased
 
+### VFS & FUSE throughput optimizations: readdirplus, kernel tuning, chunk parallelism · 2026-09-10 08:50 · rrkyuost
+
+- **FUSE `readdirplus` wire and VFS integration** (`crates/epoch-vfs-api`, `crates/epoch-fuse`, `crates/epoch-vfs`, `crates/epoch-worktree`): Added `DirEntryPlus` carrying `NodeAttr` per dentry. Implemented `Filesystem::readdirplus` in `fuser_adapter.rs` and `VfsService::readdir_plus` across all VFS layers (`PassthroughVfs`, `CasVfs`, `ControlPlaneVfs`, `RouterVfs`, `SignalVfs`, `SubMounts`, `TreeMounts`). Directory listings now serve dentry + stat attributes in one round-trip, eliminating N `getattr` calls per directory listing.
+- **FUSE kernel buffer and capability tuning** (`crates/epoch-fuse/src/fuser_adapter.rs`): In `init()`, configured 1 MiB `max_readahead`, 1 MiB `max_write`, 64 max background requests, congestion threshold 48, and negotiated `FUSE_DO_READDIRPLUS`, `FUSE_READDIRPLUS_AUTO`, `FUSE_PARALLEL_DIROPS`, `FUSE_AUTO_INVAL_DATA`, and splice capabilities (`FUSE_SPLICE_READ`/`WRITE`/`MOVE` on non-macOS).
+- **Snapshot and Submount Cache TTL** (`crates/epoch-fuse`, `crates/epoch-vfs`): Immutable `.vfs/history` snapshot roots and `.vfs/cas` tree submounts now serve a 60-second dentry and attribute TTL (`CP_BASE` check in `attr_ttl`), enabling aggressive kernel metadata caching for historic views while keeping relative history references (`5s-ago`) strictly dynamic (`ttl = 0`).
+- **Concurrent chunk read/write parallelism** (`crates/epoch-file-cas/src/cas.rs`): Upgraded `get`, `read_at`, and `store_content` in `FileCas` to fetch, decompress, compress, and hash chunked files across worker threads using `std::thread::scope` when >= 2 chunks overlap. Zero-copy slicing preserved for single-chunk spans.
+- **`CasVfs` read scalability**: Replaced coarse `Mutex<WorkingTree>` in `CasVfs` with `std::sync::RwLock`, allowing concurrent `getattr`, `read`, `readlink`, `statfs`, and `debug_snapshot` operations without lock contention.
+- **`RouterVfs` and `PassthroughVfs` fast-paths**: Added `if self.rules.is_empty()` fast-paths to bypass path normalization and lock checks when `.epochignore` is empty; added read-lock fast-path in `PassthroughVfs::id_for_path` avoiding write locks on known paths; added lower inode path caching to avoid repeated O(depth) root traversals.
+
 ### GitHub Actions CI & raw vs mount benchmark publishing · 2026-09-10 08:06 · pzqtvusm
 
 - **Multi-platform CI workflow** (`.github/workflows/ci.yml`): Linux CI runs full `cargo check`, `cargo test --workspace --all-targets`, in-process benchmarks, and live kernel FUSE mount benchmarks over `/dev/fuse`. macOS CI kept minimal as a fast compilation check (`cargo check --workspace --all-targets`).

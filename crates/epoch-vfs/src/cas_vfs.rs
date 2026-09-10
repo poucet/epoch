@@ -22,11 +22,11 @@
 
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use epoch_cas::{MemoryByteBackend, SyncByteBackend};
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
+    CreateRequest, CreatedNode, DirEntry, DirEntryPlus, Entry, FileHandle, NodeAttr, InodeId, NodeKind,
     OpenRequest, OpenedFile, ReadRequest, SetAttrRequest, StatFs, VfsError, VfsResult, VfsService,
     WriteRequest,
 };
@@ -38,7 +38,7 @@ use crate::debug::{DebugSnapshot, DebugStats, NearCount};
 /// content-addressed object store. See the [module docs](self) for the two
 /// shapes (pure vs overlay) and the handle model.
 pub struct CasVfs<Bk> {
-    tree: Mutex<WorkingTree<Bk>>,
+    tree: RwLock<WorkingTree<Bk>>,
     /// The byte backend the tree stores into (backends are cheap `Arc`-backed
     /// clones), kept so [`DebugStats`] can ask it for a near-tier count.
     backend: Bk,
@@ -49,7 +49,7 @@ pub struct CasVfs<Bk> {
 impl<Bk: SyncByteBackend + Clone> CasVfs<Bk> {
     fn wrap(backend: Bk, tree: WorkingTree<Bk>) -> Self {
         Self {
-            tree: Mutex::new(tree),
+            tree: RwLock::new(tree),
             backend,
             next_handle: AtomicU64::new(1),
         }
@@ -85,13 +85,17 @@ impl<Bk: SyncByteBackend + Clone> CasVfs<Bk> {
     /// Seal the current state into immutable objects, returning the new root
     /// [`TreeId`] (a sparse delta in overlay mode, a complete tree otherwise).
     pub fn seal(&self) -> VfsResult<TreeId> {
-        self.lock().seal()
+        self.write_lock().seal()
     }
 
-    /// Lock the working tree, recovering from a poisoned mutex (a panic in a
-    /// prior op leaves the tree usable; we do not propagate poison as an error).
-    fn lock(&self) -> MutexGuard<'_, WorkingTree<Bk>> {
-        self.tree.lock().unwrap_or_else(|e| e.into_inner())
+    /// Acquire shared read access to the working tree.
+    fn read_lock(&self) -> RwLockReadGuard<'_, WorkingTree<Bk>> {
+        self.tree.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Acquire exclusive write access to the working tree.
+    fn write_lock(&self) -> RwLockWriteGuard<'_, WorkingTree<Bk>> {
+        self.tree.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Hand out a fresh opaque handle token.
@@ -113,7 +117,7 @@ impl CasVfs<MemoryByteBackend> {
 /// shape supports one (see [`NearCount`]).
 impl<Bk: SyncByteBackend + Clone + NearCount> DebugStats for CasVfs<Bk> {
     fn debug_snapshot(&self) -> DebugSnapshot {
-        let tree = self.lock();
+        let tree = self.read_lock();
         DebugSnapshot {
             near_objects: self.backend.near_count(),
             dirty_files: tree.dirty_file_count(),
@@ -128,22 +132,26 @@ impl<Bk: SyncByteBackend + Clone + NearCount> DebugStats for CasVfs<Bk> {
 
 impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
     fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
-        let mut tree = self.lock();
+        let mut tree = self.write_lock();
         let id = tree.lookup(parent, name)?;
         Ok(Entry::new(tree.getattr(id)?))
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
-        self.lock().getattr(inode_id)
+        self.read_lock().getattr(inode_id)
     }
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
-        self.lock().readdir(inode_id)
+        self.write_lock().readdir(inode_id)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        self.write_lock().readdir_plus(inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {
         {
-            let mut tree = self.lock();
+            let mut tree = self.write_lock();
             // Validate the target exists and is a file; directories are opened
             // via readdir, not here.
             if tree.getattr(request.inode_id)?.kind == NodeKind::Directory {
@@ -162,12 +170,12 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
     }
 
     fn read(&self, request: ReadRequest) -> VfsResult<Vec<u8>> {
-        self.lock()
+        self.read_lock()
             .read_at(request.inode_id, request.offset, request.size)
     }
 
     fn write(&self, request: WriteRequest<'_>) -> VfsResult<u32> {
-        self.lock()
+        self.write_lock()
             .write_at(request.inode_id, request.offset, request.data)
     }
 
@@ -176,7 +184,7 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         // us perms, so re-attach the regular-file type bits.
         let mode = 0o100000 | (request.mode & 0o7777);
         let attr = {
-            let mut tree = self.lock();
+            let mut tree = self.write_lock();
             let id = tree.create(request.parent, request.name.as_os_str(), mode)?;
             tree.getattr(id)?
         };
@@ -192,17 +200,17 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
 
     fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry> {
         let mode = 0o040000 | (request.mode & 0o7777);
-        let mut tree = self.lock();
+        let mut tree = self.write_lock();
         let id = tree.mkdir(request.parent, request.name.as_os_str(), mode)?;
         Ok(Entry::new(tree.getattr(id)?))
     }
 
     fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
-        self.lock().unlink(parent, name)
+        self.write_lock().unlink(parent, name)
     }
 
     fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
-        self.lock().rmdir(parent, name)
+        self.write_lock().rmdir(parent, name)
     }
 
     fn rename(
@@ -212,27 +220,27 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
         new_parent: InodeId,
         new_name: &OsStr,
     ) -> VfsResult<()> {
-        self.lock().rename(parent, name, new_parent, new_name)
+        self.write_lock().rename(parent, name, new_parent, new_name)
     }
 
     fn truncate(&self, inode_id: InodeId, size: u64) -> VfsResult<NodeAttr> {
-        let mut tree = self.lock();
+        let mut tree = self.write_lock();
         tree.truncate(inode_id, size)?;
         tree.getattr(inode_id)
     }
 
     fn symlink(&self, parent: InodeId, name: &OsStr, target: &OsStr) -> VfsResult<Entry> {
-        let mut tree = self.lock();
+        let mut tree = self.write_lock();
         let id = tree.symlink(parent, name, target)?;
         Ok(Entry::new(tree.getattr(id)?))
     }
 
     fn readlink(&self, inode_id: InodeId) -> VfsResult<std::ffi::OsString> {
-        self.lock().readlink(inode_id)
+        self.read_lock().readlink(inode_id)
     }
 
     fn setattr(&self, request: SetAttrRequest) -> VfsResult<NodeAttr> {
-        let mut tree = self.lock();
+        let mut tree = self.write_lock();
         if let Some(mode) = request.mode {
             tree.set_mode(request.inode_id, mode)?;
         }
@@ -245,7 +253,7 @@ impl<Bk: SyncByteBackend + Clone> VfsService for CasVfs<Bk> {
     }
 
     fn statfs(&self, _inode_id: InodeId) -> VfsResult<StatFs> {
-        self.lock().statfs()
+        self.read_lock().statfs()
     }
 
     fn flush(&self, _handle: FileHandle) -> VfsResult<()> {

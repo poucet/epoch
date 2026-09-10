@@ -27,7 +27,7 @@ use std::{
 };
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
+    CreateRequest, CreatedNode, DirEntry, DirEntryPlus, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
     OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
     VfsResult, VfsService, WriteRequest,
 };
@@ -47,6 +47,7 @@ pub const CP_BASE: u64 = 0x8000_0000_0000_0000;
 pub(crate) const VFS_NODE_ID: InodeId = InodeId(CP_BASE);
 
 /// Returns `true` if `id` belongs to the control plane's reserved high range.
+#[inline(always)]
 fn is_cp(id: u64) -> bool {
     id >= CP_BASE
 }
@@ -109,26 +110,20 @@ impl ControlPlaneVfs {
         self
     }
 
-    /// The feature owning `id`'s slice, if any. Slice 0 (the `.vfs` node) and
-    /// slices past the registry yield `None`.
-    fn feature_of(&self, id: u64) -> Option<&Feature> {
+    /// Route by feature slice, with fallbacks for the `.vfs` node itself and
+    /// the inner service.
+    #[inline(always)]
+    fn route(&self, id: u64) -> Route<'_> {
         if !is_cp(id) {
-            return None;
+            return Route::Inner;
         }
         let slice = (id - CP_BASE) / FEATURE_RANGE;
         match slice {
-            0 => None,
-            n => self.features.get(n as usize - 1),
-        }
-    }
-
-    /// Route by feature slice, with fallbacks for the `.vfs` node itself and
-    /// the inner service.
-    fn route(&self, id: u64) -> Route<'_> {
-        match self.feature_of(id) {
-            Some(feature) => Route::Feature(feature),
-            None if is_cp(id) => Route::ControlPlane,
-            None => Route::Inner,
+            0 => Route::ControlPlane,
+            n => match self.features.get(n as usize - 1) {
+                Some(feature) => Route::Feature(feature),
+                None => Route::ControlPlane,
+            },
         }
     }
 }
@@ -210,6 +205,39 @@ impl VfsService for ControlPlaneVfs {
             }
             Route::ControlPlane => Err(VfsError::NotFound),
             Route::Inner => self.inner.readdir(inode_id),
+        }
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        if inode_id == ROOT_INODE_ID {
+            let mut entries = self.inner.readdir_plus(ROOT_INODE_ID)?;
+            entries.retain(|entry| entry.name != OsStr::new(CONTROL_DIR));
+            entries.push(DirEntryPlus::new(
+                VFS_NODE_ID,
+                OsString::from(CONTROL_DIR),
+                control_dir_attr(VFS_NODE_ID),
+            ));
+            return Ok(entries);
+        }
+        match self.route(inode_id.0) {
+            Route::Feature(feature) => feature.service.readdir_plus(inode_id),
+            Route::ControlPlane if inode_id == VFS_NODE_ID => {
+                let mut entries = vec![
+                    DirEntryPlus::new(VFS_NODE_ID, OsString::from("."), control_dir_attr(VFS_NODE_ID)),
+                    DirEntryPlus::new(ROOT_INODE_ID, OsString::from(".."), control_dir_attr(ROOT_INODE_ID)),
+                ];
+                for feature in &self.features {
+                    let root_attr = feature.service.getattr(feature.slot.root_id())?;
+                    entries.push(DirEntryPlus::new(
+                        feature.slot.root_id(),
+                        OsString::from(feature.name),
+                        root_attr,
+                    ));
+                }
+                Ok(entries)
+            }
+            Route::ControlPlane => Err(VfsError::NotFound),
+            Route::Inner => self.inner.readdir_plus(inode_id),
         }
     }
 

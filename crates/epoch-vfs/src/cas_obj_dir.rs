@@ -40,7 +40,7 @@ use epoch_cas::{CASHash, SyncByteBackend, decompress, object_kind};
 use epoch_file_cas::{BlobId, FileCas};
 use epoch_tree::TreeId;
 use epoch_vfs_api::{
-    DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenRequest, OpenedFile,
+    DirEntry, DirEntryPlus, Entry, FileHandle, InodeId, NodeAttr, NodeKind, OpenRequest, OpenedFile,
     ReadRequest, VfsError, VfsResult, VfsService,
 };
 
@@ -274,6 +274,10 @@ where
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
         self.serve_readdir(inode_id)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        self.serve_readdir_plus(inode_id)
     }
 
     fn open(&self, request: OpenRequest) -> VfsResult<OpenedFile> {

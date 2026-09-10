@@ -32,12 +32,12 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use epoch_tree::TreeId;
 use epoch_vfs_api::{
-    DirEntry, Entry, FileHandle, InodeId, NodeAttr, OpenMode, OpenRequest, OpenedFile,
+    DirEntry, DirEntryPlus, Entry, FileHandle, InodeId, NodeAttr, OpenMode, OpenRequest, OpenedFile,
     ROOT_INODE_ID, ReadRequest, VfsError, VfsResult, VfsService,
 };
 
@@ -167,7 +167,9 @@ where
     /// directory entry).
     pub fn root_entry(&self, key: K) -> VfsResult<Entry> {
         let attr = self.mounted(key)?.getattr(ROOT_INODE_ID)?;
-        Ok(Entry::new(self.remap_attr(key, attr)?))
+        let mut entry = Entry::new(self.remap_attr(key, attr)?);
+        entry.ttl = Duration::from_secs(60);
+        Ok(entry)
     }
 
     /// `lookup` inside a sub-mount (the parent is a synthetic id minted here).
@@ -175,6 +177,7 @@ where
         let entry = self.mounted(key)?.lookup(local_parent, name)?;
         Ok(Entry {
             attr: self.remap_attr(key, entry.attr)?,
+            ttl: Duration::from_secs(60),
             ..entry
         })
     }
@@ -190,6 +193,16 @@ where
         let mut entries = self.mounted(key)?.readdir(local)?;
         for entry in &mut entries {
             entry.inode_id = self.synthetic_id(key, entry.inode_id)?;
+        }
+        Ok(entries)
+    }
+
+    /// `readdir_plus` of a sub-mount directory, every row remapped.
+    pub fn readdir_plus(&self, key: K, local: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        let mut entries = self.mounted(key)?.readdir_plus(local)?;
+        for entry in &mut entries {
+            entry.inode_id = self.synthetic_id(key, entry.inode_id)?;
+            entry.attr = self.remap_attr(key, entry.attr.clone())?;
         }
         Ok(entries)
     }
@@ -332,6 +345,14 @@ impl TreeMounts {
     }
 
     /// See [`try_lookup`](Self::try_lookup).
+    pub(crate) fn try_readdir_plus(&self, id: InodeId) -> VfsResult<Option<Vec<DirEntryPlus>>> {
+        match self.subs.local_of(id)? {
+            Some((root, local)) => self.subs.readdir_plus(root, local).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`try_lookup`](Self::try_lookup).
     pub(crate) fn try_open(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>> {
         match self.subs.local_of(request.inode_id)? {
             Some((root, local)) => self.subs.open(root, local, request).map(Some),
@@ -381,6 +402,18 @@ pub(crate) trait TreeBrowseFeature: Send + Sync {
     fn getattr_own(&self, inode_id: InodeId) -> VfsResult<Option<NodeAttr>>;
     /// Listing of one of this feature's own directories.
     fn readdir_own(&self, inode_id: InodeId) -> VfsResult<Option<Vec<DirEntry>>>;
+    /// Extended directory listing of one of this feature's own directories.
+    fn readdir_plus_own(&self, inode_id: InodeId) -> VfsResult<Option<Vec<DirEntryPlus>>> {
+        let Some(entries) = self.readdir_own(inode_id)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let attr = self.serve_getattr(entry.inode_id)?;
+            out.push(DirEntryPlus::new(entry.inode_id, entry.name, attr));
+        }
+        Ok(Some(out))
+    }
     /// Open one of this feature's own files.
     fn open_own(&self, request: OpenRequest) -> VfsResult<Option<OpenedFile>>;
     /// Read one of this feature's own files.
@@ -412,6 +445,14 @@ pub(crate) trait TreeBrowseFeature: Send + Sync {
             return Ok(entries);
         }
         self.mounts().try_readdir(inode_id)?.ok_or(VfsError::NotFound)
+    }
+
+    /// Own directories first, then sub-mount readdir_plus.
+    fn serve_readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        if let Some(entries) = self.readdir_plus_own(inode_id)? {
+            return Ok(entries);
+        }
+        self.mounts().try_readdir_plus(inode_id)?.ok_or(VfsError::NotFound)
     }
 
     /// Own files first, then sub-mount open.

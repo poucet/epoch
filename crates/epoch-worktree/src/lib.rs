@@ -117,7 +117,7 @@ use epoch_cas::{Bytes, CASError, SyncByteBackend, SyncCAS};
 use epoch_file_cas::{BlobId, FileCas, FileWriter};
 use epoch_tree::{EntryId, EntryTime, Link, LinkKind, Overlay, SYMLINK_MODE, Tree, TreeEntry, TreeStore};
 use epoch_vfs_api::{
-    DirEntry, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, StatFs, VfsError,
+    DirEntry, DirEntryPlus, NodeAttr, InodeId, NodeKind, OpenMode, OpenRequest, ReadRequest, StatFs, VfsError,
     VfsResult, VfsService, ROOT_INODE_ID,
 };
 
@@ -228,15 +228,15 @@ enum Body {
     },
     /// An upper-materialized regular file: `Clean(BlobId)` or `Dirty(FileWriter)`.
     File(FileBody),
-    /// A fall-through regular file served from the lower service. The wrapped id
-    /// is the file's *lower* [`InodeId`]; the overlay never exposes it directly.
+    /// A fall-through regular file served from the lower service. Stores its lower
+    /// [`InodeId`].
     LowerFile(InodeId),
     /// An upper symlink: the target path bytes, verbatim. Symlink targets are
     /// immutable (a retarget is unlink + create), so there is no dirty/clean
     /// split; the bytes seal into the CAS as a blob on `seal`.
     Symlink(Bytes),
-    /// A fall-through symlink served from the lower service (like
-    /// [`LowerFile`](Body::LowerFile)); `readlink` delegates to the lower.
+    /// A fall-through symlink served from the lower service;
+    /// `readlink` delegates to the lower.
     LowerSymlink(InodeId),
     /// A whiteout: hides the lower entry of this name (overlay deletion marker).
     Tombstone,
@@ -683,8 +683,8 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         for (name, id) in &cached {
             let kind = match &self.inodes.get(id).ok_or(VfsError::NotFound)?.body {
                 Body::Dir { .. } => NodeKind::Directory,
-                Body::File(_) | Body::LowerFile(_) => NodeKind::RegularFile,
-                Body::Symlink(_) | Body::LowerSymlink(_) => NodeKind::Symlink,
+                Body::File(_) | Body::LowerFile(..) => NodeKind::RegularFile,
+                Body::Symlink(_) | Body::LowerSymlink(..) => NodeKind::Symlink,
                 Body::Tombstone => continue,
             };
             out.push(DirEntry::new(*id, name.clone(), kind));
@@ -692,25 +692,35 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
 
         if let Some(ld) = lower_id {
             let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
-            for de in lower.readdir(ld)? {
+            for dep in lower.readdir_plus(ld)? {
                 // The `VfsService::readdir` contract includes synthesized `.`/`..`
                 // entries (see `PassthroughVfs`); they are not mergeable content.
-                if de.name == "." || de.name == ".." {
+                if dep.name == "." || dep.name == ".." {
                     continue;
                 }
-                if cached.iter().any(|(n, _)| n == &de.name) {
+                if cached.iter().any(|(n, _)| n == &dep.name) {
                     // Already overridden / tombstoned / cached — skip.
                     continue;
                 }
                 // Materialize+cache the lower child via its full attrs so its id
                 // is stable and matches a later lookup.
-                let attr = lower.getattr(de.inode_id)?;
-                let id = self.materialize_lower(&attr);
-                self.link(node, &de.name, id)?;
-                out.push(DirEntry::new(id, de.name, attr.kind));
+                let id = self.materialize_lower(&dep.attr);
+                self.link(node, &dep.name, id)?;
+                out.push(DirEntry::new(id, dep.name, dep.attr.kind));
             }
         }
         Ok(out)
+    }
+
+    /// Extended directory listing returning entries and their attributes in a single call.
+    pub fn readdir_plus(&mut self, node: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        let entries = self.readdir(node)?;
+        let mut plus = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let attr = self.getattr(entry.inode_id)?;
+            plus.push(DirEntryPlus::with_entry(entry, attr));
+        }
+        Ok(plus)
     }
 
     // --- read / write --------------------------------------------------------
@@ -721,7 +731,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn read_at(&self, node: InodeId, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => Err(VfsError::IsDirectory),
-            Body::Symlink(_) | Body::LowerSymlink(_) => {
+            Body::Symlink(_) | Body::LowerSymlink(..) => {
                 Err(VfsError::InvalidInput("cannot read a symlink; use readlink".into()))
             }
             Body::File(FileBody::Clean(blob)) => {
@@ -830,11 +840,11 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
             // skip the clean-blob load / lower copy-up entirely.
             match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
                 Body::Dir { .. } => return Err(VfsError::IsDirectory),
-                Body::Symlink(_) | Body::LowerSymlink(_) => {
+                Body::Symlink(_) | Body::LowerSymlink(..) => {
                     return Err(VfsError::InvalidInput("cannot truncate a symlink".into()));
                 }
                 Body::Tombstone => return Err(VfsError::NotFound),
-                Body::File(_) | Body::LowerFile(_) => {}
+                Body::File(_) | Body::LowerFile(..) => {}
             }
             let writer = self.files.edit(None).map_err(io)?;
             if let Some(inode) = self.inodes.get_mut(&node) {
@@ -864,7 +874,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
         let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
-            Body::Symlink(_) | Body::LowerSymlink(_) => {
+            Body::Symlink(_) | Body::LowerSymlink(..) => {
                 return Err(VfsError::InvalidInput("cannot write a symlink".into()));
             }
             Body::Tombstone => return Err(VfsError::NotFound),
@@ -969,7 +979,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn readlink(&self, node: InodeId) -> VfsResult<OsString> {
         match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Symlink(target) => Ok(OsString::from_vec(target.to_vec())),
-            Body::LowerSymlink(ld) => {
+            Body::LowerSymlink(ld, ..) => {
                 let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?;
                 lower.readlink(*ld)
             }
@@ -996,8 +1006,8 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
         let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Tombstone => return Err(VfsError::NotFound),
-            Body::LowerFile(_) => Step::CopyUpFile,
-            Body::LowerSymlink(ld) => Step::CopyUpSymlink(*ld),
+            Body::LowerFile(..) => Step::CopyUpFile,
+            Body::LowerSymlink(ld, ..) => Step::CopyUpSymlink(*ld),
             Body::Dir { .. } => Step::Dir,
             Body::File(_) | Body::Symlink(_) => Step::Ready,
         };
@@ -1055,8 +1065,8 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         }
         let step = match &self.inodes.get(&node).ok_or(VfsError::NotFound)?.body {
             Body::Tombstone => return Err(VfsError::NotFound),
-            Body::LowerFile(_) => Step::CopyUpFile,
-            Body::LowerSymlink(ld) => Step::CopyUpSymlink(*ld),
+            Body::LowerFile(..) => Step::CopyUpFile,
+            Body::LowerSymlink(ld, ..) => Step::CopyUpSymlink(*ld),
             Body::Dir { .. } => Step::Dir,
             Body::File(_) | Body::Symlink(_) => Step::Ready,
         };
@@ -1121,7 +1131,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
             Body::Dir { .. } => return Err(VfsError::IsDirectory),
-            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {}
+            Body::File(_) | Body::LowerFile(..) | Body::Symlink(_) | Body::LowerSymlink(..) => {}
             Body::Tombstone => return Err(VfsError::NotFound),
         }
         self.remove_child(parent, name, id)
@@ -1135,7 +1145,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
     pub fn rmdir(&mut self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
         let id = self.lookup(parent, name)?;
         match &self.inodes.get(&id).ok_or(VfsError::NotFound)?.body {
-            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {
+            Body::File(_) | Body::LowerFile(..) | Body::Symlink(_) | Body::LowerSymlink(..) => {
                 return Err(VfsError::NotDirectory);
             }
             Body::Tombstone => return Err(VfsError::NotFound),
@@ -1254,7 +1264,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 }
                 true
             }
-            Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => false,
+            Body::File(_) | Body::LowerFile(..) | Body::Symlink(_) | Body::LowerSymlink(..) => false,
         };
 
         // Renaming a node onto itself is a no-op.
@@ -1271,7 +1281,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         if !src_is_dir
             && matches!(
                 self.inodes.get(&src).map(|n| &n.body),
-                Some(Body::LowerFile(_))
+                Some(Body::LowerFile(..))
             )
         {
             self.make_dirty(src)?;
@@ -1280,7 +1290,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
         // and becomes an upper link (a `make_dirty`-style content copy-up
         // would follow the link, so it is not reusable here).
         if !src_is_dir
-            && let Some(Body::LowerSymlink(ld)) = self.inodes.get(&src).map(|n| &n.body)
+            && let Some(Body::LowerSymlink(ld, ..)) = self.inodes.get(&src).map(|n| &n.body)
         {
             let ld = *ld;
             let lower = self.lower.as_ref().ok_or(VfsError::NotFound)?.clone();
@@ -1298,7 +1308,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 let dst_is_dir = match &self.inodes.get(&dst).ok_or(VfsError::NotFound)?.body {
                     Body::Tombstone => false, // a whiteout: nothing visible to replace
                     Body::Dir { .. } => true,
-                    Body::File(_) | Body::LowerFile(_) | Body::Symlink(_) | Body::LowerSymlink(_) => {
+                    Body::File(_) | Body::LowerFile(..) | Body::Symlink(_) | Body::LowerSymlink(..) => {
                         false
                     }
                 };
@@ -1433,7 +1443,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 Body::File(_) => ChildKind::File,
                 Body::Symlink(_) => ChildKind::Symlink,
                 Body::Tombstone => ChildKind::Tombstone,
-                Body::LowerFile(_) | Body::LowerSymlink(_) => ChildKind::Lower,
+                Body::LowerFile(..) | Body::LowerSymlink(..) => ChildKind::Lower,
             };
             match kind {
                 ChildKind::Dir => {
@@ -1597,7 +1607,7 @@ impl<TBk: SyncByteBackend + Clone, FBk: SyncByteBackend + Clone> WorkingTree<TBk
                 }
                 // Cached fall-throughs (files and symlinks) are not delta; a
                 // dangling id is a bug we do not surface from a debug listing.
-                Some(Body::LowerFile(_) | Body::LowerSymlink(_)) | None => {}
+                Some(Body::LowerFile(..) | Body::LowerSymlink(..)) | None => {}
             }
         }
     }

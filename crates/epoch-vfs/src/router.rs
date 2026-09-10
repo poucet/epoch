@@ -67,7 +67,7 @@ use std::{
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use epoch_vfs_api::{
-    CreateRequest, CreatedNode, DirEntry, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
+    CreateRequest, CreatedNode, DirEntry, DirEntryPlus, Entry, FileHandle, InodeId, NodeAttr, NodeKind,
     OpenRequest, OpenedFile, ROOT_INODE_ID, ReadRequest, SetAttrRequest, StatFs, VfsError,
     VfsResult, VfsService, WriteRequest,
 };
@@ -109,6 +109,8 @@ struct RouterState {
     handles: HashMap<FileHandle, FileHandle>,
     /// Overlay inode → mount-relative path (root = `""`), for rule matching.
     overlay_paths: HashMap<InodeId, PathBuf>,
+    /// Mount-relative path → lower InodeId cache to avoid re-walking components from root.
+    lower_inodes: HashMap<PathBuf, InodeId>,
 }
 
 impl RouterVfs {
@@ -129,6 +131,7 @@ impl RouterVfs {
             rules,
             state: RwLock::new(RouterState {
                 overlay_paths: HashMap::from([(ROOT_INODE_ID, PathBuf::new())]),
+                lower_inodes: HashMap::from([(PathBuf::new(), ROOT_INODE_ID)]),
                 ..RouterState::default()
             }),
             next_id: AtomicU64::new(ROUTE_BASE),
@@ -229,6 +232,13 @@ impl RouterVfs {
         Ok(())
     }
 
+    /// Record a batch of mount-relative paths in a single write lock acquisition.
+    fn record_paths_batch(&self, paths: impl IntoIterator<Item = (InodeId, PathBuf)>) -> VfsResult<()> {
+        let mut state = self.write_state()?;
+        state.overlay_paths.extend(paths);
+        Ok(())
+    }
+
     /// Does `path` (with the given kind) match the routing rules, itself or
     /// via any parent directory?
     fn path_matches(&self, path: &Path, is_dir: bool) -> bool {
@@ -236,8 +246,14 @@ impl RouterVfs {
     }
 
     /// Resolve a mount-relative path in the passthrough, walking components
-    /// from its root via repeated `lookup`.
+    /// from its root via repeated `lookup`, caching resolved lower InodeIds.
     fn resolve_lower(&self, path: &Path) -> VfsResult<Entry> {
+        {
+            let state = self.read_state()?;
+            if let Some(&id) = state.lower_inodes.get(path) {
+                return self.passthrough.getattr(id).map(Entry::new);
+            }
+        }
         let mut node = self.passthrough.getattr(ROOT_INODE_ID).map(Entry::new)?;
         for component in path.components() {
             let Component::Normal(name) = component else {
@@ -247,6 +263,9 @@ impl RouterVfs {
             };
             node = self.passthrough.lookup(node.attr.inode_id, name)?;
         }
+        self.write_state()?
+            .lower_inodes
+            .insert(path.to_path_buf(), node.attr.inode_id);
         Ok(node)
     }
 
@@ -295,6 +314,9 @@ impl RouterVfs {
 
 impl VfsService for RouterVfs {
     fn lookup(&self, parent: InodeId, name: &OsStr) -> VfsResult<Entry> {
+        if self.rules.is_empty() {
+            return self.overlay.lookup(parent, name);
+        }
         if is_routed(parent.0) {
             let local = self.local_of(parent)?;
             let entry = self.passthrough.lookup(local, name)?;
@@ -314,6 +336,9 @@ impl VfsService for RouterVfs {
     }
 
     fn getattr(&self, inode_id: InodeId) -> VfsResult<NodeAttr> {
+        if self.rules.is_empty() {
+            return self.overlay.getattr(inode_id);
+        }
         if is_routed(inode_id.0) {
             let attr = self.passthrough.getattr(self.local_of(inode_id)?)?;
             return self.remap_attr(attr);
@@ -322,6 +347,9 @@ impl VfsService for RouterVfs {
     }
 
     fn readdir(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntry>> {
+        if self.rules.is_empty() {
+            return self.overlay.readdir(inode_id);
+        }
         if is_routed(inode_id.0) {
             let mut entries = self.passthrough.readdir(self.local_of(inode_id)?)?;
             for entry in &mut entries {
@@ -331,6 +359,7 @@ impl VfsService for RouterVfs {
         }
         let mut entries = self.overlay.readdir(inode_id)?;
         if let Some(dir_path) = self.overlay_path(inode_id)? {
+            let mut new_paths = Vec::new();
             for entry in &mut entries {
                 if entry.name == OsStr::new(".") || entry.name == OsStr::new("..") {
                     continue;
@@ -340,8 +369,46 @@ impl VfsService for RouterVfs {
                     entry.inode_id = self.synthetic_id(local_entry.attr.inode_id)?;
                     entry.kind = local_entry.attr.kind;
                 } else {
-                    self.record_path(entry.inode_id, child)?;
+                    new_paths.push((entry.inode_id, child));
                 }
+            }
+            if !new_paths.is_empty() {
+                self.record_paths_batch(new_paths)?;
+            }
+        }
+        Ok(entries)
+    }
+
+    fn readdir_plus(&self, inode_id: InodeId) -> VfsResult<Vec<DirEntryPlus>> {
+        if self.rules.is_empty() {
+            return self.overlay.readdir_plus(inode_id);
+        }
+        if is_routed(inode_id.0) {
+            let mut entries = self.passthrough.readdir_plus(self.local_of(inode_id)?)?;
+            for entry in &mut entries {
+                entry.inode_id = self.synthetic_id(entry.inode_id)?;
+                entry.attr = self.remap_attr(entry.attr.clone())?;
+            }
+            return Ok(entries);
+        }
+        let mut entries = self.overlay.readdir_plus(inode_id)?;
+        if let Some(dir_path) = self.overlay_path(inode_id)? {
+            let mut new_paths = Vec::new();
+            for entry in &mut entries {
+                if entry.name == OsStr::new(".") || entry.name == OsStr::new("..") {
+                    continue;
+                }
+                let child = dir_path.join(&entry.name);
+                if let Some(local_entry) = self.route_for(&child)? {
+                    entry.inode_id = self.synthetic_id(local_entry.attr.inode_id)?;
+                    entry.kind = local_entry.attr.kind;
+                    entry.attr = self.remap_attr(local_entry.attr)?;
+                } else {
+                    new_paths.push((entry.inode_id, child));
+                }
+            }
+            if !new_paths.is_empty() {
+                self.record_paths_batch(new_paths)?;
             }
         }
         Ok(entries)
@@ -381,6 +448,9 @@ impl VfsService for RouterVfs {
     }
 
     fn create(&self, request: CreateRequest) -> VfsResult<CreatedNode> {
+        if self.rules.is_empty() {
+            return self.overlay.create(request);
+        }
         if is_routed(request.parent.0) {
             let created = self.passthrough.create(CreateRequest {
                 parent: self.local_of(request.parent)?,
@@ -412,6 +482,9 @@ impl VfsService for RouterVfs {
     }
 
     fn mkdir(&self, request: CreateRequest) -> VfsResult<Entry> {
+        if self.rules.is_empty() {
+            return self.overlay.mkdir(request);
+        }
         if is_routed(request.parent.0) {
             let entry = self.passthrough.mkdir(CreateRequest {
                 parent: self.local_of(request.parent)?,
@@ -437,6 +510,9 @@ impl VfsService for RouterVfs {
     }
 
     fn unlink(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
+        if self.rules.is_empty() {
+            return self.overlay.unlink(parent, name);
+        }
         if is_routed(parent.0) {
             return self.passthrough.unlink(self.local_of(parent)?, name);
         }
@@ -450,6 +526,9 @@ impl VfsService for RouterVfs {
     }
 
     fn rmdir(&self, parent: InodeId, name: &OsStr) -> VfsResult<()> {
+        if self.rules.is_empty() {
+            return self.overlay.rmdir(parent, name);
+        }
         if is_routed(parent.0) {
             return self.passthrough.rmdir(self.local_of(parent)?, name);
         }
@@ -469,6 +548,9 @@ impl VfsService for RouterVfs {
         new_parent: InodeId,
         new_name: &OsStr,
     ) -> VfsResult<()> {
+        if self.rules.is_empty() {
+            return self.overlay.rename(parent, name, new_parent, new_name);
+        }
         match (is_routed(parent.0), is_routed(new_parent.0)) {
             // Entirely inside a routed subtree: the host handles it.
             (true, true) => self.passthrough.rename(

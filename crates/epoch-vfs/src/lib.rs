@@ -44,7 +44,7 @@ mod test_support;
 pub use cas_obj_dir::CasObjectDir;
 pub use cas_vfs::CasVfs;
 pub use checkpointing::CheckpointedFs;
-pub use control_plane::ControlPlaneVfs;
+pub use control_plane::{CP_BASE, ControlPlaneVfs};
 pub use debug::{DebugSnapshot, DebugStats, NearCount};
 pub use debug_dir::DebugDir;
 pub use feature::{FEATURE_RANGE, FeatureSlot, ReadOnlyFeature};
