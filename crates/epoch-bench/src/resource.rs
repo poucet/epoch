@@ -98,21 +98,64 @@ pub struct ProcStat {
     pub rss_bytes: u64,
 }
 
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn self_rss_mach() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    unsafe {
+        let mut info = MaybeUninit::<libc::mach_task_basic_info>::uninit();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
+            / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        let kret = libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr() as libc::task_info_t,
+            &mut count,
+        );
+        if kret == libc::KERN_SUCCESS {
+            let info = info.assume_init();
+            Some(info.resident_size)
+        } else {
+            None
+        }
+    }
+}
+
 pub fn proc_stat(pid: u32) -> Option<ProcStat> {
-    let out = Command::new("ps")
+    if let Ok(out) = Command::new("ps")
         .args(["-o", "utime=,stime=,rss=", "-p", &pid.to_string()])
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().next() {
+                let mut it = line.split_whitespace();
+                if let (Some(u), Some(s), Some(r)) = (it.next(), it.next(), it.next()) {
+                    if let (Some(user_s), Some(sys_s), Ok(rss_kb)) =
+                        (parse_ps_time(u), parse_ps_time(s), r.parse::<u64>())
+                    {
+                        return Some(ProcStat {
+                            user_s,
+                            sys_s,
+                            rss_bytes: rss_kb * 1024,
+                        });
+                    }
+                }
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().next()?;
-    let mut it = line.split_whitespace();
-    let user_s = parse_ps_time(it.next()?)?;
-    let sys_s = parse_ps_time(it.next()?)?;
-    let rss_bytes = it.next()?.parse::<u64>().ok()? * 1024;
-    Some(ProcStat { user_s, sys_s, rss_bytes })
+    #[cfg(target_os = "macos")]
+    if pid == std::process::id() {
+        if let Some(rss_bytes) = self_rss_mach() {
+            let ru = self_cpu();
+            return Some(ProcStat {
+                user_s: ru.user.as_secs_f64(),
+                sys_s: ru.sys.as_secs_f64(),
+                rss_bytes,
+            });
+        }
+    }
+    None
 }
 
 /// Resource cost attached to every result row.
