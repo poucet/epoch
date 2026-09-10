@@ -7,17 +7,15 @@
 //! - **In-process mode** (the mount is a thread inside this binary): the
 //!   workload side is this process too, so `RUSAGE_SELF` deltas cover both;
 //!   we report the delta as "daemon+bench CPU" honestly labelled. Peak RSS is
-//!   sampled from `ps` for our own pid.
+//!   sampled directly for our own pid.
 //! - **Subprocess daemon mode** (`--daemon-pid <pid>` of a mounted
 //!   `epoch-fuse`): workload CPU comes from `RUSAGE_CHILDREN` deltas around
-//!   each spawned workload, daemon CPU from `ps -o utime=,stime=` deltas, and
-//!   peak RSS from a sampler thread polling `ps -o rss=` every ~50 ms.
+//!   each spawned workload, daemon CPU from OS task stats deltas, and
+//!   peak RSS from a sampler thread polling every ~50 ms.
 //!
-//! macOS has no `/proc`; `ps` is the dependable unprivileged source. `ps`
-//! time fields print `[[dd-]hh:]mm:ss` (optionally with `.cc`); [`parse_ps_time`]
-//! handles all shapes and is unit-tested.
+//! Measurements use native OS APIs with zero subprocess invocations:
+//! Linux reads `/proc/<pid>/stat` directly; macOS queries `proc_pidinfo`.
 
-use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -121,30 +119,28 @@ fn self_rss_mach() -> Option<u64> {
     }
 }
 
-pub fn proc_stat(pid: u32) -> Option<ProcStat> {
-    if let Ok(out) = Command::new("ps")
-        .args(["-o", "utime=,stime=,rss=", "-p", &pid.to_string()])
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(line) = text.lines().next() {
-                let mut it = line.split_whitespace();
-                if let (Some(u), Some(s), Some(r)) = (it.next(), it.next(), it.next()) {
-                    if let (Some(user_s), Some(sys_s), Ok(rss_kb)) =
-                        (parse_ps_time(u), parse_ps_time(s), r.parse::<u64>())
-                    {
-                        return Some(ProcStat {
-                            user_s,
-                            sys_s,
-                            rss_bytes: rss_kb * 1024,
-                        });
-                    }
-                }
-            }
+#[cfg(target_os = "macos")]
+fn macos_proc_stat(pid: u32) -> Option<ProcStat> {
+    use std::mem::MaybeUninit;
+    unsafe {
+        let mut info = MaybeUninit::<libc::proc_taskinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let ret = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr() as *mut libc::c_void,
+            size,
+        );
+        if ret == size {
+            let info = info.assume_init();
+            return Some(ProcStat {
+                user_s: info.pti_total_user as f64 / 1_000_000_000.0,
+                sys_s: info.pti_total_system as f64 / 1_000_000_000.0,
+                rss_bytes: info.pti_resident_size,
+            });
         }
     }
-    #[cfg(target_os = "macos")]
     if pid == std::process::id() {
         if let Some(rss_bytes) = self_rss_mach() {
             let ru = self_cpu();
@@ -156,6 +152,74 @@ pub fn proc_stat(pid: u32) -> Option<ProcStat> {
         }
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_sec() -> f64 {
+    unsafe {
+        let tck = libc::sysconf(libc::_SC_CLK_TCK);
+        if tck > 0 {
+            tck as f64
+        } else {
+            100.0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> u64 {
+    unsafe {
+        let sz = libc::sysconf(libc::_SC_PAGESIZE);
+        if sz > 0 {
+            sz as u64
+        } else {
+            4096
+        }
+    }
+}
+
+pub fn parse_procfs_stat_fields(content: &str, clk_tck: f64, page_sz: u64) -> Option<ProcStat> {
+    let rparen = content.rfind(')')?;
+    let after_comm = content.get(rparen + 1..)?.trim_start();
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    if fields.len() <= 21 {
+        return None;
+    }
+    let utime_ticks: u64 = fields[11].parse().ok()?;
+    let stime_ticks: u64 = fields[12].parse().ok()?;
+    let rss_pages: i64 = fields[21].parse().ok()?;
+
+    let user_s = utime_ticks as f64 / clk_tck;
+    let sys_s = stime_ticks as f64 / clk_tck;
+    let rss_bytes = (rss_pages.max(0) as u64).saturating_mul(page_sz);
+
+    Some(ProcStat {
+        user_s,
+        sys_s,
+        rss_bytes,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_stat(pid: u32) -> Option<ProcStat> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_procfs_stat_fields(&content, clock_ticks_per_sec(), page_size())
+}
+
+pub fn proc_stat(pid: u32) -> Option<ProcStat> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_proc_stat(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_proc_stat(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Resource cost attached to every result row.
@@ -225,6 +289,9 @@ impl RssSampler {
     pub fn start(pid: u32, interval: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicU64::new(0));
+        if let Some(stat) = proc_stat(pid) {
+            peak.store(stat.rss_bytes, Ordering::Relaxed);
+        }
         let (stop2, peak2) = (Arc::clone(&stop), Arc::clone(&peak));
         let handle = std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
@@ -326,7 +393,7 @@ mod tests {
 
     #[test]
     fn proc_stat_of_self_has_rss() {
-        let stat = proc_stat(std::process::id()).expect("ps on own pid");
+        let stat = proc_stat(std::process::id()).expect("proc_stat on own pid");
         assert!(stat.rss_bytes > 0);
     }
 
@@ -336,5 +403,21 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         let peak = sampler.stop().expect("peak observed");
         assert!(peak > 0);
+    }
+
+    #[test]
+    fn procfs_stat_parsing() {
+        let sample = "1234 (epoch-bench) S 1 1234 1234 0 -1 4194304 100 0 0 0 250 150 0 0 20 0 1 0 1000 1234567 500 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        let stat = parse_procfs_stat_fields(sample, 100.0, 4096).expect("parsed stat");
+        assert_eq!(stat.user_s, 2.5);
+        assert_eq!(stat.sys_s, 1.5);
+        assert_eq!(stat.rss_bytes, 500 * 4096);
+
+        // Process name with spaces and nested parentheses
+        let tricky = "1234 (epoch (worker) bench) S 1 1234 1234 0 -1 4194304 100 0 0 0 300 200 0 0 20 0 1 0 1000 1234567 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        let stat2 = parse_procfs_stat_fields(tricky, 100.0, 4096).expect("parsed tricky stat");
+        assert_eq!(stat2.user_s, 3.0);
+        assert_eq!(stat2.sys_s, 2.0);
+        assert_eq!(stat2.rss_bytes, 100 * 4096);
     }
 }
